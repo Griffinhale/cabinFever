@@ -1,11 +1,24 @@
-import Image from "next/image";
+// src/app/page.tsx
+import React from 'react';
+import dynamic from 'next/dynamic'
 
-export default function Home() {
+const CircleDropper = dynamic(
+  () => import('./components/CircleDropper'),
+  { ssr: false }
+)
+const Page: React.FC = () => {
   return (
-    <main className="min-h-screen bg-white-100/10 items-center justify-between p-4" style={{ zIndex: 2, position: 'relative' }}>
-      <div className="bg-slate-800/90 min-h-screen h-[400rem] min-w-screen overflow-hidden border-black rounded-2xl border-2 items-center justify-between m-4">
-        <p className=" flex justify-center items-center">Testing</p>
+    <div id="main-content">
+      <CircleDropper />
+      <header>
+        <h1>My Portfolio</h1>
+      </header>
+      <div style={{ height: '8000px' }}>
+        <p>Scroll to see more content...</p>
+        {/* Add more content here */}
       </div>
-    </main>
+    </div>
   );
-}
+};
+
+export default Page;

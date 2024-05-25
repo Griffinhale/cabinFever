@@ -23,11 +23,24 @@ body {
       transparent,
       rgb(var(--background-end-rgb))
     )
-    rgb(var(--background-start-rgb));
+  rgb(var(--background-start-rgb));
+  margin: 0;
+  overflow-x: hidden;
+  font-family: Arial, sans-serif;
 }
 
 @layer utilities {
   .text-balance {
     text-wrap: balance;
   }
+}
+#main-content {
+  position: relative;
+  z-index: 1;
+}
+canvas {
+  position: fixed;
+  top: 0;
+  left: 0;
+  z-index: 0;
 }
