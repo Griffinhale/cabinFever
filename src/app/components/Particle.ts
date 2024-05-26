@@ -11,10 +11,11 @@ export class Particle {
   velocityReversed: boolean;
   collisionFrames: number;
   vertices: p5.Vector[];
-  verticesTemp: p5.Vector[];
   canGrow: boolean[];
   vertexMagnitudes: number[];
   vertexAngles: number[];
+  largestMag: number;
+  smallestMag: number;
 
   constructor(x: number, y: number, p: p5) {
     this.position = p.createVector(x, y);
@@ -26,10 +27,11 @@ export class Particle {
     this.velocityReversed = false;
     this.collisionFrames = 0;
     this.vertices = [];
-    this.verticesTemp = [];
     this.canGrow = [];
     this.vertexMagnitudes = [];
     this.vertexAngles = [];
+    this.largestMag = 0;
+    this.smallestMag = 0;
     this.initVertices(p);
   }
 
@@ -38,35 +40,21 @@ export class Particle {
       let x = this.size * p.cos(angle);
       let y = this.size * p.sin(angle);
       this.vertices.push(p.createVector(x, y));
-      this.verticesTemp.push(p.createVector(x, y));
       this.canGrow.push(true); // Initially, all vertices can grow
       this.vertexMagnitudes.push(this.size);
       this.vertexAngles.push(angle);
     }
   }
 
-  updateVertices(p: p5) {
-    for (let i = 0; i < this.vertices.length; i++) {
-      if (this.canGrow[i]) {
-        this.vertexMagnitudes[i] += 0.05; // Apply growth to the magnitude
-        const x = this.vertexMagnitudes[i] * p.cos(this.vertexAngles[i]);
-        const y = this.vertexMagnitudes[i] * p.sin(this.vertexAngles[i]);
-        this.vertices[i].set(x, y);
-      }
-    }
-    this.verticesTemp = this.vertices.map(v => v.copy());
-  }
 
   update(p: p5) {
-    this.position.add(this.velocity);
-    this.edges(p);
-
+    //this.position.add(this.velocity);
+    
     if (this.shrinking) {
       this.shrink(p);
     } else {
       this.grow(p);
     }
-    this.updateVertices(p);
   }
 
   display(p: p5) {
@@ -74,141 +62,143 @@ export class Particle {
     p.push();
     p.translate(this.position.x, this.position.y);
     p.beginShape();
-    for (let v of this.verticesTemp) {
+    for (let v of this.vertices) {
       p.vertex(v.x, v.y);
     }
     p.endShape(p.CLOSE);
     p.pop();
   }
-
-  edges(p: p5) {
-    let hitEdge = false;
-    for (let v of this.verticesTemp) {
-      let x = this.position.x + v.x;
-      let y = this.position.y + v.y;
-
-      // Check horizontal edges
-      if (x < 0) {
-        this.position.x = Math.abs(v.x); // Adjust position to stay within bounds
-        this.velocity.x = Math.abs(this.velocity.x); // Ensure velocity is directed inwards
-        hitEdge = true;
-      } else if (x > window.innerWidth) {
-        this.position.x = window.innerWidth - Math.abs(v.x); // Adjust position to stay within bounds
-        this.velocity.x = -Math.abs(this.velocity.x); // Ensure velocity is directed inwards
-        hitEdge = true;
-      }
-
-      // Check vertical edges
-      if (y < 0) {
-        this.position.y = Math.abs(v.y); // Adjust position to stay within bounds
-        this.velocity.y = Math.abs(this.velocity.y); // Ensure velocity is directed inwards
-        hitEdge = true;
-      } else if (y > window.innerHeight) {
-        this.position.y = window.innerHeight - Math.abs(v.y); // Adjust position to stay within bounds
-        this.velocity.y = -Math.abs(this.velocity.y); // Ensure velocity is directed inwards
-        hitEdge = true;
-      }
-
-      if (hitEdge) break; // If any vertex hits the edge, stop checking further
-    }
-  }
-
-  grow(p: p5) {
-    for (let i = 0; i < this.vertices.length; i++) {
+  edges(p: p5, i: number) {
+    let hittingEdge = true;
+    let k = -1;
+    i+=(k*-1);
+    while (hittingEdge){
       let newMagnitude = this.vertexMagnitudes[i] + 0.05; // Simulate the growth
       let newX = this.position.x + newMagnitude * p.cos(this.vertexAngles[i]);
       let newY = this.position.y + newMagnitude * p.sin(this.vertexAngles[i]);
+      hittingEdge = false;
+      if (newX <= 0){
+        this.vertices[i].x=0;
+        this.canGrow[i] = false;
+        hittingEdge = true;
+      } else if( newX >= p.width ){
+        this.vertices[i].x=p.width-1;
+        this.canGrow[i] = false;
+        hittingEdge = true;
+      } else if (newY <= 0 ){
+        this.vertices[i].y=0;
+        this.canGrow[i] = false;
+        hittingEdge = true;
+      } else if (newY >= p.height) {
+        this.vertices[i].y=p.height-1;
+        this.canGrow[i] = false;
+        hittingEdge = true; // If the new position is out of bounds, stop growing this vertex
+      } 
+      k>0?k++:k--;
+      k*=-1;
+      i+=k;
+    }
+    
 
-      // Check if the new position is within the canvas boundaries
-      if (newX < 0 || newX > window.innerWidth || newY < 0 || newY > window.innerHeight) {
-        this.canGrow[i] = false; // If the new position is out of bounds, stop growing this vertex
-      } else {
-        this.canGrow[i] = true; // Otherwise, allow it to grow
+    return i;
+  }
+  grow(p: p5) {
+    this.smallestMag = 0;
+    this.largestMag = 0;
+    for (let i = 0; i < this.vertices.length; i++) {
+      if (this.canGrow[i]) {
+        let newMagnitude = this.vertexMagnitudes[i] + 0.05; // Simulate the growth
+        let newX = this.position.x + newMagnitude * p.cos(this.vertexAngles[i]);
+        let newY = this.position.y + newMagnitude * p.sin(this.vertexAngles[i]);
+
+        // Check if the new position is within the canvas boundaries
+        if (newX <= 0 || newX >= p.width || newY <= 0 || newY >= p.height){
+          this.edges(p, i);
+        } else {
+          this.vertexMagnitudes[i] = newMagnitude; // Apply growth to the magnitude
+          const x = this.vertexMagnitudes[i] * p.cos(this.vertexAngles[i]);
+          const y = this.vertexMagnitudes[i] * p.sin(this.vertexAngles[i]);
+          this.vertices[i].set(x, y);
+        }
+        if (this.vertexMagnitudes[i] > this.largestMag){
+        this.largestMag = this.vertexMagnitudes[i];
+        }
+        if (this.vertexMagnitudes[i] < this.smallestMag || this.smallestMag == 0){
+        this.smallestMag = this.vertexMagnitudes[i];
+        }
       }
     }
   }
 
   shrink(p: p5) {
-    if (this.size > 0) {
-      this.size -= 0.2;
+    this.smallestMag = 0;
+    this.largestMag = 0;
+    for (let i = 0; i < this.vertices.length; i++) {
+        this.vertexMagnitudes[i] -= .05; // Apply growth to the magnitude
+        const x = this.vertexMagnitudes[i] * p.cos(this.vertexAngles[i]);
+        const y = this.vertexMagnitudes[i] * p.sin(this.vertexAngles[i]);
+        this.vertices[i].set(x, y);
+      if (this.vertexMagnitudes[i] > this.largestMag){
+        this.largestMag = this.vertexMagnitudes[i];
+      }
+      if (this.vertexMagnitudes[i] < this.smallestMag || this.smallestMag == 0){
+        this.smallestMag = this.vertexMagnitudes[i];
+      }
     }
-  }
+    if (this.smallestMag <= 0){
+      this.size = 0;
+    }
+    }
+  
 
-  intersects(other: Particle, p: p5) {
-    // Check if any vertex of this particle overlaps with any vertex of the other particle
-    for (let v of this.verticesTemp) {
-      let x1 = v.x;
-      let y1 = v.y;
+    intersects(other: Particle): boolean {
+      const distance = this.position.dist(other.position);
+      const maxDist = this.largestMag + other.largestMag;
+      return distance < maxDist;
+    }
 
-      for (let ov of other.verticesTemp) {
-        let x2 = ov.x;
-        let y2 = ov.y;
 
-        if (p.dist(x1, y1, x2, y2) < 1) { // Small distance threshold for vertex overlap
-          return true;
+    handleCollision(other: Particle, p: p5) {
+      if (!this.intersects(other)) return;
+    
+      console.log("intersection");
+    
+      // Perform detailed vertex-based collision detection
+      let foundCollision = false;
+      for (let [index, v] of this.vertices.entries()) {
+        let x1 = this.position.x + v.x;
+        let y1 = this.position.y + v.y;
+    
+        for (let [index2, ov] of other.vertices.entries()) {
+          let x2 = other.position.x + ov.x;
+          let y2 = other.position.y + ov.y;
+    
+          if (p.dist(x1, y1, x2, y2) < 1) {
+            this.canGrow[index] = false;
+            other.canGrow[index2] = false;
+            foundCollision = true;
+          }
+            var j = index2;
+            var k = 0;
+          while (foundCollision){
+            j=(j+(k*-1));
+            k++;
+            x1 = other.position.x + other.vertices[index].x;
+            y1 = other.position.y + other.vertices[index].y;
+            x2 = other.position.x + other.vertices[index2].x;
+            y2 = other.position.y + other.vertices[index2].y;
+            foundCollision = false;
+            if (p.dist(x1, y1, x2, y2) < 1) {
+              this.canGrow[index] = false;
+              other.canGrow[index2] = false;
+              foundCollision = true;
+            }
+          }
+          return;
         }
       }
+    
     }
-    return false;
-  }
-
-
-  handleCollision(other: Particle, p: p5) {
-      // Handle the collision by adjusting positions and velocities
-      let d = p.dist(this.position.x, this.position.y, other.position.x, other.position.y);
-      let overlap = (this.size + other.size) - d;
-      this.deform(other, p);
-      other.deform(this, p);
-
-      if (overlap > 0) {
-        let direction = p5.Vector.sub(this.position, other.position).normalize();
-        let displacement = direction.mult(overlap / 2);
-        this.position.add(displacement);
-        other.position.sub(displacement);
-      }
-    }
-
-  deform(other: Particle, p: p5) {
-    // Perform deformation based on vertex positions
-    for (let i = 0; i < this.vertices.length; i++) {
-      let v = this.vertices[i];
-      let x = this.position.x + v.x;
-      let y = this.position.y + v.y;
-
-      if (x > other.position.x - other.size && x < other.position.x + other.size &&
-          y > other.position.y - other.size && y < other.position.y + other.size) {
-        let closestVertexIndex = this.getClosestVertexIndex(other.position, p);
-        let prevIndex = (closestVertexIndex - 1 + this.vertices.length) % this.vertices.length;
-        let nextIndex = (closestVertexIndex + 1) % this.vertices.length;
-
-        let prevVertex = this.vertices[prevIndex];
-        let nextVertex = this.vertices[nextIndex];
-        let closestVertex = this.vertices[closestVertexIndex];
-
-        let targetX = (prevVertex.x + nextVertex.x) / 2;
-        let targetY = (prevVertex.y + nextVertex.y) / 2;
-
-        closestVertex.x = targetX;
-        closestVertex.y = targetY;
-        this.verticesTemp = this.vertices.map(v => v.copy());
-      }
-    }
-  }
-
-  getClosestVertexIndex(targetPosition: p5.Vector, p: p5) {
-    let closestIndex = 0;
-    let closestDist = p.dist(this.verticesTemp[0].x, this.verticesTemp[0].y, targetPosition.x - this.position.x, targetPosition.y - this.position.y);
-
-    for (let i = 1; i < this.verticesTemp.length; i++) {
-      let d = p.dist(this.verticesTemp[i].x, this.verticesTemp[i].y, targetPosition.x - this.position.x, targetPosition.y - this.position.y);
-      if (d < closestDist) {
-        closestDist = d;
-        closestIndex = i;
-      }
-    }
-
-    return closestIndex;
-  }
 
   startShrinking() {
     this.shrinking = true;
