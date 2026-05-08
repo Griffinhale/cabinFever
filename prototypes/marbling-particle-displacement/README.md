@@ -12,7 +12,7 @@ The sketch is a single static HTML file using p5.js 1.11.3 from CDN. There is no
 
 Main pieces:
 
-- `particles[]`: pigment tracers with position, velocity, color, rim color, splat size, alpha, and age.
+- `particles[]`: pigment tracers with position, velocity, cached RGB/rim RGB channels, splat size, alpha, and age.
 - `impulses[]`: short-lived radial pressure events created by new drops. These push both new and existing particles.
 - `activePress`: tracks pointer location, start time, selected pigment, and how many particles have already been emitted during a hold.
 - `paperLayer`: static cream/grain background regenerated on reset/resize/palette surface changes.
@@ -29,8 +29,10 @@ Important code comments are included for hold mapping, particle injection/splatt
 - Release: locks the final paint budget and emits the remaining particles/pressure.
 - P: cycle curated palette for future pigment.
 - R: reset particles, impulses, buffers, active input, and settle state.
+- Touch top-left hint zone: cycle palette without a keyboard.
+- Touch top-right hint zone: reset without a keyboard.
 
-Touch handlers return `false`, the page uses `touch-action: none`, and the canvas is full-screen with only tiny corner hints.
+Touch handlers return `false`, the page uses `touch-action: none`, and the canvas is full-screen with tiny corner hints/hit zones for palette and reset.
 
 ## Run
 
@@ -48,6 +50,15 @@ http://localhost:8123
 ```
 
 You can also open `prototypes/marbling-particle-displacement/index.html` directly in a browser, but using a local server is the preferred comparison path.
+
+## Verification
+
+This is a static standalone prototype, so verification is scoped to the single HTML file and a local static smoke path rather than the app build.
+
+- Syntax check: extract the inline script and run `node --check` against it.
+- Static smoke: serve `prototypes/marbling-particle-displacement/` with `python3 -m http.server` and request `/` from localhost to confirm the standalone file is reachable.
+- Whitespace check: `git diff --check`.
+- App-level lint/build: skipped because this worktree has no installed `node_modules`; the prototype intentionally does not depend on the Next.js app toolchain.
 
 ## What to evaluate
 
@@ -79,6 +90,7 @@ Evaluation priorities:
 - New drops visibly disturb older particles through pressure impulses.
 - Curl/noise flow is intentionally subtle and time-limited so the sketch does not require idle animation to look alive.
 - Particle cap is lower on small/touch screens to keep the prototype plausible on mobile.
+- Palette/rim colors are parsed once into numeric channels and copied by reference into particles so the render loop avoids constructing p5 color objects from hex strings every frame.
 - When particle cap is exceeded, oldest particles are discarded. This is a deliberate prototype performance tradeoff, not a physically conserved pigment model.
 
 ## Known limitations
