@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>Marbling Radial Boundary Growth Prototype</title>
+  <script src="https://cdn.jsdelivr.net/npm/p5@1.11.3/lib/p5.min.js"></script>
+  <style>
+    html, body {
+      margin: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      touch-action: none;
+      background: #f4ead3;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    }
+    canvas { display: block; }
+    .hint {
+      position: fixed;
+      left: 10px;
+      bottom: 9px;
+      z-index: 2;
+      color: rgba(45, 39, 30, 0.48);
+      font-size: 11px;
+      letter-spacing: 0.02em;
+      user-select: none;
+      pointer-events: none;
+      text-shadow: 0 1px 0 rgba(255, 255, 255, 0.45);
+    }
+  </style>
+</head>
+<body>
+  <div id="hint" class="hint">hold to drop · P palette · R reset</div>
+  <script>
+    p5.disableFriendlyErrors = true;
+
+    // Radial boundary marbling prototype shell. Later commits add press input,
+    // ray growth/collision, organic pigment rendering, and settled static frames.
+    let grainLayer;
+
+    function setup() {
+      createCanvas(windowWidth, windowHeight);
+      pixelDensity(1);
+      rebuildSurface();
+    }
+
+    function draw() {
+      image(grainLayer, 0, 0);
+    }
+
+    function rebuildSurface() {
+      grainLayer = createGraphics(max(1, windowWidth), max(1, windowHeight));
+      grainLayer.pixelDensity(1);
+      grainLayer.background('#f4ead3');
+      grainLayer.noStroke();
+      for (let i = 0; i < width * height * 0.018; i++) {
+        const shade = random() < 0.55 ? 255 : 160;
+        grainLayer.fill(shade, shade * 0.94, shade * 0.78, random(5, 15));
+        grainLayer.circle(random(width), random(height), random(0.4, 1.6));
+      }
+    }
+
+    function windowResized() {
+      resizeCanvas(windowWidth, windowHeight);
+      rebuildSurface();
+    }
+
+    function keyPressed() {
+      if (key === 'r' || key === 'R' || keyCode === ESCAPE) rebuildSurface();
+    }
+  </script>
+</body>
+</html>
