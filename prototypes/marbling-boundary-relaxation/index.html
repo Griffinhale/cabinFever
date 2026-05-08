@@ -1,0 +1,747 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+  <title>Marbling Boundary Relaxation Raster Field</title>
+  <script src="https://cdn.jsdelivr.net/npm/p5@1.11.3/lib/p5.min.js"></script>
+  <style>
+    html, body {
+      margin: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: #f3ead8;
+      touch-action: none;
+      overscroll-behavior: none;
+      -webkit-user-select: none;
+      user-select: none;
+      font-family: ui-serif, Georgia, Cambria, "Times New Roman", Times, serif;
+    }
+    canvas { display: block; touch-action: none; }
+  </style>
+</head>
+<body>
+<script>
+p5.disableFriendlyErrors = true;
+
+/*
+  Marbling boundary relaxation raster field prototype.
+
+  The simulation is deliberately a low-resolution ownership raster rather than
+  radial polygons, metaballs, particles, or a fluid solver. Each cell has one
+  owner. Drops grow by claiming empty frontier cells, then a capped boundary
+  relaxation pass may reassign nearby seam cells when a simple local energy
+  score says the move helps a young/undersized drop without causing churn.
+*/
+
+const EMPTY = -1;
+const MIN_HOLD_MS = 80;
+const HOLD_RANGE_MS = 1500;
+const GROWTH_BUDGET = 18;
+const RELAX_BUDGET = 28;
+const MAX_FRONTIER_TRIES = 220;
+const SETTLE_AFTER_STILL_FRAMES = 38;
+const COOLDOWN_FRAMES = 20;
+const CONTROL_ZONE = 58;
+const DEBUG = false;
+const TARGET_RENDER_SCALE = 2;
+const MAX_RENDER_PIXELS = 620000;
+
+const PALETTES = [
+  {
+    name: 'traditional', surface: '#f3ead8', grain: '#cdbf9c',
+    pigments: ['#123d5a', '#74312d', '#c18b31', '#556e45', '#efe3c4'], rim: '#281b16'
+  },
+  {
+    name: 'bright', surface: '#f8eedf', grain: '#d7c69e',
+    pigments: ['#e9675f', '#16a7a5', '#e9c94c', '#7755a6', '#244b8f'], rim: '#2c2340'
+  },
+  {
+    name: 'subdued', surface: '#f0e5d3', grain: '#bfae91',
+    pigments: ['#2e3334', '#9b624c', '#3f7772', '#ead8ba', '#b7773d'], rim: '#2b211b'
+  },
+  {
+    name: 'ink', surface: '#f2eadb', grain: '#beb6a8',
+    pigments: ['#111923', '#4d5a62', '#8d9390', '#d8d0bd', '#28364d'], rim: '#101417'
+  }
+];
+
+let cellSize = 4;
+let gridW = 0;
+let gridH = 0;
+let cellCount = 0;
+let owner;
+let pressure;
+let age;
+let cooldown;
+let stableNoise;
+let drops = [];
+let nextDropId = 0;
+let paletteIndex = 0;
+let pigmentCursor = 0;
+let activePress = null;
+let paperGrain;
+let pigmentLayer;
+let renderScale = TARGET_RENDER_SCALE;
+let renderW = 0;
+let renderH = 0;
+let dirty = true;
+let settled = true;
+let debugOverlay = DEBUG;
+let globalStillFrames = 0;
+
+function setup() {
+  pixelDensity(1);
+  createCanvas(windowWidth, windowHeight);
+  // The simulation grid stays intentionally low-resolution, but pigment is
+  // rendered into a separate higher-resolution coverage layer. Ownership remains
+  // discrete; the display pass feathers that field so negotiated seams read less
+  // like square cells.
+  smooth();
+  initGrid(true);
+  createPaperGrain();
+}
+
+function draw() {
+  const palette = PALETTES[paletteIndex];
+  background(palette.surface);
+  image(paperGrain, 0, 0, width, height);
+
+  if (dirty || activePress) {
+    updateSimulation();
+    renderPigmentLayer();
+    dirty = !settled || !!activePress;
+  }
+
+  drawingContext.imageSmoothingEnabled = true;
+  image(pigmentLayer, 0, 0, width, height);
+  if (activePress) drawPressPreview();
+  if (debugOverlay) drawDebugOverlay();
+  drawHints();
+}
+
+function initGrid(clearDrops) {
+  cellSize = width < 720 || height < 720 ? 5 : 4;
+  gridW = max(1, ceil(width / cellSize));
+  gridH = max(1, ceil(height / cellSize));
+  cellCount = gridW * gridH;
+  owner = new Int16Array(cellCount);
+  pressure = new Float32Array(cellCount);
+  age = new Uint32Array(cellCount);
+  cooldown = new Uint16Array(cellCount);
+  stableNoise = new Float32Array(cellCount);
+  owner.fill(EMPTY);
+  for (let y = 0; y < gridH; y++) {
+    for (let x = 0; x < gridW; x++) stableNoise[idx(x, y)] = hashNoise(x, y);
+  }
+  renderScale = chooseRenderScale();
+  renderW = gridW * renderScale;
+  renderH = gridH * renderScale;
+  pigmentLayer = createGraphics(renderW, renderH);
+  pigmentLayer.pixelDensity(1);
+  pigmentLayer.smooth();
+  if (clearDrops) {
+    drops = [];
+    nextDropId = 0;
+  }
+  dirty = true;
+  settled = true;
+  globalStillFrames = 0;
+}
+
+function chooseRenderScale() {
+  const desiredPixels = gridW * gridH * TARGET_RENDER_SCALE * TARGET_RENDER_SCALE;
+  if (desiredPixels <= MAX_RENDER_PIXELS) return TARGET_RENDER_SCALE;
+  return 1;
+}
+
+function resetField() {
+  owner.fill(EMPTY);
+  pressure.fill(0);
+  age.fill(0);
+  cooldown.fill(0);
+  drops = [];
+  nextDropId = 0;
+  pigmentCursor = 0;
+  settled = true;
+  dirty = true;
+  globalStillFrames = 0;
+  renderPigmentLayer();
+}
+
+function cyclePalette() {
+  paletteIndex = (paletteIndex + 1) % PALETTES.length;
+  createPaperGrain();
+  dirty = true;
+}
+
+function handleCornerControl(x, y) {
+  if (x <= CONTROL_ZONE && y <= CONTROL_ZONE) {
+    cyclePalette();
+    return true;
+  }
+  if (x >= width - CONTROL_ZONE && y <= CONTROL_ZONE) {
+    resetField();
+    return true;
+  }
+  return false;
+}
+
+function createPaperGrain() {
+  const palette = PALETTES[paletteIndex];
+  paperGrain = createGraphics(max(1, windowWidth), max(1, windowHeight));
+  paperGrain.pixelDensity(1);
+  paperGrain.clear();
+  paperGrain.noStroke();
+  for (let i = 0; i < width * height / 520; i++) {
+    const a = random(13, 32).toString(16).padStart(2, '0');
+    paperGrain.fill(palette.grain + a);
+    paperGrain.circle(random(width), random(height), random(0.3, 1.5));
+  }
+  for (let i = 0; i < width * height / 2800; i++) {
+    paperGrain.stroke(palette.grain + '18');
+    const x = random(width);
+    const y = random(height);
+    paperGrain.line(x, y, x + random(-8, 8), y + random(-2, 2));
+  }
+}
+
+function updateSimulation() {
+  if (settled && !activePress) return;
+
+  if (frameCount % 6 === 0) decayCooldowns();
+  pressure.fill(0);
+
+  let changed = 0;
+  for (const drop of drops) {
+    if (drop.status !== 'settled') changed += growDrop(drop);
+  }
+  changed += relaxBoundaries();
+
+  for (const drop of drops) updateDropSettleState(drop, changed);
+  const allSettled = drops.every(d => d.status === 'settled');
+  globalStillFrames = changed === 0 && allSettled ? globalStillFrames + 1 : 0;
+  settled = allSettled && !activePress && globalStillFrames > 1;
+  dirty = changed > 0 || !settled || !!activePress;
+}
+
+function growDrop(drop) {
+  if (drop.mass >= drop.targetMass) {
+    if (drop.status === 'growing') drop.status = 'relaxing';
+    return 0;
+  }
+
+  let claimed = 0;
+  let tries = 0;
+
+  while (claimed < GROWTH_BUDGET && drop.mass < drop.targetMass && drop.frontier.length && tries < MAX_FRONTIER_TRIES) {
+    tries++;
+    const bestIndex = pickBestFrontierIndex(drop);
+    if (bestIndex < 0) break;
+    const cell = drop.frontier.splice(bestIndex, 1)[0];
+    drop.frontierSet.delete(cell);
+    const x = cell % gridW;
+    const y = floor(cell / gridW);
+    if (!inGrid(x, y)) continue;
+
+    const o = owner[cell];
+    if (o === EMPTY) {
+      claimCell(cell, drop.id);
+      addNeighborsToFrontier(drop, x, y);
+      claimed++;
+    } else if (o !== drop.id) {
+      // Ownership check: growth never blindly overwrites occupied cells. It only
+      // records seam pressure so the later relaxation pass can decide whether a
+      // cautious, energy-improving reassignment is justified.
+      pressure[cell] += 1 + dropNeed(drop) * 2;
+      addSeamCandidate(drop, cell);
+    }
+  }
+
+  if (claimed === 0) drop.noGrowthFrames++;
+  else drop.noGrowthFrames = 0;
+  if (drop.mass >= drop.targetMass || drop.noGrowthFrames > SETTLE_AFTER_STILL_FRAMES) drop.status = 'relaxing';
+  return claimed;
+}
+
+function pickBestFrontierIndex(drop) {
+  let best = -1;
+  let bestCost = Infinity;
+  const samples = min(drop.frontier.length, 18);
+  for (let i = 0; i < samples; i++) {
+    const fi = floor(random(drop.frontier.length));
+    const cell = drop.frontier[fi];
+    const x = cell % gridW;
+    const y = floor(cell / gridW);
+    const o = owner[cell];
+    if (o === drop.id) continue;
+    const dx = x - drop.seedX;
+    const dy = y - drop.seedY;
+    const radial = sqrt(dx * dx + dy * dy);
+    const noiseBias = stableNoise[cell] * 5.5;
+    const edgePenalty = (x < 2 || y < 2 || x > gridW - 3 || y > gridH - 3) ? 9 : 0;
+    const occupiedPenalty = o === EMPTY ? 0 : 25;
+    const cost = radial + noiseBias + edgePenalty + occupiedPenalty + pressure[cell] * 2;
+    if (cost < bestCost) {
+      bestCost = cost;
+      best = fi;
+    }
+  }
+  return best;
+}
+
+function relaxBoundaries() {
+  let changed = 0;
+  const activeDrops = drops.filter(d => d.status !== 'settled');
+  for (const drop of activeDrops) {
+    if (changed >= RELAX_BUDGET) break;
+    // Relaxation pass: only active seam candidates are inspected. This keeps the
+    // algorithm local and protects the static-settle invariant: old distant cells
+    // cannot churn just because a new drop exists elsewhere on the canvas.
+    let localMoves = 0;
+    const limit = min(drop.seam.length, 120);
+    for (let i = 0; i < limit && changed < RELAX_BUDGET && localMoves < 10; i++) {
+      const cell = drop.seam.shift();
+      if (cell != null) drop.seamSet.delete(cell);
+      if (cell == null || cooldown[cell] > 0) continue;
+      const victimId = owner[cell];
+      if (victimId === EMPTY || victimId === drop.id) continue;
+      const victim = drops[victimId];
+      if (!victim) continue;
+      const x = cell % gridW;
+      const y = floor(cell / gridW);
+      if (!touchesOwner(x, y, drop.id)) continue;
+
+      const score = relaxationScore(cell, drop, victim);
+      if (score > 0.85) {
+        // Accepted move: one boundary cell changes owner. The cooldown and score
+        // threshold prevent flip-flopping; neighboring candidates are queued so
+        // pressure can diffuse along the seam in small negotiated steps.
+        owner[cell] = drop.id;
+        age[cell] = frameCount;
+        cooldown[cell] = COOLDOWN_FRAMES;
+        drop.mass += 1;
+        victim.mass = max(0, victim.mass - 1);
+        addNeighborsToFrontier(drop, x, y);
+        addNeighborsToFrontier(victim, x, y);
+        queueNearbySeams(drop, x, y);
+        queueNearbySeams(victim, x, y);
+        drop.relaxMoves++;
+        localMoves++;
+        changed++;
+      }
+    }
+    if (localMoves === 0) drop.noRelaxFrames++;
+    else drop.noRelaxFrames = 0;
+  }
+  return changed;
+}
+
+function relaxationScore(cell, claimant, victim) {
+  const x = cell % gridW;
+  const y = floor(cell / gridW);
+  const activeNeed = dropNeed(claimant) * 2.4;
+  const victimSurplus = constrain((victim.mass - victim.targetMass * 0.78) / max(1, victim.targetMass), -0.8, 0.6);
+  const compactGain = compactnessGain(x, y, claimant, victim);
+  const smoothGain = smoothnessGain(x, y, claimant.id, victim.id);
+  const organicBias = (stableNoise[cell] - 0.5) * 0.35;
+  const ageResistance = min(1.4, (frameCount - age[cell]) / 420) * -0.35;
+  const settledResistance = victim.status === 'settled' ? -0.28 : 0;
+
+  // Energy terms are intentionally few: need gives young paint room, compactness
+  // avoids distant theft, smoothness avoids checkerboards, stable noise keeps the
+  // seam organic, and age/status resistance makes old cells harder to move.
+  return activeNeed + victimSurplus + compactGain + smoothGain + organicBias + ageResistance + settledResistance;
+}
+
+function compactnessGain(x, y, claimant, victim) {
+  const dc = dist(x, y, claimant.seedX, claimant.seedY) / max(1, sqrt(claimant.targetMass / PI));
+  const dv = dist(x, y, victim.seedX, victim.seedY) / max(1, sqrt(victim.targetMass / PI));
+  return constrain((dv - dc) * 0.18, -0.9, 0.9);
+}
+
+function smoothnessGain(x, y, claimantId, victimId) {
+  const claimantCard = countCardinalOwnerNeighbors(x, y, claimantId);
+  const claimantDiag = countDiagonalOwnerNeighbors(x, y, claimantId);
+  const victimCard = countCardinalOwnerNeighbors(x, y, victimId);
+  const victimDiag = countDiagonalOwnerNeighbors(x, y, victimId);
+
+  // Cardinal continuity matters more than diagonal touch: this discourages
+  // one-cell teeth and diagonal bridges while still allowing irregular seams.
+  const continuity = (claimantCard - victimCard) * 0.22 + (claimantDiag - victimDiag) * 0.08;
+  const toothPenalty = toothPenaltyIfClaimed(claimantCard, claimantDiag, victimCard);
+  const notchGain = notchFillGain(claimantCard, victimCard);
+  return continuity + toothPenalty + notchGain;
+}
+
+function countCardinalOwnerNeighbors(x, y, ownerId) {
+  let count = 0;
+  if (neighborOwner(x + 1, y) === ownerId) count++;
+  if (neighborOwner(x - 1, y) === ownerId) count++;
+  if (neighborOwner(x, y + 1) === ownerId) count++;
+  if (neighborOwner(x, y - 1) === ownerId) count++;
+  return count;
+}
+
+function countDiagonalOwnerNeighbors(x, y, ownerId) {
+  let count = 0;
+  if (neighborOwner(x + 1, y + 1) === ownerId) count++;
+  if (neighborOwner(x - 1, y - 1) === ownerId) count++;
+  if (neighborOwner(x + 1, y - 1) === ownerId) count++;
+  if (neighborOwner(x - 1, y + 1) === ownerId) count++;
+  return count;
+}
+
+function toothPenaltyIfClaimed(claimantCard, claimantDiag, victimCard) {
+  if (claimantCard === 0 && claimantDiag > 0) return -0.5;
+  if (claimantCard === 1 && victimCard >= 2) return -0.24;
+  return 0;
+}
+
+function notchFillGain(claimantCard, victimCard) {
+  if (claimantCard >= 3 && victimCard <= 1) return 0.38;
+  if (claimantCard >= 2 && victimCard === 0) return 0.18;
+  return 0;
+}
+
+function updateDropSettleState(drop) {
+  if (drop.status === 'settled') return;
+  const enoughMass = drop.mass >= drop.targetMass * 0.96 || drop.noGrowthFrames > SETTLE_AFTER_STILL_FRAMES;
+  const calmSeam = drop.noRelaxFrames > SETTLE_AFTER_STILL_FRAMES;
+  if (drop.status === 'relaxing' && enoughMass && calmSeam) drop.status = 'settled';
+}
+
+function beginPress(x, y) {
+  activePress = {
+    x: constrain(x, 0, width - 1),
+    y: constrain(y, 0, height - 1),
+    startedAt: millis(),
+    paletteIndex,
+    pigmentIndex: pigmentCursor % PALETTES[paletteIndex].pigments.length
+  };
+  dirty = true;
+}
+
+function endPress(x, y) {
+  if (!activePress) return;
+  activePress.x = constrain(x, 0, width - 1);
+  activePress.y = constrain(y, 0, height - 1);
+  createDropFromPress(activePress);
+  activePress = null;
+  dirty = true;
+  settled = false;
+}
+
+function createDropFromPress(press) {
+  const gx = constrain(floor(press.x / cellSize), 0, gridW - 1);
+  const gy = constrain(floor(press.y / cellSize), 0, gridH - 1);
+  const holdMs = max(MIN_HOLD_MS, millis() - press.startedAt);
+  const targetMass = holdToTargetMass(holdMs);
+  const palette = PALETTES[press.paletteIndex];
+  const colorHex = palette.pigments[press.pigmentIndex];
+  pigmentCursor++;
+
+  const drop = {
+    id: nextDropId++, seedX: gx, seedY: gy,
+    targetMass, mass: 0,
+    colorHex, rgb: hexToRgb(colorHex), rim: hexToRgb(palette.rim),
+    frontier: [], frontierSet: new Set(), seam: [], seamSet: new Set(), status: 'growing', createdFrame: frameCount,
+    noGrowthFrames: 0, noRelaxFrames: 0, relaxMoves: 0
+  };
+  drops[drop.id] = drop;
+
+  // Hold mapping is area/mass based rather than radius based. A quick tap still
+  // gets a visible minimum; longer holds ease into a larger raster cell budget.
+  // Intentional limitation: the initial nucleus is force-claimed even when the
+  // pointer lands inside older pigment. This makes the prototype visibly test
+  // "new drop in existing pigment" boundary negotiation immediately; only this
+  // tiny seed bypasses the normal seam-scored victim negotiation.
+  const nucleus = targetMass > 900 ? 2 : 1;
+  for (let yy = gy - nucleus; yy <= gy + nucleus; yy++) {
+    for (let xx = gx - nucleus; xx <= gx + nucleus; xx++) {
+      if (!inGrid(xx, yy) || dist(xx, yy, gx, gy) > nucleus + 0.35) continue;
+      claimCell(idx(xx, yy), drop.id, true);
+      addNeighborsToFrontier(drop, xx, yy);
+    }
+  }
+  queueNearbySeams(drop, gx, gy, 3);
+}
+
+function holdToTargetMass(holdMs) {
+  const holdT = constrain((holdMs - MIN_HOLD_MS) / HOLD_RANGE_MS, 0, 1);
+  const paintT = 1 - pow(1 - holdT, 3);
+  const minMass = max(70, floor(cellCount * 0.0025));
+  const maxMass = min(floor(cellCount * 0.055), 3200);
+  return floor(lerp(minMass, maxMass, paintT));
+}
+
+function claimCell(cell, dropId, force = false) {
+  const previous = owner[cell];
+  if (previous === dropId) return;
+  if (previous !== EMPTY && drops[previous]) drops[previous].mass = max(0, drops[previous].mass - 1);
+  if (previous === EMPTY || force) {
+    owner[cell] = dropId;
+    age[cell] = frameCount;
+    cooldown[cell] = force && previous !== EMPTY ? COOLDOWN_FRAMES : 4;
+    drops[dropId].mass += 1;
+  }
+}
+
+function addNeighborsToFrontier(drop, x, y) {
+  forEachNeighbor(x, y, (nx, ny, ni) => {
+    if (owner[ni] !== drop.id) addFrontierCandidate(drop, ni);
+    if (owner[ni] !== EMPTY && owner[ni] !== drop.id) addSeamCandidate(drop, ni);
+  });
+}
+
+function addFrontierCandidate(drop, cell) {
+  if (!drop.frontierSet.has(cell) && drop.frontier.length < 1400) {
+    drop.frontierSet.add(cell);
+    drop.frontier.push(cell);
+  }
+}
+
+function addSeamCandidate(drop, cell) {
+  if (!drop.seamSet.has(cell) && drop.seam.length < 700) {
+    drop.seamSet.add(cell);
+    drop.seam.push(cell);
+  }
+}
+
+function queueNearbySeams(drop, x, y, radius = 2) {
+  for (let yy = y - radius; yy <= y + radius; yy++) {
+    for (let xx = x - radius; xx <= x + radius; xx++) {
+      if (!inGrid(xx, yy)) continue;
+      const cell = idx(xx, yy);
+      if (owner[cell] !== EMPTY && owner[cell] !== drop.id && touchesOwner(xx, yy, drop.id)) addSeamCandidate(drop, cell);
+    }
+  }
+}
+
+function renderPigmentLayer() {
+  pigmentLayer.clear();
+  pigmentLayer.loadPixels();
+  const pixels = pigmentLayer.pixels;
+  pixels.fill(0);
+
+  for (let y = 0; y < gridH; y++) {
+    for (let x = 0; x < gridW; x++) {
+      const cell = idx(x, y);
+      const o = owner[cell];
+      if (o === EMPTY || !drops[o]) continue;
+      const drop = drops[o];
+      const wash = 0.86 + stableNoise[cell] * 0.22;
+      const baseR = drop.rgb.r * wash;
+      const baseG = drop.rgb.g * wash;
+      const baseB = drop.rgb.b * wash;
+
+      for (let sy = 0; sy < renderScale; sy++) {
+        for (let sx = 0; sx < renderScale; sx++) {
+          const coverage = boundaryCoverage(x, y, o, sx, sy);
+          const rimStrength = seamRimStrength(x, y, o, sx, sy);
+          const rimBlend = rimStrength * 0.18;
+          const alpha = constrain(lerp(64, 184, coverage) + rimStrength * 28, 0, 205);
+          const p = ((y * renderScale + sy) * renderW + (x * renderScale + sx)) * 4;
+
+          // Round-two smoothing is display-only. Each ownership cell writes a
+          // small coverage block whose corner alpha responds to neighboring
+          // owners, and the dye-pooling rim is a thin blend near owner-owner
+          // seams rather than a hard dark square over the whole boundary cell.
+          pixels[p] = constrain(lerp(baseR, drop.rim.r, rimBlend), 0, 255);
+          pixels[p + 1] = constrain(lerp(baseG, drop.rim.g, rimBlend), 0, 255);
+          pixels[p + 2] = constrain(lerp(baseB, drop.rim.b, rimBlend), 0, 255);
+          pixels[p + 3] = alpha;
+        }
+      }
+    }
+  }
+  pigmentLayer.updatePixels();
+}
+
+function boundaryCoverage(x, y, own, sx, sy) {
+  const card = countCardinalOwnerNeighbors(x, y, own);
+  const diag = countDiagonalOwnerNeighbors(x, y, own);
+  if (card === 4 && diag >= 3) return 1;
+
+  const density = constrain((card * 1.2 + diag * 0.55) / 7, 0, 1);
+  let coverage = lerp(0.48, 0.96, density);
+  const leftOpen = neighborOwner(x - 1, y) !== own;
+  const rightOpen = neighborOwner(x + 1, y) !== own;
+  const topOpen = neighborOwner(x, y - 1) !== own;
+  const bottomOpen = neighborOwner(x, y + 1) !== own;
+  if (renderScale === 1) {
+    const openSides = (leftOpen ? 1 : 0) + (rightOpen ? 1 : 0) + (topOpen ? 1 : 0) + (bottomOpen ? 1 : 0);
+    return constrain(coverage - openSides * 0.08, 0.42, 1);
+  }
+  const leftHalf = sx < renderScale / 2;
+  const topHalf = sy < renderScale / 2;
+
+  // Directional corner coverage softens the side of a cell that faces paper or a
+  // neighbor pigment. This is a cheap, stable substitute for full contours.
+  if (leftHalf && leftOpen) coverage -= 0.18;
+  if (!leftHalf && rightOpen) coverage -= 0.18;
+  if (topHalf && topOpen) coverage -= 0.18;
+  if (!topHalf && bottomOpen) coverage -= 0.18;
+  if (neighborOwner(x + (leftHalf ? -1 : 1), y + (topHalf ? -1 : 1)) !== own) coverage -= 0.08;
+  return constrain(coverage, 0.34, 1);
+}
+
+function seamRimStrength(x, y, own, sx, sy) {
+  if (renderScale === 1) {
+    let coarseStrength = 0;
+    coarseStrength += directionalRimWeight(neighborOwner(x - 1, y), own, 0.35);
+    coarseStrength += directionalRimWeight(neighborOwner(x + 1, y), own, 0.35);
+    coarseStrength += directionalRimWeight(neighborOwner(x, y - 1), own, 0.35);
+    coarseStrength += directionalRimWeight(neighborOwner(x, y + 1), own, 0.35);
+    return constrain(coarseStrength, 0, 0.75);
+  }
+  const leftHalf = sx < renderScale / 2;
+  const topHalf = sy < renderScale / 2;
+  let strength = 0;
+  strength += directionalRimWeight(neighborOwner(x - 1, y), own, leftHalf ? 0.9 : 0.18);
+  strength += directionalRimWeight(neighborOwner(x + 1, y), own, !leftHalf ? 0.9 : 0.18);
+  strength += directionalRimWeight(neighborOwner(x, y - 1), own, topHalf ? 0.9 : 0.18);
+  strength += directionalRimWeight(neighborOwner(x, y + 1), own, !topHalf ? 0.9 : 0.18);
+  strength += directionalRimWeight(neighborOwner(x + (leftHalf ? -1 : 1), y + (topHalf ? -1 : 1)), own, 0.28);
+  return constrain(strength, 0, 1);
+}
+
+function directionalRimWeight(neighbor, own, weight) {
+  if (neighbor === EMPTY || neighbor === own) return 0;
+  return weight;
+}
+
+function neighborOwner(x, y) {
+  if (!inGrid(x, y)) return EMPTY;
+  return owner[idx(x, y)];
+}
+
+function drawPressPreview() {
+  const holdMs = max(MIN_HOLD_MS, millis() - activePress.startedAt);
+  const target = holdToTargetMass(holdMs);
+  const r = sqrt(target / PI) * cellSize;
+  const palette = PALETTES[activePress.paletteIndex];
+  const c = color(palette.pigments[activePress.pigmentIndex]);
+  push();
+  noFill();
+  stroke(red(c), green(c), blue(c), 98);
+  strokeWeight(1.25);
+  circle(activePress.x, activePress.y, r * 2);
+  fill(red(c), green(c), blue(c), 30);
+  noStroke();
+  circle(activePress.x, activePress.y, max(12, r * 0.28));
+  pop();
+}
+
+function drawHints() {
+  push();
+  fill(62, 48, 34, 96);
+  noStroke();
+  textSize(11);
+  textAlign(LEFT, TOP);
+  text(`palette\n${PALETTES[paletteIndex].name}`, 10, 8);
+  textAlign(CENTER, TOP);
+  text('hold to drop', width * 0.5, 10);
+  textAlign(RIGHT, TOP);
+  text('reset', width - 10, 8);
+  textAlign(RIGHT, BOTTOM);
+  const state = settled ? 'settled' : 'relaxing';
+  text(`${state} · ${drops.filter(Boolean).length} drops`, width - 12, height - 10);
+  pop();
+}
+
+function drawDebugOverlay() {
+  push();
+  noFill();
+  stroke(20, 20, 20, 120);
+  textSize(10);
+  textAlign(LEFT, TOP);
+  text(`grid ${gridW}x${gridH} cell ${cellSize}px · render ${renderW}x${renderH} (${renderScale}x coverage)`, 12, 28);
+  for (const d of drops) if (d) text(`#${d.id} ${d.status} mass ${floor(d.mass)}/${d.targetMass}`, 12, 42 + d.id * 12);
+  pop();
+}
+
+function isBoundaryCell(x, y, own) {
+  let boundary = false;
+  forEachNeighbor(x, y, (nx, ny, ni) => {
+    if (owner[ni] !== own) boundary = true;
+  });
+  return boundary;
+}
+
+function touchesOwner(x, y, ownerId) {
+  let touches = false;
+  forEachNeighbor(x, y, (nx, ny, ni) => {
+    if (owner[ni] === ownerId) touches = true;
+  });
+  return touches;
+}
+
+function forEachNeighbor(x, y, fn) {
+  const dirs = [[1,0],[-1,0],[0,1],[0,-1],[1,1],[-1,-1],[1,-1],[-1,1]];
+  for (const d of dirs) {
+    const nx = x + d[0];
+    const ny = y + d[1];
+    if (inGrid(nx, ny)) fn(nx, ny, idx(nx, ny));
+  }
+}
+
+function decayCooldowns() {
+  for (let i = 0; i < cellCount; i++) if (cooldown[i] > 0) cooldown[i]--;
+}
+
+function dropNeed(drop) {
+  return constrain((drop.targetMass - drop.mass) / max(1, drop.targetMass), 0, 1);
+}
+
+function idx(x, y) { return y * gridW + x; }
+function inGrid(x, y) { return x >= 0 && y >= 0 && x < gridW && y < gridH; }
+function hashNoise(x, y) {
+  const s = sin(x * 127.1 + y * 311.7) * 43758.5453123;
+  return s - floor(s);
+}
+function hexToRgb(hex) {
+  const v = hex.replace('#', '');
+  return { r: parseInt(v.slice(0, 2), 16), g: parseInt(v.slice(2, 4), 16), b: parseInt(v.slice(4, 6), 16) };
+}
+
+function mousePressed() {
+  if (handleCornerControl(mouseX, mouseY)) return false;
+  beginPress(mouseX, mouseY);
+  return false;
+}
+function mouseDragged() { if (activePress) { activePress.x = mouseX; activePress.y = mouseY; dirty = true; } return false; }
+function mouseReleased() { endPress(mouseX, mouseY); return false; }
+function touchStarted() {
+  const t = touches[0];
+  const x = t ? t.x : mouseX;
+  const y = t ? t.y : mouseY;
+  if (handleCornerControl(x, y)) return false;
+  beginPress(x, y);
+  return false;
+}
+function touchMoved() { if (activePress) { const t = touches[0]; activePress.x = t ? t.x : mouseX; activePress.y = t ? t.y : mouseY; dirty = true; } return false; }
+function touchEnded() { endPress(activePress ? activePress.x : mouseX, activePress ? activePress.y : mouseY); return false; }
+
+function keyPressed() {
+  if (key === 'p' || key === 'P') {
+    cyclePalette();
+  } else if (key === 'r' || key === 'R') {
+    resetField();
+  } else if (key === 'd' || key === 'D') {
+    debugOverlay = !debugOverlay;
+  }
+}
+
+function windowResized() {
+  resizeCanvas(windowWidth, windowHeight);
+  createPaperGrain();
+  // Resize policy: rebuild the raster rather than resampling existing ownership.
+  // It is simple and predictable for a prototype; future app work can preserve
+  // compositions across resize with a field resample if that becomes important.
+  initGrid(true);
+}
+</script>
+</body>
+</html>
