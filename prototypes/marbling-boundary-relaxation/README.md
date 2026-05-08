@@ -34,10 +34,14 @@ Rendering model:
 
 - Cream/paper background with stable grain.
 - Pigment is rendered from the ownership raster, not separate vector shapes.
-- The low-resolution pigment buffer is scaled with image interpolation enabled to feather the displayed cell edges and reduce grid artifacts.
-- Boundary cells receive a darker rim treatment.
+- Round two keeps the low-resolution ownership grid as the source of truth, but renders it into a separate coverage layer, normally 2x the simulation grid resolution.
+- Boundary cells write per-corner alpha based on same-owner cardinal and diagonal neighbors, so exposed sides feather instead of scaling as hard 4-5 px stairs.
+- Negotiated owner-owner seams receive a thin, semi-transparent dye-pooling rim. The rim is weighted toward the side/corner that touches another pigment instead of darkening an entire square cell.
+- A small local seam score now prefers cardinal continuity, penalizes one-cell teeth/diagonal bridges, and rewards notch fills without running any global smoothing pass.
 - Stable per-cell wash variation reduces flatness.
 - No animated noise is used after settle.
+
+The render layer falls back to 1x coverage when the 2x buffer would exceed the prototype pixel budget, which keeps larger or mobile-sized canvases responsive at the cost of a little extra visible raster structure.
 
 ## Controls
 
@@ -90,13 +94,20 @@ Specific questions:
 - Does the relaxation pass improve enough over strict raster occupancy to justify the extra logic?
 - Does performance remain acceptable with repeated relaxation passes?
 
+Round-two jaggedness check:
+
+- The main visible jaggedness came from square boundary cells and full-cell dark rims emphasizing the raster staircase. The second pass addresses that with higher-resolution coverage rendering and feathered seam rims while preserving the negotiated-boundary concept.
+- Settled compositions should look static: all coverage, rim, and wash variation are rebuilt deterministically from ownership when dirty, with no animated blur or moving noise.
+- One-cell teeth should be less common because seam scoring gives modest preference to cardinal continuity and notch fills, but it should still allow irregular marbled boundaries rather than circularizing every drop.
+
 ## Known limitations
 
 - This is not a fluid simulation and does not solve pressure globally.
 - Boundary pressure is a local heuristic around active seams.
 - Mass conservation is approximate; nucleus creation and seam reassignment can steal cells from older drops.
 - Extreme crowding may leave drops below target mass or create cramped seams.
-- The renderer smooths a low-resolution field but can still show raster artifacts on some boundaries.
+- The renderer smooths and feathers a low-resolution field, but discrete ownership remains underneath; sharp crowding, tiny drops, or 1x render fallback can still show some raster artifacts.
+- The 2x coverage layer improves normal desktop jaggedness but has a pixel-budget tradeoff, so very large canvases fall back to the cheaper path.
 - Resize clears the field instead of resampling the existing composition.
 - No export, undo, or Next.js integration.
 - The forced nucleus can steal a few cells from older pigment before negotiated relaxation takes over; better victim negotiation or mass-debt accounting is future work.
