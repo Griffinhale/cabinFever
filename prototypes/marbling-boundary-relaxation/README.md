@@ -23,16 +23,18 @@ Update model:
 
 1. Press/tap/hold records pointer position and hold duration.
 2. Release maps hold duration to a target cell mass/area.
-3. A small nucleus is claimed at the pointer. If it lands inside existing pigment, the nucleus can displace those cells to prove the negotiated-boundary case.
+3. A small nucleus is force-claimed at the pointer. If it lands inside existing pigment, only that tiny seed can displace cells immediately; surrounding growth still uses the seam negotiation path. This is intentional for the prototype so the "new drop inside old pigment" case is visible.
 4. Growth expands into empty frontier cells with a cost based on seed distance, stable noise, edge penalty, occupied penalty, and local pressure.
 5. Occupied neighboring cells are not blindly overwritten during growth. They become seam candidates.
 6. A capped local relaxation pass may reassign seam cells when a documented energy score improves. The score considers active drop need, victim surplus, compactness, boundary smoothness, stable organic bias, age resistance, and settled-region resistance.
 7. Cooldowns and no-change counters prevent flip-flopping and allow the whole composition to become static.
+8. Frontier and seam queues use small per-drop sets to de-dupe queued cells before they become performance-heavy; cooldown remains a typed-array scan because it is cheap at the prototype grid size.
 
 Rendering model:
 
 - Cream/paper background with stable grain.
 - Pigment is rendered from the ownership raster, not separate vector shapes.
+- The low-resolution pigment buffer is scaled with image interpolation enabled to feather the displayed cell edges and reduce grid artifacts.
 - Boundary cells receive a darker rim treatment.
 - Stable per-cell wash variation reduces flatness.
 - No animated noise is used after settle.
@@ -41,6 +43,8 @@ Rendering model:
 
 - Press/tap: create pigment at the pointer.
 - Hold: increase target paint amount / final area.
+- Tap upper-left corner: cycle the active curated palette for future drops.
+- Tap upper-right corner: reset the surface; current palette is preserved.
 - P: cycle the active curated palette for future drops.
 - R: reset the surface; current palette is preserved.
 - D: toggle a small debug text overlay.
@@ -95,7 +99,7 @@ Specific questions:
 - The renderer smooths a low-resolution field but can still show raster artifacts on some boundaries.
 - Resize clears the field instead of resampling the existing composition.
 - No export, undo, or Next.js integration.
-- Touch controls are supported, but keyboard-only palette/reset may be less discoverable on phone-sized devices.
+- The forced nucleus can steal a few cells from older pigment before negotiated relaxation takes over; better victim negotiation or mass-debt accounting is future work.
 
 ## Future displacement support
 
