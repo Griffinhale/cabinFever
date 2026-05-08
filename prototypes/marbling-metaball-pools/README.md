@@ -30,7 +30,7 @@ You can also open `index.html` directly in a browser, but the static server path
 - Release: finalize the pigment pool; it keeps growing slowly until settled.
 - `P`: cycle palette for future pools.
 - `R` or `Escape`: reset.
-- Touch/mobile fallback: tap top-left corner to cycle palette; tap top-right corner to reset.
+- Touch/mobile fallback: tap top-left corner to cycle palette; hold top-right corner for about 750 ms to reset.
 
 Tiny corner hints are the only UI.
 
@@ -109,7 +109,7 @@ Pools mutate only while growing. Lobe offsets and radii freeze once target mass 
 - Very crowded scenes can still become visually busy or muddy depending on palette choices.
 - The field is recomputed globally while anything grows, so many pools can become expensive.
 - Boundaries are implicit/rendered, not editable vector contours.
-- Touch reset is currently a top-right tap, not a safer long-confirm gesture.
+- Top-right reset uses a hold confirmation so accidental mobile corner taps do not clear the composition.
 
 ## Future displacement support
 
