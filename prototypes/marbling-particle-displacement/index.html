@@ -103,6 +103,7 @@
     const IMPULSE_LIFE = 58;
     const DAMPING = 0.915;
     const BOUNDARY_PAD = 3;
+    const TOUCH_HIT_SIZE = 56;
 
     let paperLayer;
     let pigmentLayer;
@@ -115,7 +116,29 @@
     let settled = true;
     let quietFrames = 0;
     let lastTouchAt = 0;
+    let touchCommandActive = false;
     let maxParticles = 2200;
+
+    function parseHexRgb(hex) {
+      const value = hex.replace('#', '');
+      return [
+        parseInt(value.slice(0, 2), 16),
+        parseInt(value.slice(2, 4), 16),
+        parseInt(value.slice(4, 6), 16)
+      ];
+    }
+
+    function preparePaletteColors() {
+      for (const palette of PALETTES) {
+        palette.grainRgb = parseHexRgb(palette.grain);
+        for (const pigment of palette.pigments) {
+          pigment.rgb = parseHexRgb(pigment.color);
+          pigment.rimRgb = parseHexRgb(pigment.rim);
+        }
+      }
+    }
+
+    preparePaletteColors();
 
     function setup() {
       pixelDensity(1);
@@ -171,7 +194,7 @@
         const y = random(height);
         const a = random(5, 16);
         const r = random(0.35, 1.2);
-        paperLayer.fill(red(color(palette.grain)), green(color(palette.grain)), blue(color(palette.grain)), a);
+        paperLayer.fill(palette.grainRgb[0], palette.grainRgb[1], palette.grainRgb[2], a);
         paperLayer.circle(x, y, r);
       }
       for (let y = 0; y < height; y += 5) {
@@ -205,15 +228,19 @@
         resetSketch();
       }
       if (key === 'p' || key === 'P') {
-        paletteIndex = (paletteIndex + 1) % PALETTES.length;
-        paintPaper();
-        updateHint();
-        loop();
+        cyclePalette();
       }
     }
 
+    function cyclePalette() {
+      paletteIndex = (paletteIndex + 1) % PALETTES.length;
+      paintPaper();
+      updateHint();
+      loop();
+    }
+
     function updateHint() {
-      document.getElementById('hint').textContent = `hold to drop · P palette (${PALETTES[paletteIndex].name}) · R reset`;
+      document.getElementById('hint').textContent = `hold to drop · P/top-left palette (${PALETTES[paletteIndex].name}) · R/top-right reset`;
     }
 
     function startPress(x, y) {
@@ -295,8 +322,8 @@
           y: py,
           vx: cos(a + random(-0.45, 0.45)) * outward,
           vy: sin(a + random(-0.45, 0.45)) * outward,
-          color: pigment.color,
-          rim: pigment.rim,
+          rgb: pigment.rgb,
+          rimRgb: pigment.rimRgb,
           radius: random(5.8, 10.8),
           alpha: random(30, 55),
           age: 0
@@ -455,8 +482,8 @@
       rimLayer.noFill();
 
       for (const p of particles) {
-        const c = color(p.color);
-        const rim = color(p.rim);
+        const c = p.rgb;
+        const rim = p.rimRgb;
         const speed = sqrt(p.vx * p.vx + p.vy * p.vy);
         const stretch = constrain(speed * 2.1, 0, 4.5);
         const r = p.radius + stretch;
@@ -464,14 +491,14 @@
         // Rendering splat: soft translucent disks overlap into pigment washes.
         // A darker outer ring suggests marbling/oil boundaries without threshold
         // filters or expensive full-screen blur passes.
-        pigmentLayer.fill(red(c), green(c), blue(c), p.alpha * 0.32);
+        pigmentLayer.fill(c[0], c[1], c[2], p.alpha * 0.32);
         pigmentLayer.circle(p.x, p.y, r * 2.65);
-        pigmentLayer.fill(red(c), green(c), blue(c), p.alpha * 0.52);
+        pigmentLayer.fill(c[0], c[1], c[2], p.alpha * 0.52);
         pigmentLayer.circle(p.x, p.y, r * 1.45);
         pigmentLayer.fill(255, 255, 245, 6);
         pigmentLayer.circle(p.x - r * 0.16, p.y - r * 0.16, r * 0.78);
 
-        rimLayer.stroke(red(rim), green(rim), blue(rim), 17);
+        rimLayer.stroke(rim[0], rim[1], rim[2], 17);
         rimLayer.strokeWeight(1.15);
         rimLayer.circle(p.x, p.y, r * 2.12);
       }
@@ -489,9 +516,15 @@
 
       fill(75, 55, 35, 24);
       textSize(11);
+      textAlign(LEFT, TOP);
+      text('palette', 10, 9);
+      textAlign(RIGHT, TOP);
+      text('reset', width - 10, 9);
+
+      fill(75, 55, 35, 24);
       textAlign(RIGHT, TOP);
       const state = settled ? 'settled' : `${particles.length}/${maxParticles} particles`;
-      text(`${PALETTES[paletteIndex].name} · ${state}`, width - 10, 9);
+      text(`${PALETTES[paletteIndex].name} · ${state}`, width - 10, 25);
     }
 
     function pointerFromTouch() {
@@ -499,6 +532,27 @@
         return { x: touches[0].x, y: touches[0].y };
       }
       return { x: mouseX, y: mouseY };
+    }
+
+    function paletteHit(x, y) {
+      return x <= TOUCH_HIT_SIZE && y <= TOUCH_HIT_SIZE;
+    }
+
+    function resetHit(x, y) {
+      return x >= width - TOUCH_HIT_SIZE && y <= TOUCH_HIT_SIZE;
+    }
+
+    function handleTouchCommand(x, y) {
+      if (paletteHit(x, y)) {
+        cyclePalette();
+        return true;
+      }
+      if (resetHit(x, y)) {
+        resetSketch();
+        updateHint();
+        return true;
+      }
+      return false;
     }
 
     function mousePressed() {
@@ -516,12 +570,18 @@
     function touchStarted() {
       lastTouchAt = millis();
       const p = pointerFromTouch();
+      touchCommandActive = handleTouchCommand(p.x, p.y);
+      if (touchCommandActive) return false;
       startPress(p.x, p.y);
       return false;
     }
 
     function touchEnded() {
       lastTouchAt = millis();
+      if (touchCommandActive) {
+        touchCommandActive = false;
+        return false;
+      }
       finishPress();
       return false;
     }
