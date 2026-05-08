@@ -77,6 +77,8 @@
     const MIN_DROP_AREA = 26 * 26 * Math.PI;
     const MAX_DROP_AREA = 122 * 122 * Math.PI;
     const START_RADIUS = 5;
+    const EDGE_MARGIN_PX = 8;
+    const MIN_EDGE_LIMIT_RADIUS = 10;
     const GROWTH_PX_PER_SEC = 24;
     const SETTLE_EPSILON = 0.45;
 
@@ -135,7 +137,6 @@
       const int MAX_DROPS = ${MAX_DROPS};
 
       uniform vec2 u_resolution;
-      uniform float u_time;
       uniform int u_dropCount;
       uniform vec3 u_surface;
       uniform vec3 u_grain;
@@ -143,8 +144,10 @@
 
       // Uniform packing from JavaScript:
       // u_dropGeom[i] = vec4(centerX01, centerY01, currentRadiusPx, seed)
-      // u_dropColor[i] = vec4(fillR, fillG, fillB, age01)
-      // u_dropRim[i]   = vec4(rimR, rimG, rimB, targetRadiusPx)
+      // u_dropColor[i] = vec4(fillR, fillG, fillB, age01), where age01 is used for
+      //                  subtle layer-depth variation in crowded compositions.
+      // u_dropRim[i]   = vec4(rimR, rimG, rimB, targetRadiusPx), where targetRadiusPx
+      //                  is used to estimate growth/wetness while a drop settles.
       uniform vec4 u_dropGeom[MAX_DROPS];
       uniform vec4 u_dropColor[MAX_DROPS];
       uniform vec4 u_dropRim[MAX_DROPS];
@@ -262,6 +265,8 @@
           vec3 fill = fillData.rgb;
           vec3 rim = rimData.rgb;
           float radius = max(geom.z, 1.0);
+          float ageLayer = fillData.a;
+          float growth01 = clamp(radius / max(rimData.a, 1.0), 0.0, 1.0);
           vec2 centerPx = geom.xy * u_resolution;
           vec2 rel = px - centerPx;
           float radial = length(rel) / radius;
@@ -279,13 +284,13 @@
           vec3 pigment = fill;
           pigment = mix(pigment, rim, rimMask * 0.55);
           pigment = mix(pigment, u_accent, seam * bodyMask * 0.18);
-          pigment *= 0.88 + wash * 0.22;
+          pigment *= 0.88 + wash * 0.22 - ageLayer * 0.035;
           pigment -= (1.0 - smoothstep(0.35, 0.96, granule)) * 0.035;
-          pigment += (vein - 0.5) * 0.065 * (1.0 - rimMask);
+          pigment += (vein - 0.5) * 0.065 * (1.0 - rimMask) * mix(1.15, 0.85, growth01);
 
-          vec3 stainedPaper = mix(color, fill, stainMask * 0.10);
+          vec3 stainedPaper = mix(color, fill, stainMask * (0.07 + growth01 * 0.04));
           color = mix(stainedPaper, pigment, edgeMask * (0.70 + bodyMask * 0.23));
-          color = mix(color, rim, rimMask * 0.22);
+          color = mix(color, rim, rimMask * mix(0.30, 0.20, growth01));
           color = mix(color, u_accent, seam * edgeMask * 0.16);
         }
 
@@ -299,7 +304,6 @@
     let currentPaletteIndex = 0;
     let lastMs = 0;
     let settled = false;
-    let frozenTime = 0;
     let dropId = 0;
 
     function setup() {
@@ -324,11 +328,7 @@
       const anyGrowing = updateDrops(dt);
       settled = !activePress && !anyGrowing;
 
-      if (!settled) {
-        frozenTime = now / 1000;
-      }
-
-      renderShader(frozenTime);
+      renderShader();
 
       // Static-settle detection: when no press is active and every current radius is
       // within epsilon of its target, uniforms stop changing and p5 can stop looping.
@@ -342,11 +342,10 @@
       loop();
     }
 
-    function renderShader(timeSeconds) {
+    function renderShader() {
       const palette = PALETTES[currentPaletteIndex];
       shader(theShader);
       theShader.setUniform('u_resolution', [width, height]);
-      theShader.setUniform('u_time', timeSeconds);
       theShader.setUniform('u_dropCount', drops.length);
       theShader.setUniform('u_surface', hexToRgb01(palette.surface));
       theShader.setUniform('u_grain', hexToRgb01(palette.grain));
@@ -412,8 +411,8 @@
         id: dropId++,
         x: pointer.x,
         y: pointer.y,
-        currentRadius: START_RADIUS,
-        targetRadius: radiusForHold(0),
+        currentRadius: capRadiusToCanvas(pointer.x, pointer.y, START_RADIUS),
+        targetRadius: cappedRadiusForHold(pointer.x, pointer.y, 0),
         color: hexToRgb01(palette.pigments[colorIndex]),
         rimColor: hexToRgb01(palette.rims[colorIndex % palette.rims.length]),
         seed: random(0.01, 99.0),
@@ -457,12 +456,20 @@
 
     function updateActivePress(now) {
       if (!activePress) return;
-      activePress.drop.targetRadius = radiusForHold(now - activePress.startedAtMs);
+      activePress.drop.targetRadius = cappedRadiusForHold(
+        activePress.drop.x,
+        activePress.drop.y,
+        now - activePress.startedAtMs
+      );
     }
 
     function finalizeActivePress(now) {
       if (!activePress) return;
-      activePress.drop.targetRadius = radiusForHold(now - activePress.startedAtMs);
+      activePress.drop.targetRadius = cappedRadiusForHold(
+        activePress.drop.x,
+        activePress.drop.y,
+        now - activePress.startedAtMs
+      );
       activePress = null;
       settled = false;
       loop();
@@ -471,6 +478,9 @@
     function updateDrops(dt) {
       let anyGrowing = false;
       for (const drop of drops) {
+        const edgeLimit = edgeRadiusLimit(drop.x, drop.y);
+        drop.targetRadius = min(drop.targetRadius, edgeLimit);
+        drop.currentRadius = min(drop.currentRadius, edgeLimit);
         const remaining = drop.targetRadius - drop.currentRadius;
         if (remaining > SETTLE_EPSILON) {
           const ease = 0.55 + 0.45 * constrain(remaining / max(drop.targetRadius, 1), 0, 1);
@@ -494,6 +504,28 @@
       const eased = 1 - pow(1 - holdT, 3);
       const area = lerp(MIN_DROP_AREA, MAX_DROP_AREA, eased);
       return sqrt(area / Math.PI);
+    }
+
+    function cappedRadiusForHold(x, y, durationMs) {
+      return capRadiusToCanvas(x, y, radiusForHold(durationMs));
+    }
+
+    function capRadiusToCanvas(x, y, radius) {
+      return min(radius, edgeRadiusLimit(x, y));
+    }
+
+    function edgeRadiusLimit(x, y) {
+      // Edge-aware drop semantics: a drop's field is bounded to the visible page
+      // instead of growing far offscreen and relying on canvas clipping. The limit is
+      // the nearest canvas edge minus a small paper margin, clamped to a visible
+      // minimum so taps directly on an edge still produce an intentional mark.
+      const nearestEdgePx = min(
+        x * width,
+        (1 - x) * width,
+        y * height,
+        (1 - y) * height
+      );
+      return max(MIN_EDGE_LIMIT_RADIUS, nearestEdgePx - EDGE_MARGIN_PX);
     }
 
     function pointerToNorm(event) {
@@ -525,7 +557,6 @@
       drops = [];
       activePress = null;
       settled = false;
-      frozenTime = millis() / 1000;
       updateHint();
       loop();
     }
@@ -537,8 +568,17 @@
 
     function windowResized() {
       resizeCanvas(windowWidth, windowHeight);
+      clampDropsToCanvas();
       settled = false;
       loop();
+    }
+
+    function clampDropsToCanvas() {
+      for (const drop of drops) {
+        const edgeLimit = edgeRadiusLimit(drop.x, drop.y);
+        drop.targetRadius = min(drop.targetRadius, edgeLimit);
+        drop.currentRadius = min(drop.currentRadius, edgeLimit);
+      }
     }
 
     function updateHint() {
