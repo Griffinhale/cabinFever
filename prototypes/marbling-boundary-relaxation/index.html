@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+  <title>Marbling Boundary Relaxation Raster Field</title>
+  <script src="https://cdn.jsdelivr.net/npm/p5@1.11.3/lib/p5.min.js"></script>
+  <style>
+    html, body {
+      margin: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: #f3ead8;
+      touch-action: none;
+      overscroll-behavior: none;
+      font-family: ui-serif, Georgia, Cambria, "Times New Roman", Times, serif;
+    }
+    canvas {
+      display: block;
+      touch-action: none;
+    }
+  </style>
+</head>
+<body>
+<script>
+p5.disableFriendlyErrors = true;
+
+/*
+  Marbling boundary relaxation raster field prototype.
+  This standalone p5 sketch tests whether a low-resolution ownership raster can
+  grow pigment regions and then locally relax shared boundaries so newly added
+  pigment can squeeze/negotiate older territories without a full fluid solver.
+*/
+
+let paperGrain;
+let paletteIndex = 0;
+
+const PALETTES = [
+  { name: 'traditional', surface: '#f3ead8', grain: '#cdbf9c', pigments: ['#123d5a', '#74312d', '#c18b31', '#556e45', '#efe3c4'] },
+  { name: 'bright', surface: '#f8eedf', grain: '#d7c69e', pigments: ['#e9675f', '#16a7a5', '#e9c94c', '#7755a6', '#244b8f'] },
+  { name: 'subdued', surface: '#f0e5d3', grain: '#bfae91', pigments: ['#2e3334', '#9b624c', '#3f7772', '#ead8ba', '#b7773d'] },
+  { name: 'ink', surface: '#f2eadb', grain: '#beb6a8', pigments: ['#111923', '#4d5a62', '#8d9390', '#d8d0bd', '#28364d'] }
+];
+
+function setup() {
+  pixelDensity(1);
+  createCanvas(windowWidth, windowHeight);
+  createPaperGrain();
+}
+
+function draw() {
+  const palette = PALETTES[paletteIndex];
+  background(palette.surface);
+  image(paperGrain, 0, 0, width, height);
+  drawHints();
+}
+
+function createPaperGrain() {
+  const palette = PALETTES[paletteIndex];
+  paperGrain = createGraphics(max(1, windowWidth), max(1, windowHeight));
+  paperGrain.pixelDensity(1);
+  paperGrain.clear();
+  paperGrain.noStroke();
+  paperGrain.fill(palette.grain + '24');
+  for (let i = 0; i < width * height / 650; i++) {
+    paperGrain.circle(random(width), random(height), random(0.35, 1.25));
+  }
+}
+
+function drawHints() {
+  push();
+  fill(62, 48, 34, 92);
+  noStroke();
+  textSize(11);
+  textAlign(LEFT, TOP);
+  text(`hold to drop · P palette (${PALETTES[paletteIndex].name}) · R reset`, 12, 10);
+  textAlign(RIGHT, BOTTOM);
+  text('boundary relaxation raster field', width - 12, height - 10);
+  pop();
+}
+
+function keyPressed() {
+  if (key === 'p' || key === 'P') {
+    paletteIndex = (paletteIndex + 1) % PALETTES.length;
+    createPaperGrain();
+  }
+  if (key === 'r' || key === 'R') {
+    createPaperGrain();
+  }
+}
+
+function windowResized() {
+  resizeCanvas(windowWidth, windowHeight);
+  createPaperGrain();
+}
+</script>
+</body>
+</html>
