@@ -43,6 +43,7 @@ const RELAX_BUDGET = 28;
 const MAX_FRONTIER_TRIES = 220;
 const SETTLE_AFTER_STILL_FRAMES = 38;
 const COOLDOWN_FRAMES = 20;
+const CONTROL_ZONE = 58;
 const DEBUG = false;
 
 const PALETTES = [
@@ -88,7 +89,10 @@ let globalStillFrames = 0;
 function setup() {
   pixelDensity(1);
   createCanvas(windowWidth, windowHeight);
-  noSmooth();
+  // The simulation grid stays intentionally low-resolution, but the displayed
+  // pigment layer is interpolated when scaled to the canvas so seams feather
+  // instead of reading as hard square pixels.
+  smooth();
   initGrid(true);
   createPaperGrain();
 }
@@ -104,6 +108,7 @@ function draw() {
     dirty = !settled || !!activePress;
   }
 
+  drawingContext.imageSmoothingEnabled = true;
   image(pigmentLayer, 0, 0, width, height);
   if (activePress) drawPressPreview();
   if (debugOverlay) drawDebugOverlay();
@@ -126,7 +131,7 @@ function initGrid(clearDrops) {
   }
   pigmentLayer = createGraphics(gridW, gridH);
   pigmentLayer.pixelDensity(1);
-  pigmentLayer.noSmooth();
+  pigmentLayer.smooth();
   if (clearDrops) {
     drops = [];
     nextDropId = 0;
@@ -148,6 +153,24 @@ function resetField() {
   dirty = true;
   globalStillFrames = 0;
   renderPigmentLayer();
+}
+
+function cyclePalette() {
+  paletteIndex = (paletteIndex + 1) % PALETTES.length;
+  createPaperGrain();
+  dirty = true;
+}
+
+function handleCornerControl(x, y) {
+  if (x <= CONTROL_ZONE && y <= CONTROL_ZONE) {
+    cyclePalette();
+    return true;
+  }
+  if (x >= width - CONTROL_ZONE && y <= CONTROL_ZONE) {
+    resetField();
+    return true;
+  }
+  return false;
 }
 
 function createPaperGrain() {
@@ -202,6 +225,7 @@ function growDrop(drop) {
     const bestIndex = pickBestFrontierIndex(drop);
     if (bestIndex < 0) break;
     const cell = drop.frontier.splice(bestIndex, 1)[0];
+    drop.frontierSet.delete(cell);
     const x = cell % gridW;
     const y = floor(cell / gridW);
     if (!inGrid(x, y)) continue;
@@ -264,6 +288,7 @@ function relaxBoundaries() {
     const limit = min(drop.seam.length, 120);
     for (let i = 0; i < limit && changed < RELAX_BUDGET && localMoves < 10; i++) {
       const cell = drop.seam.shift();
+      if (cell != null) drop.seamSet.delete(cell);
       if (cell == null || cooldown[cell] > 0) continue;
       const victimId = owner[cell];
       if (victimId === EMPTY || victimId === drop.id) continue;
@@ -372,13 +397,17 @@ function createDropFromPress(press) {
     id: nextDropId++, seedX: gx, seedY: gy,
     targetMass, mass: 0,
     colorHex, rgb: hexToRgb(colorHex), rim: hexToRgb(palette.rim),
-    frontier: [], seam: [], status: 'growing', createdFrame: frameCount,
+    frontier: [], frontierSet: new Set(), seam: [], seamSet: new Set(), status: 'growing', createdFrame: frameCount,
     noGrowthFrames: 0, noRelaxFrames: 0, relaxMoves: 0
   };
   drops[drop.id] = drop;
 
   // Hold mapping is area/mass based rather than radius based. A quick tap still
   // gets a visible minimum; longer holds ease into a larger raster cell budget.
+  // Intentional limitation: the initial nucleus is force-claimed even when the
+  // pointer lands inside older pigment. This makes the prototype visibly test
+  // "new drop in existing pigment" boundary negotiation immediately; only this
+  // tiny seed bypasses the normal seam-scored victim negotiation.
   const nucleus = targetMass > 900 ? 2 : 1;
   for (let yy = gy - nucleus; yy <= gy + nucleus; yy++) {
     for (let xx = gx - nucleus; xx <= gx + nucleus; xx++) {
@@ -412,13 +441,23 @@ function claimCell(cell, dropId, force = false) {
 
 function addNeighborsToFrontier(drop, x, y) {
   forEachNeighbor(x, y, (nx, ny, ni) => {
-    if (owner[ni] !== drop.id) drop.frontier.push(ni);
+    if (owner[ni] !== drop.id) addFrontierCandidate(drop, ni);
     if (owner[ni] !== EMPTY && owner[ni] !== drop.id) addSeamCandidate(drop, ni);
   });
 }
 
+function addFrontierCandidate(drop, cell) {
+  if (!drop.frontierSet.has(cell) && drop.frontier.length < 1400) {
+    drop.frontierSet.add(cell);
+    drop.frontier.push(cell);
+  }
+}
+
 function addSeamCandidate(drop, cell) {
-  if (drop.seam.length < 700) drop.seam.push(cell);
+  if (!drop.seamSet.has(cell) && drop.seam.length < 700) {
+    drop.seamSet.add(cell);
+    drop.seam.push(cell);
+  }
 }
 
 function queueNearbySeams(drop, x, y, radius = 2) {
@@ -492,7 +531,11 @@ function drawHints() {
   noStroke();
   textSize(11);
   textAlign(LEFT, TOP);
-  text(`hold to drop · P palette (${PALETTES[paletteIndex].name}) · R reset`, 12, 10);
+  text(`palette\n${PALETTES[paletteIndex].name}`, 10, 8);
+  textAlign(CENTER, TOP);
+  text('hold to drop', width * 0.5, 10);
+  textAlign(RIGHT, TOP);
+  text('reset', width - 10, 8);
   textAlign(RIGHT, BOTTOM);
   const state = settled ? 'settled' : 'relaxing';
   text(`${state} · ${drops.filter(Boolean).length} drops`, width - 12, height - 10);
@@ -554,18 +597,27 @@ function hexToRgb(hex) {
   return { r: parseInt(v.slice(0, 2), 16), g: parseInt(v.slice(2, 4), 16), b: parseInt(v.slice(4, 6), 16) };
 }
 
-function mousePressed() { beginPress(mouseX, mouseY); return false; }
+function mousePressed() {
+  if (handleCornerControl(mouseX, mouseY)) return false;
+  beginPress(mouseX, mouseY);
+  return false;
+}
 function mouseDragged() { if (activePress) { activePress.x = mouseX; activePress.y = mouseY; dirty = true; } return false; }
 function mouseReleased() { endPress(mouseX, mouseY); return false; }
-function touchStarted() { const t = touches[0]; beginPress(t ? t.x : mouseX, t ? t.y : mouseY); return false; }
+function touchStarted() {
+  const t = touches[0];
+  const x = t ? t.x : mouseX;
+  const y = t ? t.y : mouseY;
+  if (handleCornerControl(x, y)) return false;
+  beginPress(x, y);
+  return false;
+}
 function touchMoved() { if (activePress) { const t = touches[0]; activePress.x = t ? t.x : mouseX; activePress.y = t ? t.y : mouseY; dirty = true; } return false; }
 function touchEnded() { endPress(activePress ? activePress.x : mouseX, activePress ? activePress.y : mouseY); return false; }
 
 function keyPressed() {
   if (key === 'p' || key === 'P') {
-    paletteIndex = (paletteIndex + 1) % PALETTES.length;
-    createPaperGrain();
-    dirty = true;
+    cyclePalette();
   } else if (key === 'r' || key === 'R') {
     resetField();
   } else if (key === 'd' || key === 'D') {
