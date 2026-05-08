@@ -8,7 +8,15 @@ It deliberately does not touch the Next.js app and has no npm/build dependency.
 
 ## Architecture
 
-The prototype is a single `index.html` using p5.js 1.11.3 from the CDN in `WEBGL` mode.
+The prototype is a single `index.html` using p5.js 1.11.3 from the CDN. It now starts with a defensive loader:
+
+- visible DOM status overlay before p5/WebGL work begins
+- p5 CDN availability check
+- WebGL context preflight
+- guarded shader creation/render calls
+- automatic p5 2D canvas fallback if WebGL or shader setup/rendering fails
+
+The preferred path is still p5 `WEBGL` with an inline shader. The fallback path uses the same drop/palette/input state and draws layered circular pigment with the 2D canvas API so the page remains usable even on devices that reject the shader.
 
 JavaScript owns:
 
@@ -19,8 +27,9 @@ JavaScript owns:
 - curated palette selection
 - reset behavior
 - static-settle detection
-- packing drop state into shader uniform arrays
+- packing drop state into shader uniform arrays when the shader path is active
 - edge-aware target/current radius limiting so drops near canvas edges stay bounded
+- 2D fallback rendering when shader/WebGL is unavailable
 
 The fragment shader owns:
 
@@ -69,6 +78,29 @@ http://localhost:8123
 
 Because p5 is loaded from a CDN, the page needs network access for first load unless the dependency is already cached.
 
+## Reliability / fallback behavior
+
+Round-two diagnosis from static inspection found several likely blank-page failure modes in the original version:
+
+- `p5.disableFriendlyErrors = true` ran unguarded, so a CDN/network failure could throw before any useful UI appeared.
+- `createCanvas(..., WEBGL)`, `createShader`, initial `shader(...)`, and draw-time uniform/shader calls were not wrapped, so WebGL or shader compile/link/runtime failures could leave the prototype blank.
+- The full shader used fixed uniform arrays for 48 drops plus per-drop noise/warp loops, which is more likely to hit older GPU/browser limits.
+- There was no DOM-level diagnostic path independent of p5/WebGL.
+
+The implemented fallback ladder is:
+
+1. Full shader renderer: paper grain, warped SDF-like drops, rims, seams, stains, and granulation.
+2. p5 2D fallback: cream paper background plus layered, lightly warped circular pigment drops. Tap/hold, palette cycling, reset, edge limiting, and settle behavior are preserved.
+3. DOM diagnostic: if p5 fails to load from the CDN, the page still shows the cream background and a visible error message.
+
+How to recognize fallback mode:
+
+- A top-left status overlay stays visible with a concise reason such as `WebGL unavailable; using 2D fallback` or `Shader render failed; using 2D fallback`.
+- The lower-left hint includes `2D fallback` instead of `shader`.
+- You can force this path for QA with `http://localhost:8123/?fallback2d`.
+
+The shader drop cap was reduced from 48 to 32 to lower uniform pressure and startup risk. Older drops are still discarded after the cap.
+
 ## Verification
 
 Static checks used for this prototype:
@@ -86,6 +118,14 @@ node --check /tmp/marbling-shader-sdf-inline.js
 python3 -m http.server 8123
 curl -fsS http://127.0.0.1:8123/ >/tmp/marbling-shader-sdf-smoke.html
 ```
+
+Fallback smoke/manual checks:
+
+```text
+http://localhost:8123/?fallback2d
+```
+
+Confirm the visible status says the 2D fallback is active, then quick tap, long hold, add neighboring drops, press `P`, press `R`, and wait for settle.
 
 If a real browser/WebGL session is unavailable in the verification environment, record that limitation explicitly and use the static smoke above to confirm the standalone HTML serves correctly. Final acceptance should still include opening `http://localhost:8123` in a WebGL-capable browser and testing tap/hold, edge drops, palette cycling, reset, and settle behavior.
 
@@ -109,7 +149,7 @@ Evaluate especially:
 - visual ceiling and screenshot quality
 - whether the gesture feels like adding pigment rather than toggling blobs
 - whether implicit seams feel plausible or fake
-- desktop/mobile viability at up to 48 active drops
+- desktop/mobile viability at up to 32 active drops
 - whether this shader could become a rendering layer over a stricter raster/displacement model
 
 ## Curated palettes
@@ -136,11 +176,13 @@ New input, reset, palette change, or resize calls `loop()` and resumes rendering
 - New drops do not truly displace old pigment.
 - Edge drops are intentionally radius-limited rather than physically displaced back into the page.
 - Weighted nearest-owner seams may still read as a shader trick in crowded compositions.
-- Fixed uniform arrays cap the prototype at 48 drops; older drops are discarded after the cap.
+- Fixed uniform arrays cap the prototype at 32 drops; older drops are discarded after the cap.
 - Full-screen fragment shader cost scales with viewport size and active drop count.
 - Mobile performance may require a lower drop cap or simpler shader noise.
 - Debugging shader ownership is harder than inspecting raster or geometry state.
 - The model is better at visual ceiling than physically honest marbling.
+- The p5 CDN remains an external dependency; if it is blocked, the DOM diagnostic appears but canvas interaction cannot run.
+- The 2D fallback is intentionally simpler than the shader and is for reliability/interaction evaluation, not final visual parity.
 
 ## Future displacement support
 
