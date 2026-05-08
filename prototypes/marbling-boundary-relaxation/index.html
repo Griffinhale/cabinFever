@@ -45,6 +45,8 @@ const SETTLE_AFTER_STILL_FRAMES = 38;
 const COOLDOWN_FRAMES = 20;
 const CONTROL_ZONE = 58;
 const DEBUG = false;
+const TARGET_RENDER_SCALE = 2;
+const MAX_RENDER_PIXELS = 620000;
 
 const PALETTES = [
   {
@@ -81,6 +83,9 @@ let pigmentCursor = 0;
 let activePress = null;
 let paperGrain;
 let pigmentLayer;
+let renderScale = TARGET_RENDER_SCALE;
+let renderW = 0;
+let renderH = 0;
 let dirty = true;
 let settled = true;
 let debugOverlay = DEBUG;
@@ -89,9 +94,10 @@ let globalStillFrames = 0;
 function setup() {
   pixelDensity(1);
   createCanvas(windowWidth, windowHeight);
-  // The simulation grid stays intentionally low-resolution, but the displayed
-  // pigment layer is interpolated when scaled to the canvas so seams feather
-  // instead of reading as hard square pixels.
+  // The simulation grid stays intentionally low-resolution, but pigment is
+  // rendered into a separate higher-resolution coverage layer. Ownership remains
+  // discrete; the display pass feathers that field so negotiated seams read less
+  // like square cells.
   smooth();
   initGrid(true);
   createPaperGrain();
@@ -129,7 +135,10 @@ function initGrid(clearDrops) {
   for (let y = 0; y < gridH; y++) {
     for (let x = 0; x < gridW; x++) stableNoise[idx(x, y)] = hashNoise(x, y);
   }
-  pigmentLayer = createGraphics(gridW, gridH);
+  renderScale = chooseRenderScale();
+  renderW = gridW * renderScale;
+  renderH = gridH * renderScale;
+  pigmentLayer = createGraphics(renderW, renderH);
   pigmentLayer.pixelDensity(1);
   pigmentLayer.smooth();
   if (clearDrops) {
@@ -139,6 +148,12 @@ function initGrid(clearDrops) {
   dirty = true;
   settled = true;
   globalStillFrames = 0;
+}
+
+function chooseRenderScale() {
+  const desiredPixels = gridW * gridH * TARGET_RENDER_SCALE * TARGET_RENDER_SCALE;
+  if (desiredPixels <= MAX_RENDER_PIXELS) return TARGET_RENDER_SCALE;
+  return 1;
 }
 
 function resetField() {
@@ -347,13 +362,47 @@ function compactnessGain(x, y, claimant, victim) {
 }
 
 function smoothnessGain(x, y, claimantId, victimId) {
-  let claimantN = 0;
-  let victimN = 0;
-  forEachNeighbor(x, y, (nx, ny, ni) => {
-    if (owner[ni] === claimantId) claimantN++;
-    if (owner[ni] === victimId) victimN++;
-  });
-  return (claimantN - victimN) * 0.18;
+  const claimantCard = countCardinalOwnerNeighbors(x, y, claimantId);
+  const claimantDiag = countDiagonalOwnerNeighbors(x, y, claimantId);
+  const victimCard = countCardinalOwnerNeighbors(x, y, victimId);
+  const victimDiag = countDiagonalOwnerNeighbors(x, y, victimId);
+
+  // Cardinal continuity matters more than diagonal touch: this discourages
+  // one-cell teeth and diagonal bridges while still allowing irregular seams.
+  const continuity = (claimantCard - victimCard) * 0.22 + (claimantDiag - victimDiag) * 0.08;
+  const toothPenalty = toothPenaltyIfClaimed(claimantCard, claimantDiag, victimCard);
+  const notchGain = notchFillGain(claimantCard, victimCard);
+  return continuity + toothPenalty + notchGain;
+}
+
+function countCardinalOwnerNeighbors(x, y, ownerId) {
+  let count = 0;
+  if (neighborOwner(x + 1, y) === ownerId) count++;
+  if (neighborOwner(x - 1, y) === ownerId) count++;
+  if (neighborOwner(x, y + 1) === ownerId) count++;
+  if (neighborOwner(x, y - 1) === ownerId) count++;
+  return count;
+}
+
+function countDiagonalOwnerNeighbors(x, y, ownerId) {
+  let count = 0;
+  if (neighborOwner(x + 1, y + 1) === ownerId) count++;
+  if (neighborOwner(x - 1, y - 1) === ownerId) count++;
+  if (neighborOwner(x + 1, y - 1) === ownerId) count++;
+  if (neighborOwner(x - 1, y + 1) === ownerId) count++;
+  return count;
+}
+
+function toothPenaltyIfClaimed(claimantCard, claimantDiag, victimCard) {
+  if (claimantCard === 0 && claimantDiag > 0) return -0.5;
+  if (claimantCard === 1 && victimCard >= 2) return -0.24;
+  return 0;
+}
+
+function notchFillGain(claimantCard, victimCard) {
+  if (claimantCard >= 3 && victimCard <= 1) return 0.38;
+  if (claimantCard >= 2 && victimCard === 0) return 0.18;
+  return 0;
 }
 
 function updateDropSettleState(drop) {
@@ -474,38 +523,98 @@ function renderPigmentLayer() {
   pigmentLayer.clear();
   pigmentLayer.loadPixels();
   const pixels = pigmentLayer.pixels;
-  for (let i = 0; i < cellCount; i++) {
-    const o = owner[i];
-    const p = i * 4;
-    if (o === EMPTY || !drops[o]) {
-      pixels[p + 3] = 0;
-      continue;
-    }
-    const drop = drops[o];
-    const x = i % gridW;
-    const y = floor(i / gridW);
-    const rim = isBoundaryCell(x, y, o);
-    const wash = 0.86 + stableNoise[i] * 0.22;
+  pixels.fill(0);
 
-    // Smoothing/rim rendering: raster cells are scaled up with browser/p5 image
-    // smoothing, while boundary cells get darker alpha/color. This hides grid
-    // stair-steps without inventing separate vector geometry that would break the
-    // ownership-field premise of the prototype.
-    let r = drop.rgb.r * wash;
-    let g = drop.rgb.g * wash;
-    let b = drop.rgb.b * wash;
-    let a = rim ? 210 : 174;
-    if (rim) {
-      r = lerp(r, drop.rim.r, 0.28);
-      g = lerp(g, drop.rim.g, 0.28);
-      b = lerp(b, drop.rim.b, 0.28);
+  for (let y = 0; y < gridH; y++) {
+    for (let x = 0; x < gridW; x++) {
+      const cell = idx(x, y);
+      const o = owner[cell];
+      if (o === EMPTY || !drops[o]) continue;
+      const drop = drops[o];
+      const wash = 0.86 + stableNoise[cell] * 0.22;
+      const baseR = drop.rgb.r * wash;
+      const baseG = drop.rgb.g * wash;
+      const baseB = drop.rgb.b * wash;
+
+      for (let sy = 0; sy < renderScale; sy++) {
+        for (let sx = 0; sx < renderScale; sx++) {
+          const coverage = boundaryCoverage(x, y, o, sx, sy);
+          const rimStrength = seamRimStrength(x, y, o, sx, sy);
+          const rimBlend = rimStrength * 0.18;
+          const alpha = constrain(lerp(64, 184, coverage) + rimStrength * 28, 0, 205);
+          const p = ((y * renderScale + sy) * renderW + (x * renderScale + sx)) * 4;
+
+          // Round-two smoothing is display-only. Each ownership cell writes a
+          // small coverage block whose corner alpha responds to neighboring
+          // owners, and the dye-pooling rim is a thin blend near owner-owner
+          // seams rather than a hard dark square over the whole boundary cell.
+          pixels[p] = constrain(lerp(baseR, drop.rim.r, rimBlend), 0, 255);
+          pixels[p + 1] = constrain(lerp(baseG, drop.rim.g, rimBlend), 0, 255);
+          pixels[p + 2] = constrain(lerp(baseB, drop.rim.b, rimBlend), 0, 255);
+          pixels[p + 3] = alpha;
+        }
+      }
     }
-    pixels[p] = constrain(r, 0, 255);
-    pixels[p + 1] = constrain(g, 0, 255);
-    pixels[p + 2] = constrain(b, 0, 255);
-    pixels[p + 3] = a;
   }
   pigmentLayer.updatePixels();
+}
+
+function boundaryCoverage(x, y, own, sx, sy) {
+  const card = countCardinalOwnerNeighbors(x, y, own);
+  const diag = countDiagonalOwnerNeighbors(x, y, own);
+  if (card === 4 && diag >= 3) return 1;
+
+  const density = constrain((card * 1.2 + diag * 0.55) / 7, 0, 1);
+  let coverage = lerp(0.48, 0.96, density);
+  const leftOpen = neighborOwner(x - 1, y) !== own;
+  const rightOpen = neighborOwner(x + 1, y) !== own;
+  const topOpen = neighborOwner(x, y - 1) !== own;
+  const bottomOpen = neighborOwner(x, y + 1) !== own;
+  if (renderScale === 1) {
+    const openSides = (leftOpen ? 1 : 0) + (rightOpen ? 1 : 0) + (topOpen ? 1 : 0) + (bottomOpen ? 1 : 0);
+    return constrain(coverage - openSides * 0.08, 0.42, 1);
+  }
+  const leftHalf = sx < renderScale / 2;
+  const topHalf = sy < renderScale / 2;
+
+  // Directional corner coverage softens the side of a cell that faces paper or a
+  // neighbor pigment. This is a cheap, stable substitute for full contours.
+  if (leftHalf && leftOpen) coverage -= 0.18;
+  if (!leftHalf && rightOpen) coverage -= 0.18;
+  if (topHalf && topOpen) coverage -= 0.18;
+  if (!topHalf && bottomOpen) coverage -= 0.18;
+  if (neighborOwner(x + (leftHalf ? -1 : 1), y + (topHalf ? -1 : 1)) !== own) coverage -= 0.08;
+  return constrain(coverage, 0.34, 1);
+}
+
+function seamRimStrength(x, y, own, sx, sy) {
+  if (renderScale === 1) {
+    let coarseStrength = 0;
+    coarseStrength += directionalRimWeight(neighborOwner(x - 1, y), own, 0.35);
+    coarseStrength += directionalRimWeight(neighborOwner(x + 1, y), own, 0.35);
+    coarseStrength += directionalRimWeight(neighborOwner(x, y - 1), own, 0.35);
+    coarseStrength += directionalRimWeight(neighborOwner(x, y + 1), own, 0.35);
+    return constrain(coarseStrength, 0, 0.75);
+  }
+  const leftHalf = sx < renderScale / 2;
+  const topHalf = sy < renderScale / 2;
+  let strength = 0;
+  strength += directionalRimWeight(neighborOwner(x - 1, y), own, leftHalf ? 0.9 : 0.18);
+  strength += directionalRimWeight(neighborOwner(x + 1, y), own, !leftHalf ? 0.9 : 0.18);
+  strength += directionalRimWeight(neighborOwner(x, y - 1), own, topHalf ? 0.9 : 0.18);
+  strength += directionalRimWeight(neighborOwner(x, y + 1), own, !topHalf ? 0.9 : 0.18);
+  strength += directionalRimWeight(neighborOwner(x + (leftHalf ? -1 : 1), y + (topHalf ? -1 : 1)), own, 0.28);
+  return constrain(strength, 0, 1);
+}
+
+function directionalRimWeight(neighbor, own, weight) {
+  if (neighbor === EMPTY || neighbor === own) return 0;
+  return weight;
+}
+
+function neighborOwner(x, y) {
+  if (!inGrid(x, y)) return EMPTY;
+  return owner[idx(x, y)];
 }
 
 function drawPressPreview() {
@@ -548,7 +657,7 @@ function drawDebugOverlay() {
   stroke(20, 20, 20, 120);
   textSize(10);
   textAlign(LEFT, TOP);
-  text(`grid ${gridW}x${gridH} cell ${cellSize}px`, 12, 28);
+  text(`grid ${gridW}x${gridH} cell ${cellSize}px · render ${renderW}x${renderH} (${renderScale}x coverage)`, 12, 28);
   for (const d of drops) if (d) text(`#${d.id} ${d.status} mass ${floor(d.mass)}/${d.targetMass}`, 12, 42 + d.id * 12);
   pop();
 }
