@@ -6,6 +6,13 @@
   <title>Marbling Radial Boundary Growth Prototype</title>
   <script src="https://cdn.jsdelivr.net/npm/p5@1.11.3/lib/p5.min.js"></script>
   <style>
+    :root {
+      --touch-control-top: 10px;
+      --touch-control-right: 10px;
+      --touch-control-width: 44px;
+      --touch-control-height: 32px;
+      --touch-control-gap: 6px;
+    }
     html, body {
       margin: 0;
       width: 100%;
@@ -34,17 +41,17 @@
     }
     .touch-controls {
       position: fixed;
-      top: max(10px, env(safe-area-inset-top));
-      right: max(10px, env(safe-area-inset-right));
+      top: max(var(--touch-control-top), env(safe-area-inset-top));
+      right: max(var(--touch-control-right), env(safe-area-inset-right));
       z-index: 2;
       display: grid;
-      gap: 6px;
+      gap: var(--touch-control-gap);
       pointer-events: none;
       user-select: none;
     }
     .touch-control {
-      min-width: 44px;
-      height: 32px;
+      width: var(--touch-control-width);
+      height: var(--touch-control-height);
       box-sizing: border-box;
       padding: 8px 9px 0;
       border: 1px solid rgba(50, 39, 26, 0.18);
@@ -63,8 +70,8 @@
 <body>
   <div id="hint" class="hint">tap/hold to drop · top-right P/R</div>
   <div class="touch-controls" aria-hidden="true">
-    <div class="touch-control">P</div>
-    <div class="touch-control">R</div>
+    <div class="touch-control" data-touch-control="palette">P</div>
+    <div class="touch-control" data-touch-control="reset">R</div>
   </div>
   <script>
     p5.disableFriendlyErrors = true;
@@ -88,8 +95,6 @@
     const EDGE_PAD = 2;
     const COLLISION_MARGIN = 0.9;
     const SETTLE_EPSILON = 0.18;
-    const TOUCH_ZONE_SIZE = 54;
-    const TOUCH_ZONE_GAP = 6;
 
     const PALETTES = [
       {
@@ -154,6 +159,7 @@
     let frameWasSettled = false;
 
     const hintEl = document.getElementById('hint');
+    const touchControlEls = Array.from(document.querySelectorAll('[data-touch-control]'));
 
     function setup() {
       createCanvas(windowWidth, windowHeight);
@@ -298,19 +304,26 @@
     }
 
     function handleControlHit(x, y) {
-      const left = width - TOUCH_ZONE_SIZE - 8;
-      const paletteTop = 8;
-      const resetTop = paletteTop + TOUCH_ZONE_SIZE + TOUCH_ZONE_GAP;
-      if (x < left || y < paletteTop || y > resetTop + TOUCH_ZONE_SIZE) return false;
-      if (y <= paletteTop + TOUCH_ZONE_SIZE) {
+      const action = touchControlActionAt(x, y);
+      if (action === 'palette') {
         nextPalette();
         return true;
       }
-      if (y >= resetTop) {
+      if (action === 'reset') {
         resetSketch();
         return true;
       }
       return false;
+    }
+
+    function touchControlActionAt(x, y) {
+      for (const el of touchControlEls) {
+        const rect = el.getBoundingClientRect();
+        if (x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom) {
+          return el.dataset.touchControl;
+        }
+      }
+      return null;
     }
 
     function beginPress(x, y) {
