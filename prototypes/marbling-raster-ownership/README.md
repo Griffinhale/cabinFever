@@ -71,6 +71,7 @@ Static-settle behavior:
 
 - `draw()` updates and renders while a press preview is active or drops are growing.
 - Once all drops are settled and no press is active, the final frame remains unchanged.
+- The simulation tick is only advanced while an unsettled drop has active growth work, so idle renders cannot change tick-derived visual variation.
 - There is no idle animated noise.
 
 ## Known limitations
