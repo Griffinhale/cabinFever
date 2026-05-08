@@ -10,8 +10,9 @@ It deliberately does not touch the Next.js app and has no npm/build dependency.
 
 The prototype is a single `index.html` using p5.js 1.11.3 from the CDN. It now starts with a defensive loader:
 
-- visible DOM status overlay before p5/WebGL work begins
-- p5 CDN availability check
+- visible DOM status overlay and cream page shell before any p5 dependency request begins
+- inline diagnostics/error handlers installed before p5/WebGL work begins
+- dynamic p5 CDN load with `onload`/`onerror`/timeout diagnostics
 - WebGL context preflight
 - guarded shader creation/render calls
 - automatic p5 2D canvas fallback if WebGL or shader setup/rendering fails
@@ -76,12 +77,13 @@ Open:
 http://localhost:8123
 ```
 
-Because p5 is loaded from a CDN, the page needs network access for first load unless the dependency is already cached.
+Because p5 is loaded dynamically from a CDN after the visible diagnostic shell is on the page, the page needs network access for first load unless the dependency is already cached. If the CDN is blocked or hangs, the cream page and top-left diagnostic remain visible instead of a blank page.
 
 ## Reliability / fallback behavior
 
 Round-two diagnosis from static inspection found several likely blank-page failure modes in the original version:
 
+- The p5 CDN was originally parser-blocking in `<head>`, so a CDN hang/block could prevent the diagnostic DOM and inline error handlers from ever appearing.
 - `p5.disableFriendlyErrors = true` ran unguarded, so a CDN/network failure could throw before any useful UI appeared.
 - `createCanvas(..., WEBGL)`, `createShader`, initial `shader(...)`, and draw-time uniform/shader calls were not wrapped, so WebGL or shader compile/link/runtime failures could leave the prototype blank.
 - The full shader used fixed uniform arrays for 48 drops plus per-drop noise/warp loops, which is more likely to hit older GPU/browser limits.

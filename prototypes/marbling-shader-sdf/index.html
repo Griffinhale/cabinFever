@@ -4,7 +4,6 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <title>Marbling Shader / SDF Prototype</title>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.11.3/p5.min.js"></script>
   <style>
     html,
     body {
@@ -125,14 +124,42 @@
       setStatus(`Renderer promise error: ${reason || 'unknown rejection'}`, 'error', true);
     });
 
-    window.setTimeout(() => {
-      if (!window.p5) {
-        setStatus('p5 failed to load from CDN. Static page is visible, but canvas interaction needs p5/network access.', 'error', true);
-      }
-    }, 2200);
+    const P5_CDN_URL = 'https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.11.3/p5.min.js';
+    const P5_LOAD_TIMEOUT_MS = 3500;
+    const p5Load = {
+      loaded: false,
+      failed: false,
+      timer: 0
+    };
 
-    if (window.p5) {
-      p5.disableFriendlyErrors = true;
+    function loadP5AfterDiagnostics() {
+      setStatus('Loading p5 renderer dependency…', 'info', true);
+
+      const script = document.createElement('script');
+      script.src = P5_CDN_URL;
+      script.async = true;
+      script.onload = () => {
+        p5Load.loaded = true;
+        window.clearTimeout(p5Load.timer);
+        if (window.p5) {
+          window.p5.disableFriendlyErrors = true;
+        }
+        setStatus('p5 loaded; starting renderer…', 'info');
+      };
+      script.onerror = () => {
+        p5Load.failed = true;
+        window.clearTimeout(p5Load.timer);
+        setStatus('p5 failed to load from CDN. Static page is visible, but canvas interaction needs p5/network access.', 'error', true);
+      };
+
+      p5Load.timer = window.setTimeout(() => {
+        if (!p5Load.loaded) {
+          p5Load.failed = true;
+          setStatus('p5 CDN load timed out. Static page is visible, but canvas interaction needs p5/network access.', 'error', true);
+        }
+      }, P5_LOAD_TIMEOUT_MS);
+
+      document.head.appendChild(script);
     }
 
     const MAX_DROPS = 32;
@@ -789,6 +816,8 @@
       const n = parseInt(clean, 16);
       return [((n >> 16) & 255) / 255, ((n >> 8) & 255) / 255, (n & 255) / 255];
     }
+
+    loadP5AfterDiagnostics();
   </script>
 </body>
 </html>
