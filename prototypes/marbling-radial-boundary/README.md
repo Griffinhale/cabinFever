@@ -36,8 +36,8 @@ Rendering uses stable visual-only boundary modulation, translucent pigment fills
 - Press / tap: begin adding pigment at the pointer
 - Hold: increase paint amount and target footprint
 - Release: create the growing drop
-- P: cycle palette for future drops
-- R: reset all drops and rebuild the paper surface
+- P: cycle palette for future drops only; settled drops and the existing surface stay visually stable
+- R: reset all drops and rebuild the paper surface for the active palette
 - Escape: reset
 
 Touch input uses p5 touch handlers and returns `false` to suppress page scrolling/zooming in the standalone demo. Palette/reset are keyboard controls in this version.
@@ -78,7 +78,7 @@ Key evaluation priorities for this radial model:
 - Drops placed inside existing pigment are ambiguous and may settle as tiny blocked marks.
 - Area conservation is approximate after uneven ray blocking.
 - Crowded compositions can still become visually busy or sticker-like.
-- Palette cycling changes the surface and future drops; existing drops keep their original pigment colors.
+- Palette cycling affects future drops only; existing drops keep their original pigment colors and the current surface is not regenerated. Use reset to rebuild the surface for the active palette.
 - Mobile core press/tap works, but palette/reset remain desktop keyboard controls for this pass.
 
 ## Future displacement support

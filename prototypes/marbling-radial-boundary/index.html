@@ -190,7 +190,6 @@
     function nextPalette() {
       currentPaletteIndex = (currentPaletteIndex + 1) % PALETTES.length;
       pigmentCursor = 0;
-      rebuildSurface();
       updateHint();
       wake();
     }
