@@ -6,23 +6,124 @@
   <title>Marbling Shader / SDF Prototype</title>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.11.3/p5.min.js"></script>
   <style>
-    html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #f4efe3; touch-action: none; }
-    canvas { display: block; position: fixed; inset: 0; width: 100vw !important; height: 100vh !important; }
-    .hint { position: fixed; left: 12px; bottom: 10px; z-index: 2; color: rgba(45, 38, 29, 0.48); font: 11px/1.45 ui-monospace, Menlo, monospace; letter-spacing: 0.03em; pointer-events: none; user-select: none; }
+    html,
+    body {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: #f4efe3;
+      touch-action: none;
+      overscroll-behavior: none;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+    }
+
+    canvas {
+      display: block;
+      position: fixed;
+      inset: 0;
+      width: 100vw !important;
+      height: 100vh !important;
+      touch-action: none;
+    }
+
+    .hint {
+      position: fixed;
+      left: 12px;
+      bottom: 10px;
+      z-index: 2;
+      color: rgba(45, 38, 29, 0.48);
+      font-size: 11px;
+      letter-spacing: 0.03em;
+      line-height: 1.45;
+      pointer-events: none;
+      user-select: none;
+      text-shadow: 0 1px 8px rgba(250, 246, 236, 0.75);
+    }
+
+    .tap-zone {
+      position: fixed;
+      z-index: 3;
+      width: 54px;
+      height: 54px;
+      opacity: 0;
+      touch-action: none;
+    }
+
+    #palette-zone { left: 0; top: 0; }
+    #reset-zone { right: 0; top: 0; }
   </style>
 </head>
 <body>
-  <div class="hint">hold to drop · P palette · R reset</div>
+  <div id="hint" class="hint">hold to drop · P palette · R reset</div>
+  <button id="palette-zone" class="tap-zone" aria-label="cycle palette"></button>
+  <button id="reset-zone" class="tap-zone" aria-label="reset"></button>
+
   <script>
-    /* Standalone p5 WEBGL shader shell for the marbling SDF prototype. */
+    /*
+      Marbling shader/SDF prototype.
+
+      This file is intentionally standalone: p5 owns input, drop state, hold-to-radius
+      mapping, growth, palette/reset, and packing arrays into shader uniforms. The
+      fragment shader owns the paper surface and the implicit SDF-like ownership field.
+      No Next.js or build tooling is involved so visual/interaction experiments stay fast.
+    */
     p5.disableFriendlyErrors = true;
+
+    const MAX_DROPS = 48;
+    const MIN_HOLD_MS = 35;
+    const MAX_HOLD_MS = 1800;
+    const MIN_DROP_AREA = 26 * 26 * Math.PI;
+    const MAX_DROP_AREA = 122 * 122 * Math.PI;
+    const START_RADIUS = 5;
+    const GROWTH_PX_PER_SEC = 24;
+    const SETTLE_EPSILON = 0.45;
+
+    const PALETTES = [
+      {
+        name: 'traditional marbling',
+        surface: '#f4efe3',
+        grain: '#c7b99d',
+        pigments: ['#17375f', '#7e2631', '#c08b32', '#3f5f46', '#efe1bf'],
+        rims: ['#09192d', '#4c1018', '#80530f', '#203623', '#c8b071'],
+        accent: '#b78c5b'
+      },
+      {
+        name: 'bright playful',
+        surface: '#fff1dc',
+        grain: '#e0bb8e',
+        pigments: ['#ee6d66', '#16aeba', '#f1d451', '#7d5ad6', '#244ba8'],
+        rims: ['#aa3231', '#0b6674', '#bd8e18', '#4b2b8d', '#10245c'],
+        accent: '#fc9f80'
+      },
+      {
+        name: 'portfolio subdued',
+        surface: '#eee7db',
+        grain: '#b7a995',
+        pigments: ['#20262b', '#9b5d48', '#527b78', '#ead7b5', '#b8723f'],
+        rims: ['#07090b', '#643427', '#284744', '#bda87d', '#794118'],
+        accent: '#c79768'
+      },
+      {
+        name: 'monochrome ink',
+        surface: '#f2efe7',
+        grain: '#b9b2a5',
+        pigments: ['#07101d', '#283241', '#5d6570', '#aab0b2', '#d7d2c5'],
+        rims: ['#010307', '#121923', '#373e48', '#777d82', '#aaa294'],
+        accent: '#576579'
+      }
+    ];
 
     const VERT_SHADER = `
       precision highp float;
       attribute vec3 aPosition;
       varying vec2 vUv;
+
       void main() {
-        // Full-screen clip-space quad; p5 WEBGL's usual centered pixel space is bypassed.
+        // We draw a clip-space quad with vertices in [-1, 1]. p5 WEBGL normally
+        // uses a centered pixel coordinate system, but this pass bypasses the
+        // default matrices so the fragment shader receives full-screen UVs.
         vUv = aPosition.xy * 0.5 + 0.5;
         gl_Position = vec4(aPosition.xy, 0.0, 1.0);
       }
@@ -30,37 +131,426 @@
 
     const FRAG_SHADER = `
       precision highp float;
+
+      const int MAX_DROPS = ${MAX_DROPS};
+
       uniform vec2 u_resolution;
+      uniform float u_time;
+      uniform int u_dropCount;
+      uniform vec3 u_surface;
+      uniform vec3 u_grain;
+      uniform vec3 u_accent;
+
+      // Uniform packing from JavaScript:
+      // u_dropGeom[i] = vec4(centerX01, centerY01, currentRadiusPx, seed)
+      // u_dropColor[i] = vec4(fillR, fillG, fillB, age01)
+      // u_dropRim[i]   = vec4(rimR, rimG, rimB, targetRadiusPx)
+      uniform vec4 u_dropGeom[MAX_DROPS];
+      uniform vec4 u_dropColor[MAX_DROPS];
+      uniform vec4 u_dropRim[MAX_DROPS];
+
       varying vec2 vUv;
+
       float hash12(vec2 p) {
         vec3 p3 = fract(vec3(p.xyx) * 0.1031);
         p3 += dot(p3, p3.yzx + 33.33);
         return fract((p3.x + p3.y) * p3.z);
       }
+
+      float noise(vec2 p) {
+        vec2 i = floor(p);
+        vec2 f = fract(p);
+        vec2 u = f * f * (3.0 - 2.0 * f);
+        return mix(
+          mix(hash12(i + vec2(0.0, 0.0)), hash12(i + vec2(1.0, 0.0)), u.x),
+          mix(hash12(i + vec2(0.0, 1.0)), hash12(i + vec2(1.0, 1.0)), u.x),
+          u.y
+        );
+      }
+
+      float fbm(vec2 p) {
+        float v = 0.0;
+        float a = 0.5;
+        for (int i = 0; i < 4; i++) {
+          v += a * noise(p);
+          p = mat2(1.62, -1.18, 1.18, 1.62) * p + 8.3;
+          a *= 0.5;
+        }
+        return v;
+      }
+
+      vec2 aspectUvToPx(vec2 uv) {
+        // WEBGL coordinate assumption: vUv is lower-left 0..1, while pointer state
+        // is stored as browser-style normalized x and y from the top-left. JS flips
+        // y before sending, so shader math can stay in bottom-left UV space.
+        return uv * u_resolution;
+      }
+
+      float boundaryWarp(vec2 px, vec2 centerPx, float seed, float radius) {
+        vec2 d = px - centerPx;
+        float a = atan(d.y, d.x);
+        float r = max(length(d), 1.0);
+        float angular = fbm(vec2(cos(a) * 2.2 + seed, sin(a) * 2.2 - seed));
+        float current = fbm(px * 0.010 + vec2(seed * 13.7, seed * 5.1));
+        float fine = noise(vec2(a * 7.0 + seed * 20.0, r * 0.030));
+        float strength = mix(2.2, 8.5, smoothstep(18.0, 120.0, radius));
+        return (angular - 0.5) * strength + (current - 0.5) * strength * 0.65 + (fine - 0.5) * 2.2;
+      }
+
+      float dropSignedDistance(vec2 px, vec4 geom) {
+        // SDF/metaball field math: each pigment drop is treated as a warped circle.
+        // Negative distance means inside the implicit region. The warp perturbs the
+        // radius rather than animating the coordinates, so settled frames are static.
+        vec2 centerPx = vec2(geom.x, geom.y) * u_resolution;
+        float radius = geom.z;
+        float warpedRadius = radius + boundaryWarp(px, centerPx, geom.w, radius);
+        return length(px - centerPx) - warpedRadius;
+      }
+
+      float ownershipScore(vec2 px, vec4 geom) {
+        // Weighted/power distance gives larger drops room to claim space while still
+        // producing nearest-owner seams. This is a collision illusion, not conserved
+        // material displacement: pixels are assigned to the best implicit owner.
+        vec2 centerPx = vec2(geom.x, geom.y) * u_resolution;
+        float radius = max(geom.z, 1.0);
+        float d = length(px - centerPx) + boundaryWarp(px, centerPx, geom.w, radius) * 0.52;
+        return d / radius - 0.070 * radius / 100.0;
+      }
+
+      vec3 paperSurface(vec2 uv, vec2 px) {
+        float broad = fbm(px * 0.0035 + 4.0);
+        float grain = noise(px * 0.95) * 0.32 + noise(px * 0.21 + 19.0) * 0.68;
+        float fibers = sin((px.x + fbm(px * 0.006) * 32.0) * 0.035) * 0.5 + 0.5;
+        vec3 paper = u_surface;
+        paper += (broad - 0.5) * 0.055;
+        paper = mix(paper, u_grain, 0.030 + grain * 0.045 + fibers * 0.012);
+        float vignette = smoothstep(0.88, 0.18, distance(uv, vec2(0.5)));
+        paper *= mix(0.94, 1.02, vignette);
+        return paper;
+      }
+
       void main() {
-        vec2 px = vUv * u_resolution;
-        float grain = hash12(floor(px * 0.65));
-        vec3 cream = vec3(0.957, 0.937, 0.890);
-        vec3 fiber = vec3(0.78, 0.72, 0.61);
-        gl_FragColor = vec4(mix(cream, fiber, grain * 0.045), 1.0);
+        vec2 uv = vUv;
+        vec2 px = aspectUvToPx(uv);
+        vec3 color = paperSurface(uv, px);
+
+        float bestScore = 1.0e6;
+        float secondScore = 1.0e6;
+        float bestSdf = 1.0e6;
+        int owner = -1;
+
+        for (int i = 0; i < MAX_DROPS; i++) {
+          if (i >= u_dropCount) { break; }
+          vec4 geom = u_dropGeom[i];
+          float sdf = dropSignedDistance(px, geom);
+          float score = ownershipScore(px, geom);
+
+          if (score < bestScore) {
+            secondScore = bestScore;
+            bestScore = score;
+            bestSdf = sdf;
+            owner = i;
+          } else if (score < secondScore) {
+            secondScore = score;
+          }
+        }
+
+        if (owner >= 0 && bestSdf < 5.5) {
+          vec4 geom = u_dropGeom[owner];
+          vec4 fillData = u_dropColor[owner];
+          vec4 rimData = u_dropRim[owner];
+          vec3 fill = fillData.rgb;
+          vec3 rim = rimData.rgb;
+          float radius = max(geom.z, 1.0);
+          vec2 centerPx = geom.xy * u_resolution;
+          vec2 rel = px - centerPx;
+          float radial = length(rel) / radius;
+
+          float edgeMask = 1.0 - smoothstep(-2.0, 5.5, bestSdf);
+          float bodyMask = 1.0 - smoothstep(-10.0, 2.0, bestSdf);
+          float rimMask = smoothstep(6.0, -1.0, abs(bestSdf));
+          float stainMask = 1.0 - smoothstep(12.0, 42.0, bestSdf);
+          float seam = 1.0 - smoothstep(0.010, 0.105, abs(secondScore - bestScore));
+
+          float wash = fbm(px * 0.018 + geom.w * 24.0);
+          float granule = noise(px * 1.65 + geom.w * 311.0);
+          float vein = fbm(vec2(atan(rel.y, rel.x) * 4.0 + geom.w * 9.0, radial * 7.5));
+
+          vec3 pigment = fill;
+          pigment = mix(pigment, rim, rimMask * 0.55);
+          pigment = mix(pigment, u_accent, seam * bodyMask * 0.18);
+          pigment *= 0.88 + wash * 0.22;
+          pigment -= (1.0 - smoothstep(0.35, 0.96, granule)) * 0.035;
+          pigment += (vein - 0.5) * 0.065 * (1.0 - rimMask);
+
+          vec3 stainedPaper = mix(color, fill, stainMask * 0.10);
+          color = mix(stainedPaper, pigment, edgeMask * (0.70 + bodyMask * 0.23));
+          color = mix(color, rim, rimMask * 0.22);
+          color = mix(color, u_accent, seam * edgeMask * 0.16);
+        }
+
+        gl_FragColor = vec4(clamp(color, 0.0, 1.0), 1.0);
       }
     `;
 
     let theShader;
+    let drops = [];
+    let activePress = null;
+    let currentPaletteIndex = 0;
+    let lastMs = 0;
+    let settled = false;
+    let frozenTime = 0;
+    let dropId = 0;
+
     function setup() {
-      createCanvas(windowWidth, windowHeight, WEBGL);
+      const canvas = createCanvas(windowWidth, windowHeight, WEBGL);
+      canvas.elt.addEventListener('contextmenu', (event) => event.preventDefault());
       pixelDensity(1);
       noStroke();
       theShader = createShader(VERT_SHADER, FRAG_SHADER);
+      lastMs = millis();
+      updateHint();
+      attachPointerEvents(canvas.elt);
+      drawOnce();
     }
+
     function draw() {
+      const now = millis();
+      const dt = min((now - lastMs) / 1000, 0.08);
+      lastMs = now;
+
+      const wasSettled = settled;
+      updateActivePress(now);
+      const anyGrowing = updateDrops(dt);
+      settled = !activePress && !anyGrowing;
+
+      if (!settled) {
+        frozenTime = now / 1000;
+      }
+
+      renderShader(frozenTime);
+
+      // Static-settle detection: when no press is active and every current radius is
+      // within epsilon of its target, uniforms stop changing and p5 can stop looping.
+      // New input/palette/reset/resize calls loop() to resume.
+      if (settled && !wasSettled) {
+        noLoop();
+      }
+    }
+
+    function drawOnce() {
+      loop();
+    }
+
+    function renderShader(timeSeconds) {
+      const palette = PALETTES[currentPaletteIndex];
       shader(theShader);
       theShader.setUniform('u_resolution', [width, height]);
+      theShader.setUniform('u_time', timeSeconds);
+      theShader.setUniform('u_dropCount', drops.length);
+      theShader.setUniform('u_surface', hexToRgb01(palette.surface));
+      theShader.setUniform('u_grain', hexToRgb01(palette.grain));
+      theShader.setUniform('u_accent', hexToRgb01(palette.accent));
+
+      const geom = [];
+      const fill = [];
+      const rim = [];
+      for (let i = 0; i < MAX_DROPS; i++) {
+        const drop = drops[i];
+        if (drop) {
+          geom.push(drop.x, 1 - drop.y, drop.currentRadius, drop.seed);
+          fill.push(...drop.color, drop.ageLayer);
+          rim.push(...drop.rimColor, drop.targetRadius);
+        } else {
+          geom.push(0, 0, 0, 0);
+          fill.push(0, 0, 0, 0);
+          rim.push(0, 0, 0, 0);
+        }
+      }
+      theShader.setUniform('u_dropGeom', geom);
+      theShader.setUniform('u_dropColor', fill);
+      theShader.setUniform('u_dropRim', rim);
+
       beginShape();
-      vertex(-1, -1, 0); vertex(1, -1, 0); vertex(1, 1, 0); vertex(-1, 1, 0);
+      vertex(-1, -1, 0);
+      vertex(1, -1, 0);
+      vertex(1, 1, 0);
+      vertex(-1, 1, 0);
       endShape(CLOSE);
     }
-    function windowResized() { resizeCanvas(windowWidth, windowHeight); }
+
+    function attachPointerEvents(canvas) {
+      canvas.addEventListener('pointerdown', onPointerDown, { passive: false });
+      canvas.addEventListener('pointermove', onPointerMove, { passive: false });
+      window.addEventListener('pointerup', onPointerUp, { passive: false });
+      window.addEventListener('pointercancel', onPointerCancel, { passive: false });
+
+      document.getElementById('palette-zone').addEventListener('pointerdown', (event) => {
+        event.preventDefault();
+        cyclePalette();
+      }, { passive: false });
+
+      document.getElementById('reset-zone').addEventListener('pointerdown', (event) => {
+        event.preventDefault();
+        resetCanvas();
+      }, { passive: false });
+    }
+
+    function onPointerDown(event) {
+      if (event.target.classList && event.target.classList.contains('tap-zone')) return;
+      event.preventDefault();
+      const pointer = pointerToNorm(event);
+      if (!pointer) return;
+
+      if (drops.length >= MAX_DROPS) {
+        drops.shift();
+      }
+
+      const palette = PALETTES[currentPaletteIndex];
+      const colorIndex = (dropId + floor(random(palette.pigments.length))) % palette.pigments.length;
+      const drop = {
+        id: dropId++,
+        x: pointer.x,
+        y: pointer.y,
+        currentRadius: START_RADIUS,
+        targetRadius: radiusForHold(0),
+        color: hexToRgb01(palette.pigments[colorIndex]),
+        rimColor: hexToRgb01(palette.rims[colorIndex % palette.rims.length]),
+        seed: random(0.01, 99.0),
+        createdAtMs: millis(),
+        ageLayer: drops.length / MAX_DROPS,
+        settled: false
+      };
+
+      drops.push(drop);
+      activePress = {
+        pointerId: event.pointerId,
+        startedAtMs: millis(),
+        drop
+      };
+      canvasPointerCapture(event);
+      lastMs = millis();
+      settled = false;
+      loop();
+    }
+
+    function onPointerMove(event) {
+      if (!activePress || event.pointerId !== activePress.pointerId) return;
+      event.preventDefault();
+      // The pigment seed stays where the press began. Holding is about paint amount,
+      // not dragging, which keeps the gesture meditative and close to dropping ink.
+    }
+
+    function onPointerUp(event) {
+      if (!activePress || event.pointerId !== activePress.pointerId) return;
+      event.preventDefault();
+      finalizeActivePress(millis());
+      releasePointerCapture(event);
+    }
+
+    function onPointerCancel(event) {
+      if (!activePress || event.pointerId !== activePress.pointerId) return;
+      event.preventDefault();
+      finalizeActivePress(millis());
+      releasePointerCapture(event);
+    }
+
+    function updateActivePress(now) {
+      if (!activePress) return;
+      activePress.drop.targetRadius = radiusForHold(now - activePress.startedAtMs);
+    }
+
+    function finalizeActivePress(now) {
+      if (!activePress) return;
+      activePress.drop.targetRadius = radiusForHold(now - activePress.startedAtMs);
+      activePress = null;
+      settled = false;
+      loop();
+    }
+
+    function updateDrops(dt) {
+      let anyGrowing = false;
+      for (const drop of drops) {
+        const remaining = drop.targetRadius - drop.currentRadius;
+        if (remaining > SETTLE_EPSILON) {
+          const ease = 0.55 + 0.45 * constrain(remaining / max(drop.targetRadius, 1), 0, 1);
+          const amount = min(remaining, GROWTH_PX_PER_SEC * dt * ease);
+          drop.currentRadius += amount;
+          drop.settled = false;
+          anyGrowing = true;
+        } else {
+          drop.currentRadius = drop.targetRadius;
+          drop.settled = true;
+        }
+      }
+      return anyGrowing;
+    }
+
+    function radiusForHold(durationMs) {
+      // Hold mapping: duration controls target area first, then radius is derived.
+      // This keeps quick taps visible and makes longer holds feel like more paint,
+      // even though the shader later represents that paint as an implicit field.
+      const holdT = constrain((durationMs - MIN_HOLD_MS) / (MAX_HOLD_MS - MIN_HOLD_MS), 0, 1);
+      const eased = 1 - pow(1 - holdT, 3);
+      const area = lerp(MIN_DROP_AREA, MAX_DROP_AREA, eased);
+      return sqrt(area / Math.PI);
+    }
+
+    function pointerToNorm(event) {
+      const rect = event.currentTarget && event.currentTarget.getBoundingClientRect
+        ? event.currentTarget.getBoundingClientRect()
+        : document.querySelector('canvas').getBoundingClientRect();
+      const x = constrain((event.clientX - rect.left) / rect.width, 0, 1);
+      const y = constrain((event.clientY - rect.top) / rect.height, 0, 1);
+      return { x, y };
+    }
+
+    function canvasPointerCapture(event) {
+      try { event.currentTarget.setPointerCapture(event.pointerId); } catch (_) {}
+    }
+
+    function releasePointerCapture(event) {
+      const canvas = document.querySelector('canvas');
+      try { canvas.releasePointerCapture(event.pointerId); } catch (_) {}
+    }
+
+    function cyclePalette() {
+      currentPaletteIndex = (currentPaletteIndex + 1) % PALETTES.length;
+      updateHint();
+      settled = false;
+      loop();
+    }
+
+    function resetCanvas() {
+      drops = [];
+      activePress = null;
+      settled = false;
+      frozenTime = millis() / 1000;
+      updateHint();
+      loop();
+    }
+
+    function keyPressed() {
+      if (key === 'p' || key === 'P') cyclePalette();
+      if (key === 'r' || key === 'R' || keyCode === ESCAPE) resetCanvas();
+    }
+
+    function windowResized() {
+      resizeCanvas(windowWidth, windowHeight);
+      settled = false;
+      loop();
+    }
+
+    function updateHint() {
+      const hint = document.getElementById('hint');
+      hint.textContent = `hold to drop · P palette · R reset · ${PALETTES[currentPaletteIndex].name}`;
+    }
+
+    function hexToRgb01(hex) {
+      const clean = hex.replace('#', '');
+      const n = parseInt(clean, 16);
+      return [((n >> 16) & 255) / 255, ((n >> 8) & 255) / 255, (n & 255) / 255];
+    }
   </script>
 </body>
 </html>
