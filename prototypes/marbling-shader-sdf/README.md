@@ -20,6 +20,7 @@ JavaScript owns:
 - reset behavior
 - static-settle detection
 - packing drop state into shader uniform arrays
+- edge-aware target/current radius limiting so drops near canvas edges stay bounded
 
 The fragment shader owns:
 
@@ -32,10 +33,12 @@ The fragment shader owns:
 Drop uniform packing is documented in the shader:
 
 - `u_dropGeom[i] = vec4(centerX01, centerY01, currentRadiusPx, seed)`
-- `u_dropColor[i] = vec4(fillR, fillG, fillB, age01)`
-- `u_dropRim[i] = vec4(rimR, rimG, rimB, targetRadiusPx)`
+- `u_dropColor[i] = vec4(fillR, fillG, fillB, age01)`; `age01` subtly varies layer depth in crowded compositions
+- `u_dropRim[i] = vec4(rimR, rimG, rimB, targetRadiusPx)`; `targetRadiusPx` estimates growth/wetness while a drop settles
 
 The collision model is an illusion: pixels choose an implicit owner using warped signed distance and weighted/power-distance scoring. This creates plausible negotiated seams, but it is not physical material conservation.
+
+Drops are bounded before they reach the shader: JavaScript caps each current/target radius by the drop center's distance to the nearest canvas edge minus an 8px paper margin, with a 10px minimum visible radius for direct edge taps. This keeps edge drops understandable instead of allowing large offscreen circles that are only clipped by the canvas.
 
 ## Controls
 
@@ -65,6 +68,26 @@ http://localhost:8123
 ```
 
 Because p5 is loaded from a CDN, the page needs network access for first load unless the dependency is already cached.
+
+## Verification
+
+Static checks used for this prototype:
+
+```bash
+python3 - <<'PY' > /tmp/marbling-shader-sdf-inline.js
+from pathlib import Path
+import re
+html = Path('index.html').read_text()
+match = re.search(r'<script>\n([\s\S]*)\n  </script>', html)
+assert match, 'inline script not found'
+print(match.group(1))
+PY
+node --check /tmp/marbling-shader-sdf-inline.js
+python3 -m http.server 8123
+curl -fsS http://127.0.0.1:8123/ >/tmp/marbling-shader-sdf-smoke.html
+```
+
+If a real browser/WebGL session is unavailable in the verification environment, record that limitation explicitly and use the static smoke above to confirm the standalone HTML serves correctly. Final acceptance should still include opening `http://localhost:8123` in a WebGL-capable browser and testing tap/hold, edge drops, palette cycling, reset, and settle behavior.
 
 ## What to evaluate
 
@@ -111,6 +134,7 @@ New input, reset, palette change, or resize calls `loop()` and resumes rendering
 - Collision semantics are approximate, not physical.
 - Paint amount maps to target radius/field strength, not conserved pigment mass.
 - New drops do not truly displace old pigment.
+- Edge drops are intentionally radius-limited rather than physically displaced back into the page.
 - Weighted nearest-owner seams may still read as a shader trick in crowded compositions.
 - Fixed uniform arrays cap the prototype at 48 drops; older drops are discarded after the cap.
 - Full-screen fragment shader cost scales with viewport size and active drop count.
