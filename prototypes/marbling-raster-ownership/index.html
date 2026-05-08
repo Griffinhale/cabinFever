@@ -105,6 +105,7 @@ let activePress = null;
 let paperLayer;
 let pigmentLayer;
 let rimLayer;
+let canvasElement;
 let settled = true;
 let dirty = true;
 let tick = 0;
@@ -120,13 +121,14 @@ let tick = 0;
 */
 function setup() {
   pixelDensity(1);
-  createCanvas(windowWidth, windowHeight);
-  canvas.elt.style.touchAction = 'none';
-  canvas.elt.addEventListener('pointerdown', handlePointerDown, { passive: false });
-  canvas.elt.addEventListener('pointerup', handlePointerUp, { passive: false });
-  canvas.elt.addEventListener('pointercancel', handlePointerCancel, { passive: false });
-  canvas.elt.addEventListener('pointerleave', handlePointerLeave, { passive: false });
-  canvas.elt.addEventListener('contextmenu', (event) => event.preventDefault());
+  const cnv = createCanvas(windowWidth, windowHeight);
+  canvasElement = cnv.elt;
+  canvasElement.style.touchAction = 'none';
+  canvasElement.addEventListener('pointerdown', handlePointerDown, { passive: false });
+  canvasElement.addEventListener('pointerup', handlePointerUp, { passive: false });
+  canvasElement.addEventListener('pointercancel', handlePointerCancel, { passive: false });
+  canvasElement.addEventListener('pointerleave', handlePointerLeave, { passive: false });
+  canvasElement.addEventListener('contextmenu', (event) => event.preventDefault());
   resetSimulation();
 }
 
@@ -168,7 +170,7 @@ function touchEnded() { return false; }
 function handlePointerDown(event) {
   event.preventDefault();
   if (activePress && activePress.pointerId !== event.pointerId) return;
-  canvas.elt.setPointerCapture(event.pointerId);
+  canvasElement.setPointerCapture(event.pointerId);
   const pos = eventToCanvas(event);
   activePress = {
     pointerId: event.pointerId,
@@ -210,7 +212,7 @@ function handlePointerLeave(event) {
 }
 
 function eventToCanvas(event) {
-  const rect = canvas.elt.getBoundingClientRect();
+  const rect = canvasElement.getBoundingClientRect();
   return {
     x: constrain(event.clientX - rect.left, 0, width - 1),
     y: constrain(event.clientY - rect.top, 0, height - 1)
@@ -380,6 +382,14 @@ function addFrontierNeighbors(drop, idx) {
 */
 function updateSimulation() {
   let anyGrew = false;
+  const hasActiveDrop = drops.some((drop) => !drop.settled);
+  if (!hasActiveDrop) {
+    const nextSettled = !activePress;
+    if (settled !== nextSettled) dirty = true;
+    settled = nextSettled;
+    return false;
+  }
+
   let anyActiveBeforeUpdate = false;
   tick++;
   let updated = 0;
