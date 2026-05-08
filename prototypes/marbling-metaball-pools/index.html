@@ -61,6 +61,8 @@
     const FIELD_RIM_BAND = 0.42;
     const MAX_HOLD_MS = 2100;
     const MIN_HOLD_MS = 80;
+    const RESET_HOLD_MS = 750;
+    const CORNER_ACTION_SIZE = 72;
     const SETTLE_EPSILON = 0.985;
 
     const PALETTES = [
@@ -130,6 +132,7 @@
     let paperLayer;
     let pigmentLayer;
     let lastDrawHadMotion = false;
+    let pendingReset = null;
 
     function setup() {
       pixelDensity(1);
@@ -331,15 +334,67 @@
     }
 
     function handleCornerActionStart(x, y) {
-      if (x < 64 && y < 64) {
+      if (isTopLeftAction(x, y)) {
         nextPalette();
         return true;
       }
-      if (x > width - 72 && y < 72) {
-        resetAll();
+      if (isTopRightAction(x, y)) {
+        startResetHold(x, y);
         return true;
       }
       return false;
+    }
+
+    function isTopLeftAction(x, y) {
+      return x < CORNER_ACTION_SIZE && y < CORNER_ACTION_SIZE;
+    }
+
+    function isTopRightAction(x, y) {
+      return x > width - CORNER_ACTION_SIZE && y < CORNER_ACTION_SIZE;
+    }
+
+    function startResetHold(x, y) {
+      cancelResetHold();
+      pendingReset = {
+        x,
+        y,
+        completed: false,
+        timer: window.setTimeout(() => {
+          if (!pendingReset) return;
+          pendingReset.completed = true;
+          resetAll();
+        }, RESET_HOLD_MS)
+      };
+      dirty = true;
+    }
+
+    function cancelResetHold() {
+      if (!pendingReset) return;
+      window.clearTimeout(pendingReset.timer);
+      pendingReset = null;
+      dirty = true;
+    }
+
+    function updateCornerActionHold(x, y) {
+      if (pendingReset && !pendingReset.completed && !isTopRightAction(x, y)) {
+        cancelResetHold();
+      }
+    }
+
+    function finishCornerActionHold() {
+      if (pendingReset && !pendingReset.completed) {
+        cancelResetHold();
+        return true;
+      }
+      if (pendingReset && pendingReset.completed) {
+        pendingReset = null;
+        return true;
+      }
+      return false;
+    }
+
+    function handlePointerMove(x, y) {
+      updateCornerActionHold(x, y);
     }
 
     // Hold mapping: duration is clamped, eased, converted to target area/mass,
@@ -483,6 +538,10 @@
     }
 
     function resetAll() {
+      if (pendingReset) {
+        window.clearTimeout(pendingReset.timer);
+        pendingReset = null;
+      }
       pools = [];
       activePress = null;
       pigmentLayer.clear();
@@ -509,7 +568,14 @@
 
     function mouseReleased() {
       if (touches && touches.length) return false;
+      if (finishCornerActionHold()) return false;
       endPress();
+      return false;
+    }
+
+    function mouseDragged() {
+      if (touches && touches.length) return false;
+      handlePointerMove(mouseX, mouseY);
       return false;
     }
 
@@ -519,7 +585,14 @@
       return false;
     }
 
+    function touchMoved() {
+      const t = touches && touches.length ? touches[0] : { x: mouseX, y: mouseY };
+      handlePointerMove(t.x, t.y);
+      return false;
+    }
+
     function touchEnded() {
+      if (finishCornerActionHold()) return false;
       endPress();
       return false;
     }
