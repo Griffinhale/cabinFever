@@ -28,6 +28,31 @@
       touch-action: none;
     }
 
+    .status {
+      position: fixed;
+      left: 12px;
+      top: 10px;
+      z-index: 4;
+      max-width: min(520px, calc(100vw - 24px));
+      padding: 7px 9px;
+      border: 1px solid rgba(64, 50, 31, 0.18);
+      border-radius: 9px;
+      background: rgba(250, 246, 236, 0.84);
+      color: rgba(45, 38, 29, 0.74);
+      font-size: 11px;
+      line-height: 1.35;
+      letter-spacing: 0.01em;
+      pointer-events: none;
+      user-select: none;
+      box-shadow: 0 8px 28px rgba(44, 32, 18, 0.08);
+      opacity: 0;
+      transition: opacity 180ms ease;
+    }
+
+    .status.visible { opacity: 1; }
+    .status.error { color: #5d2020; border-color: rgba(115, 38, 38, 0.28); }
+    .status.warn { color: #5b4422; border-color: rgba(132, 91, 30, 0.28); }
+
     .hint {
       position: fixed;
       left: 12px;
@@ -56,6 +81,7 @@
   </style>
 </head>
 <body>
+  <div id="status" class="status visible">Starting marbling renderer…</div>
   <div id="hint" class="hint">hold to drop · P palette · R reset</div>
   <button id="palette-zone" class="tap-zone" aria-label="cycle palette"></button>
   <button id="reset-zone" class="tap-zone" aria-label="reset"></button>
@@ -69,9 +95,47 @@
       fragment shader owns the paper surface and the implicit SDF-like ownership field.
       No Next.js or build tooling is involved so visual/interaction experiments stay fast.
     */
-    p5.disableFriendlyErrors = true;
+    const statusEl = document.getElementById('status');
+    const hintEl = document.getElementById('hint');
 
-    const MAX_DROPS = 48;
+    function setStatus(message, level = 'info', persist = false) {
+      if (!statusEl) return;
+      statusEl.textContent = message;
+      statusEl.className = `status visible ${level === 'error' ? 'error' : level === 'warn' ? 'warn' : ''}`.trim();
+      if (!persist && level === 'info') {
+        window.clearTimeout(setStatus.hideTimer);
+        setStatus.hideTimer = window.setTimeout(() => statusEl.classList.remove('visible'), 1800);
+      }
+    }
+
+    function reportStartupIssue(message, detail) {
+      if (detail) console.warn(message, detail);
+      setStatus(message, 'warn', true);
+    }
+
+    window.addEventListener('error', (event) => {
+      const message = event.message || 'Unknown script error';
+      console.error('Visible startup error:', event.error || message);
+      setStatus(`Renderer error: ${message}`, 'error', true);
+    });
+
+    window.addEventListener('unhandledrejection', (event) => {
+      const reason = event.reason && (event.reason.message || String(event.reason));
+      console.error('Visible unhandled rejection:', event.reason);
+      setStatus(`Renderer promise error: ${reason || 'unknown rejection'}`, 'error', true);
+    });
+
+    window.setTimeout(() => {
+      if (!window.p5) {
+        setStatus('p5 failed to load from CDN. Static page is visible, but canvas interaction needs p5/network access.', 'error', true);
+      }
+    }, 2200);
+
+    if (window.p5) {
+      p5.disableFriendlyErrors = true;
+    }
+
+    const MAX_DROPS = 32;
     const MIN_HOLD_MS = 35;
     const MAX_HOLD_MS = 1800;
     const MIN_DROP_AREA = 26 * 26 * Math.PI;
@@ -298,7 +362,12 @@
       }
     `;
 
+    const FORCE_2D_FALLBACK = new URLSearchParams(window.location.search).has('fallback2d');
+
     let theShader;
+    let rendererMode = 'shader';
+    let currentCanvas = null;
+    let controlsAttached = false;
     let drops = [];
     let activePress = null;
     let currentPaletteIndex = 0;
@@ -307,15 +376,71 @@
     let dropId = 0;
 
     function setup() {
-      const canvas = createCanvas(windowWidth, windowHeight, WEBGL);
-      canvas.elt.addEventListener('contextmenu', (event) => event.preventDefault());
+      setStatus('Checking WebGL and shader support…', 'info', true);
+      if (FORCE_2D_FALLBACK) {
+        setupFallback2D('Forced 2D fallback via ?fallback2d');
+        return;
+      }
+
+      if (!canCreateWebGLContext()) {
+        setupFallback2D('WebGL unavailable; using 2D fallback');
+        return;
+      }
+
+      try {
+        currentCanvas = createCanvas(windowWidth, windowHeight, WEBGL);
+        currentCanvas.elt.addEventListener('contextmenu', (event) => event.preventDefault());
+        pixelDensity(1);
+        noStroke();
+        theShader = createShader(VERT_SHADER, FRAG_SHADER);
+        shader(theShader);
+        resetShader();
+        rendererMode = 'shader';
+        lastMs = millis();
+        updateHint();
+        attachPointerEvents(currentCanvas.elt);
+        setStatus('Shader renderer ready', 'info');
+        drawOnce();
+      } catch (error) {
+        console.warn('Shader startup failed; falling back to 2D renderer.', error);
+        setupFallback2D(`Shader failed; using 2D fallback (${shortError(error)})`);
+      }
+    }
+
+    function canCreateWebGLContext() {
+      try {
+        const probe = document.createElement('canvas');
+        return !!(probe.getContext('webgl') || probe.getContext('experimental-webgl'));
+      } catch (error) {
+        console.warn('WebGL preflight threw.', error);
+        return false;
+      }
+    }
+
+    function setupFallback2D(reason) {
+      try {
+        if (currentCanvas && currentCanvas.remove) currentCanvas.remove();
+      } catch (_) {}
+      rendererMode = 'fallback2d';
+      currentCanvas = createCanvas(windowWidth, windowHeight);
+      currentCanvas.elt.addEventListener('contextmenu', (event) => event.preventDefault());
       pixelDensity(1);
       noStroke();
-      theShader = createShader(VERT_SHADER, FRAG_SHADER);
       lastMs = millis();
       updateHint();
-      attachPointerEvents(canvas.elt);
+      attachPointerEvents(currentCanvas.elt);
+      reportStartupIssue(reason || 'Using 2D fallback renderer');
       drawOnce();
+    }
+
+    function switchToFallback2D(reason) {
+      if (rendererMode === 'fallback2d') return;
+      console.warn('Switching to 2D fallback:', reason);
+      setupFallback2D(reason);
+    }
+
+    function shortError(error) {
+      return error && error.message ? error.message.split('\n')[0].slice(0, 90) : 'unknown error';
     }
 
     function draw() {
@@ -328,7 +453,16 @@
       const anyGrowing = updateDrops(dt);
       settled = !activePress && !anyGrowing;
 
-      renderShader();
+      if (rendererMode === 'shader') {
+        try {
+          renderShader();
+        } catch (error) {
+          switchToFallback2D(`Shader render failed; using 2D fallback (${shortError(error)})`);
+          renderFallback2D();
+        }
+      } else {
+        renderFallback2D();
+      }
 
       // Static-settle detection: when no press is active and every current radius is
       // within epsilon of its target, uniforms stop changing and p5 can stop looping.
@@ -346,7 +480,7 @@
       const palette = PALETTES[currentPaletteIndex];
       shader(theShader);
       theShader.setUniform('u_resolution', [width, height]);
-      theShader.setUniform('u_dropCount', drops.length);
+      theShader.setUniform('u_dropCount', min(drops.length, MAX_DROPS));
       theShader.setUniform('u_surface', hexToRgb01(palette.surface));
       theShader.setUniform('u_grain', hexToRgb01(palette.grain));
       theShader.setUniform('u_accent', hexToRgb01(palette.accent));
@@ -378,9 +512,73 @@
       endShape(CLOSE);
     }
 
+    function renderFallback2D() {
+      const palette = PALETTES[currentPaletteIndex];
+      resetMatrix();
+      clear();
+      background(palette.surface);
+      drawPaperGrain2D(palette);
+      for (const drop of drops) {
+        drawFallbackDrop(drop);
+      }
+    }
+
+    function drawPaperGrain2D(palette) {
+      push();
+      const grain = color(palette.grain);
+      stroke(red(grain), green(grain), blue(grain), 18);
+      strokeWeight(1);
+      const step = max(18, min(width, height) / 34);
+      for (let y = 0; y < height; y += step) {
+        const wobble = sin(y * 0.027) * 8;
+        line(0, y + wobble, width, y - wobble * 0.35);
+      }
+      noStroke();
+      fill(255, 250, 240, 24);
+      ellipse(width * 0.5, height * 0.44, width * 1.05, height * 0.78);
+      pop();
+    }
+
+    function drawFallbackDrop(drop) {
+      const cx = drop.x * width;
+      const cy = drop.y * height;
+      const r = drop.currentRadius;
+      const fillRgb = drop.color.map((v) => v * 255);
+      const rimRgb = drop.rimColor.map((v) => v * 255);
+      push();
+      translate(cx, cy);
+      noStroke();
+      fill(fillRgb[0], fillRgb[1], fillRgb[2], 30);
+      ellipse(0, 0, r * 2.55, r * 2.2);
+      for (let layer = 5; layer >= 1; layer--) {
+        const t = layer / 5;
+        const alpha = 34 + (1 - t) * 38;
+        fill(fillRgb[0], fillRgb[1], fillRgb[2], alpha);
+        beginShape();
+        const points = 36;
+        for (let i = 0; i < points; i++) {
+          const a = (Math.PI * 2 * i) / points;
+          const warp = 1 + 0.045 * sin(a * 3 + drop.seed * 2.1) + 0.030 * sin(a * 7 - drop.seed);
+          const rr = r * (0.28 + t * 0.72) * warp;
+          vertex(cos(a) * rr, sin(a) * rr);
+        }
+        endShape(CLOSE);
+      }
+      noFill();
+      stroke(rimRgb[0], rimRgb[1], rimRgb[2], 115);
+      strokeWeight(max(1.5, r * 0.045));
+      ellipse(0, 0, r * 1.96, r * 1.96);
+      stroke(255, 250, 235, 42);
+      strokeWeight(max(1, r * 0.018));
+      ellipse(-r * 0.08, -r * 0.08, r * 1.35, r * 1.18);
+      pop();
+    }
+
     function attachPointerEvents(canvas) {
       canvas.addEventListener('pointerdown', onPointerDown, { passive: false });
       canvas.addEventListener('pointermove', onPointerMove, { passive: false });
+      if (controlsAttached) return;
+      controlsAttached = true;
       window.addEventListener('pointerup', onPointerUp, { passive: false });
       window.addEventListener('pointercancel', onPointerCancel, { passive: false });
 
@@ -582,8 +780,8 @@
     }
 
     function updateHint() {
-      const hint = document.getElementById('hint');
-      hint.textContent = `hold to drop · P palette · R reset · ${PALETTES[currentPaletteIndex].name}`;
+      const modeLabel = rendererMode === 'fallback2d' ? '2D fallback' : 'shader';
+      hintEl.textContent = `hold to drop · P palette · R reset · ${PALETTES[currentPaletteIndex].name} · ${modeLabel}`;
     }
 
     function hexToRgb01(hex) {
