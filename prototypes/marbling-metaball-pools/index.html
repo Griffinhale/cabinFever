@@ -7,45 +7,530 @@
   <script src="https://cdn.jsdelivr.net/npm/p5@1.11.3/lib/p5.min.js"></script>
   <script>window.p5 && (p5.disableFriendlyErrors = true);</script>
   <style>
-    html, body { margin: 0; padding: 0; overflow: hidden; background: #f4eddf; touch-action: none; }
-    canvas { display: block; }
-    #hint { position: fixed; left: 10px; bottom: 8px; color: rgba(45,35,25,0.46); font: 11px/1.35 ui-monospace, monospace; pointer-events: none; }
+    html, body {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: #f4eddf;
+      touch-action: none;
+      overscroll-behavior: none;
+      -webkit-user-select: none;
+      user-select: none;
+    }
+    canvas { display: block; touch-action: none; }
+    #hint {
+      position: fixed;
+      left: 10px;
+      bottom: 8px;
+      z-index: 10;
+      color: rgba(45, 35, 25, 0.46);
+      font: 11px/1.35 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      letter-spacing: 0.02em;
+      pointer-events: none;
+      text-shadow: 0 1px 0 rgba(255,255,255,0.35);
+    }
+    #cornerActions {
+      position: fixed;
+      right: 8px;
+      bottom: 8px;
+      z-index: 11;
+      color: rgba(45, 35, 25, 0.34);
+      font: 10px/1.35 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      pointer-events: none;
+      text-align: right;
+    }
   </style>
 </head>
 <body>
   <div id="hint">hold to drop · P palette · R reset</div>
+  <div id="cornerActions">tap top-left: palette<br>hold top-right: reset</div>
   <script>
-    /* Marbling metaballs prototype shell: standalone p5 canvas for implicit pigment pool exploration. */
+    /*
+      Marbling metaballs / implicit pigment pools prototype.
+
+      Standalone p5 sketch that tests whether same-pigment metaball lobes plus
+      strongest-owner clipping can make soft marbled pools without collapsing
+      all colors into one global lava-lamp blob. Kept self-contained for quick
+      comparison with sibling architecture prototypes.
+    */
+
+    const FIELD_CELL = 4;
+    const FIELD_THRESHOLD = 0.92;
+    const FIELD_RIM_BAND = 0.42;
+    const MAX_HOLD_MS = 2100;
+    const MIN_HOLD_MS = 80;
+    const SETTLE_EPSILON = 0.985;
+
+    const PALETTES = [
+      {
+        name: 'traditional marbling',
+        surface: '#f3ead8',
+        grain: '#d8c6a8',
+        shadow: '#3a2a21',
+        pigments: [
+          { base: '#173b62', rim: '#0b2138', wash: '#6f8fb0' },
+          { base: '#7d2630', rim: '#42121a', wash: '#b96f68' },
+          { base: '#c18a2f', rim: '#765119', wash: '#dfbd71' },
+          { base: '#53673a', rim: '#2c381f', wash: '#9aa574' },
+          { base: '#d9c8a4', rim: '#8f7650', wash: '#f2e6c9' }
+        ]
+      },
+      {
+        name: 'bright playful',
+        surface: '#fbf2df',
+        grain: '#e1cfaa',
+        shadow: '#24212b',
+        pigments: [
+          { base: '#f0645f', rim: '#9e2d32', wash: '#ffaaa0' },
+          { base: '#17a6a5', rim: '#08666d', wash: '#8bdad2' },
+          { base: '#f3cf38', rim: '#a77c0d', wash: '#ffe988' },
+          { base: '#8066c8', rim: '#46337d', wash: '#b9a6ed' },
+          { base: '#2351c6', rim: '#142a77', wash: '#7e9dea' }
+        ]
+      },
+      {
+        name: 'portfolio subdued',
+        surface: '#f1eadc',
+        grain: '#d0c2aa',
+        shadow: '#2b2925',
+        pigments: [
+          { base: '#29313a', rim: '#11161b', wash: '#737b83' },
+          { base: '#a85f47', rim: '#653225', wash: '#d7a18b' },
+          { base: '#4f827f', rim: '#294a49', wash: '#9abcb7' },
+          { base: '#d8c6a0', rim: '#856f49', wash: '#f0e4c4' },
+          { base: '#b8733b', rim: '#70401f', wash: '#d6a06b' }
+        ]
+      },
+      {
+        name: 'monochrome ink',
+        surface: '#f5f1e8',
+        grain: '#cbc2b1',
+        shadow: '#171a20',
+        pigments: [
+          { base: '#101b2a', rim: '#05090f', wash: '#657287' },
+          { base: '#3e4855', rim: '#1b2129', wash: '#8b95a1' },
+          { base: '#777a76', rim: '#3d403f', wash: '#babcb3' },
+          { base: '#b6b7aa', rim: '#74786d', wash: '#deded2' }
+        ]
+      }
+    ];
+
+    let pools = [];
+    let activePress = null;
+    let paletteIndex = 0;
+    let pigmentIndex = 0;
+    let poolId = 1;
+    let dirty = true;
+    let settled = true;
+    let fieldCols = 0;
+    let fieldRows = 0;
+    let field = [];
     let paperLayer;
+    let pigmentLayer;
+    let lastDrawHadMotion = false;
 
     function setup() {
       pixelDensity(1);
       createCanvas(windowWidth, windowHeight);
-      paperLayer = createGraphics(width, height);
-      renderPaper();
+      rebuildSurfaces();
+      updateHint();
     }
 
     function draw() {
-      image(paperLayer, 0, 0);
+      let moving = false;
+      if (activePress) moving = true;
+
+      for (const pool of pools) {
+        if (pool.update()) moving = true;
+      }
+
+      // Static-settle detection: when no press preview exists and every pool has
+      // reached its target radii, stop mutating lobe offsets/noise and stop
+      // recomputing the expensive field until new input/resizes/reset occurs.
+      settled = !activePress && pools.every(pool => pool.settled);
+      if (moving || dirty || lastDrawHadMotion) {
+        renderScene();
+        dirty = false;
+      } else {
+        image(paperLayer, 0, 0);
+        image(pigmentLayer, 0, 0);
+      }
+      lastDrawHadMotion = moving;
+    }
+
+    function rebuildSurfaces() {
+      fieldCols = Math.ceil(width / FIELD_CELL);
+      fieldRows = Math.ceil(height / FIELD_CELL);
+      field = new Array(fieldCols * fieldRows);
+      paperLayer = createGraphics(width, height);
+      pigmentLayer = createGraphics(width, height);
+      pigmentLayer.pixelDensity(1);
+      paperLayer.pixelDensity(1);
+      renderPaper();
+      dirty = true;
     }
 
     function renderPaper() {
-      paperLayer.background('#f3ead8');
+      const palette = PALETTES[paletteIndex];
+      paperLayer.background(palette.surface);
       paperLayer.noStroke();
       paperLayer.randomSeed(4887);
-      for (let i = 0; i < (width * height) / 70; i++) {
-        paperLayer.fill(216, 198, 168, paperLayer.random(4, 14));
-        paperLayer.circle(paperLayer.random(width), paperLayer.random(height), paperLayer.random(0.5, 1.5));
+      const grainColor = color(palette.grain);
+      for (let i = 0; i < (width * height) / 46; i++) {
+        const x = paperLayer.random(width);
+        const y = paperLayer.random(height);
+        const a = paperLayer.random(5, 18);
+        const r = paperLayer.random(0.35, 1.6);
+        paperLayer.fill(red(grainColor), green(grainColor), blue(grainColor), a);
+        paperLayer.circle(x, y, r);
+      }
+      for (let y = 0; y < height; y += 3) {
+        const a = 4 + 3 * noise(y * 0.008, 17.3);
+        paperLayer.stroke(255, 248, 232, a);
+        paperLayer.line(0, y, width, y);
       }
     }
 
-    function keyPressed() {}
+    function renderScene() {
+      image(paperLayer, 0, 0);
+      renderPigmentField();
+      image(pigmentLayer, 0, 0);
+      renderPressPreview();
+    }
+
+    function renderPigmentField() {
+      pigmentLayer.clear();
+      const renderPools = activePress ? pools.concat([previewPoolFromPress(activePress)]) : pools;
+      evaluateField(renderPools);
+
+      pigmentLayer.noStroke();
+      for (let gy = 0; gy < fieldRows; gy++) {
+        for (let gx = 0; gx < fieldCols; gx++) {
+          const cell = field[gx + gy * fieldCols];
+          if (!cell || cell.owner < 0) continue;
+          const pool = renderPools[cell.owner];
+          const neighborRim = hasDifferentNeighbor(gx, gy, cell.owner);
+          drawPigmentCell(gx, gy, cell, pool, neighborRim);
+        }
+      }
+    }
+
+    // Metaball field evaluation: child lobes inside a pool sum their smooth
+    // influence so a single pigment identity merges organically. We deliberately
+    // evaluate each pool separately instead of one global field.
+    function evaluateField(renderPools) {
+      for (let gy = 0; gy < fieldRows; gy++) {
+        const y = gy * FIELD_CELL + FIELD_CELL * 0.5;
+        for (let gx = 0; gx < fieldCols; gx++) {
+          const x = gx * FIELD_CELL + FIELD_CELL * 0.5;
+          let best = -1;
+          let bestField = 0;
+          let bestAge = -1;
+          let secondField = 0;
+          for (let i = 0; i < renderPools.length; i++) {
+            const pool = renderPools[i];
+            const f = pool.fieldAt(x, y);
+            if (f > secondField) secondField = f;
+            // Ownership/clipping strategy: each cell can have exactly one owner.
+            // Strongest normalized pool field wins above threshold; near-ties go
+            // to the newer pool, making fresh pigment read as sitting on top while
+            // preventing different pigment identities from summing into one blob.
+            const newerTie = Math.abs(f - bestField) < 0.045 && pool.createdAt > bestAge;
+            if (f > bestField || (f > FIELD_THRESHOLD && newerTie)) {
+              secondField = bestField;
+              bestField = f;
+              best = i;
+              bestAge = pool.createdAt;
+            }
+          }
+          const idx = gx + gy * fieldCols;
+          field[idx] = bestField >= FIELD_THRESHOLD
+            ? { owner: best, strength: bestField, margin: bestField - secondField }
+            : { owner: -1, strength: bestField, margin: 0 };
+        }
+      }
+    }
+
+    function hasDifferentNeighbor(gx, gy, owner) {
+      const checks = [[1,0],[-1,0],[0,1],[0,-1]];
+      for (const [dx, dy] of checks) {
+        const nx = gx + dx;
+        const ny = gy + dy;
+        if (nx < 0 || ny < 0 || nx >= fieldCols || ny >= fieldRows) return true;
+        const n = field[nx + ny * fieldCols];
+        if (!n || n.owner !== owner) return true;
+      }
+      return false;
+    }
+
+    // Contour/rim rendering: threshold bands darken the outer edge and neighbor
+    // changes darken pigment-pigment seams, so clipping boundaries read as
+    // intentional marbling contours instead of accidental field overlap.
+    function drawPigmentCell(gx, gy, cell, pool, neighborRim) {
+      const base = color(pool.color.base);
+      const rim = color(pool.color.rim);
+      const wash = color(pool.color.wash);
+      const x = gx * FIELD_CELL;
+      const y = gy * FIELD_CELL;
+      const n = stableNoise(gx, gy, pool.seed);
+      const edgeT = constrain((cell.strength - FIELD_THRESHOLD) / FIELD_RIM_BAND, 0, 1);
+      const alpha = 76 + 78 * constrain(edgeT, 0, 1);
+      const rimT = neighborRim ? 0.75 : Math.max(0, 1 - edgeT) * 0.65;
+      const washT = constrain((cell.strength - 1.5) / 3.2, 0, 0.48);
+      let c = lerpColor(base, wash, washT);
+      c = lerpColor(c, rim, rimT);
+      pigmentLayer.fill(
+        constrain(red(c) + (n - 0.5) * 10, 0, 255),
+        constrain(green(c) + (n - 0.5) * 10, 0, 255),
+        constrain(blue(c) + (n - 0.5) * 10, 0, 255),
+        neighborRim ? 168 : alpha
+      );
+      pigmentLayer.rect(x, y, FIELD_CELL + 0.6, FIELD_CELL + 0.6);
+
+      if (neighborRim && (gx + gy) % 2 === 0) {
+        pigmentLayer.fill(red(rim), green(rim), blue(rim), 48);
+        pigmentLayer.rect(x, y, FIELD_CELL + 0.6, FIELD_CELL + 0.6);
+      }
+    }
+
+    function renderPressPreview() {
+      if (!activePress) return;
+      const held = millis() - activePress.startedAt;
+      const t = holdToUnit(held);
+      noFill();
+      stroke(35, 25, 18, 34 + 28 * t);
+      strokeWeight(1);
+      const r = sqrt(holdToMass(held) / PI) * 1.15;
+      circle(activePress.x, activePress.y, r * 2);
+      stroke(255, 250, 238, 60);
+      circle(activePress.x, activePress.y, max(8, r * 0.6));
+    }
+
+    function startPress(x, y) {
+      const corner = handleCornerActionStart(x, y);
+      if (corner) return;
+      activePress = {
+        x: constrain(x, 0, width),
+        y: constrain(y, 0, height),
+        startedAt: millis(),
+        color: choosePigment(),
+        seed: random(1000000)
+      };
+      dirty = true;
+    }
+
+    function endPress() {
+      if (!activePress) return;
+      const held = millis() - activePress.startedAt;
+      const pool = createPool(activePress.x, activePress.y, held, activePress.color, activePress.seed, false);
+      pools.push(pool);
+      activePress = null;
+      dirty = true;
+    }
+
+    function handleCornerActionStart(x, y) {
+      if (x < 64 && y < 64) {
+        nextPalette();
+        return true;
+      }
+      if (x > width - 72 && y < 72) {
+        resetAll();
+        return true;
+      }
+      return false;
+    }
+
+    // Hold mapping: duration is clamped, eased, converted to target area/mass,
+    // then split across 3-12 child lobes. This makes quick taps visibly small
+    // while long holds create broader footprints with richer asymmetric edges.
+    function holdToUnit(ms) {
+      const clamped = constrain(ms, MIN_HOLD_MS, MAX_HOLD_MS);
+      const t = (clamped - MIN_HOLD_MS) / (MAX_HOLD_MS - MIN_HOLD_MS);
+      return t * t * (3 - 2 * t);
+    }
+
+    function holdToMass(ms) {
+      const minArea = 1600;
+      const maxArea = min(width * height * 0.105, 36000);
+      return lerp(minArea, maxArea, holdToUnit(ms));
+    }
+
+    function choosePigment() {
+      const palette = PALETTES[paletteIndex];
+      const pigment = palette.pigments[pigmentIndex % palette.pigments.length];
+      pigmentIndex++;
+      return pigment;
+    }
+
+    function createPool(x, y, holdMs, pigment, seed, preview) {
+      const mass = holdToMass(holdMs);
+      const t = holdToUnit(holdMs);
+      const lobeCount = floor(lerp(3, 12.99, t));
+      const id = preview ? -1 : poolId++;
+      return new PigmentPool(id, x, y, mass, lobeCount, pigment, seed, preview);
+    }
+
+    function previewPoolFromPress(press) {
+      const p = createPool(press.x, press.y, millis() - press.startedAt, press.color, press.seed, true);
+      p.currentMass = p.targetMass * 0.38;
+      for (const lobe of p.lobes) {
+        lobe.radius = lobe.targetRadius * 0.42;
+        lobe.offsetNow = lobe.offsetTarget * 0.45;
+      }
+      return p;
+    }
+
+    class PigmentPool {
+      constructor(id, x, y, mass, lobeCount, colorValue, seed, preview) {
+        this.id = id;
+        this.center = { x, y };
+        this.createdAt = preview ? millis() + 999999 : millis();
+        this.color = colorValue;
+        this.targetMass = mass;
+        this.currentMass = preview ? mass * 0.35 : 32;
+        this.growthRate = random(0.010, 0.018);
+        this.seed = seed;
+        this.settled = false;
+        this.preview = preview;
+        this.lobes = [];
+        this.makeLobes(lobeCount);
+      }
+
+      makeLobes(count) {
+        randomSeed(floor(this.seed));
+        const baseRadius = sqrt(this.targetMass / PI);
+        let weights = [];
+        let total = 0;
+        for (let i = 0; i < count; i++) {
+          const w = random(0.55, 1.45);
+          weights.push(w);
+          total += w;
+        }
+        for (let i = 0; i < count; i++) {
+          const angle = (TWO_PI * i / count) + random(-0.55, 0.55);
+          const offsetTarget = i === 0 ? 0 : random(baseRadius * 0.10, baseRadius * 0.58);
+          const lobeMass = this.targetMass * weights[i] / total * random(0.82, 1.18);
+          const targetRadius = sqrt(lobeMass / PI) * random(1.35, 1.95);
+          this.lobes.push({
+            angle,
+            offsetTarget,
+            offsetNow: 0,
+            radius: 2 + random(0, 2),
+            targetRadius,
+            growthVariation: random(0.72, 1.22),
+            phase: random(1000)
+          });
+        }
+      }
+
+      update() {
+        if (this.preview || this.settled) return false;
+        const before = this.currentMass;
+        this.currentMass = lerp(this.currentMass, this.targetMass, this.growthRate);
+        const progress = constrain(this.currentMass / this.targetMass, 0, 1);
+        let moving = Math.abs(this.currentMass - before) > 0.2;
+        for (const lobe of this.lobes) {
+          const targetR = lobe.targetRadius * sqrt(progress);
+          const nextR = lerp(lobe.radius, targetR, 0.045 * lobe.growthVariation);
+          const nextOffset = lerp(lobe.offsetNow, lobe.offsetTarget, 0.032 * lobe.growthVariation);
+          if (Math.abs(nextR - lobe.radius) > 0.05 || Math.abs(nextOffset - lobe.offsetNow) > 0.04) moving = true;
+          lobe.radius = nextR;
+          // Drift is only during growth; once settled these offsets freeze.
+          const drift = (noise(this.seed * 0.001, lobe.phase, progress * 1.7) - 0.5) * 4 * (1 - progress);
+          lobe.offsetNow = nextOffset + drift;
+        }
+        if (progress >= SETTLE_EPSILON && !moving) this.settled = true;
+        if (progress >= 0.998) {
+          this.currentMass = this.targetMass;
+          for (const lobe of this.lobes) {
+            lobe.radius = lobe.targetRadius;
+            lobe.offsetNow = lobe.offsetTarget;
+          }
+          this.settled = true;
+          moving = false;
+        }
+        if (moving) dirty = true;
+        return moving;
+      }
+
+      fieldAt(x, y) {
+        let sum = 0;
+        for (const lobe of this.lobes) {
+          const lx = this.center.x + cos(lobe.angle) * lobe.offsetNow;
+          const ly = this.center.y + sin(lobe.angle) * lobe.offsetNow;
+          const warp = (stableNoise(floor(x * 0.025), floor(y * 0.025), this.seed + lobe.phase) - 0.5) * lobe.radius * 0.18;
+          const dx = x - lx + cos(lobe.phase) * warp;
+          const dy = y - ly + sin(lobe.phase) * warp;
+          const d2 = dx * dx + dy * dy + 18;
+          sum += (lobe.radius * lobe.radius) / d2;
+        }
+        return sum;
+      }
+    }
+
+    function stableNoise(x, y, seed) {
+      return noise(x * 0.13 + seed * 0.0007, y * 0.13 - seed * 0.0003);
+    }
+
+    function nextPalette() {
+      paletteIndex = (paletteIndex + 1) % PALETTES.length;
+      pigmentIndex = 0;
+      renderPaper();
+      updateHint();
+      dirty = true;
+    }
+
+    function resetAll() {
+      pools = [];
+      activePress = null;
+      pigmentLayer.clear();
+      renderPaper();
+      dirty = true;
+      settled = true;
+    }
+
+    function updateHint() {
+      const el = document.getElementById('hint');
+      el.textContent = `hold to drop · P palette · R reset · ${PALETTES[paletteIndex].name}`;
+    }
+
+    function keyPressed() {
+      if (key === 'p' || key === 'P') nextPalette();
+      if (key === 'r' || key === 'R' || keyCode === ESCAPE) resetAll();
+    }
+
+    function mousePressed() {
+      if (touches && touches.length) return false;
+      startPress(mouseX, mouseY);
+      return false;
+    }
+
+    function mouseReleased() {
+      if (touches && touches.length) return false;
+      endPress();
+      return false;
+    }
+
+    function touchStarted() {
+      const t = touches && touches.length ? touches[0] : { x: mouseX, y: mouseY };
+      startPress(t.x, t.y);
+      return false;
+    }
+
+    function touchEnded() {
+      endPress();
+      return false;
+    }
 
     function windowResized() {
       resizeCanvas(windowWidth, windowHeight);
-      paperLayer = createGraphics(width, height);
-      renderPaper();
+      rebuildSurfaces();
     }
+
+    document.addEventListener('gesturestart', event => event.preventDefault());
+    document.addEventListener('touchmove', event => event.preventDefault(), { passive: false });
   </script>
 </body>
 </html>
