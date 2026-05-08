@@ -32,10 +32,40 @@
       overflow: hidden;
       text-overflow: ellipsis;
     }
+    .touch-controls {
+      position: fixed;
+      top: max(10px, env(safe-area-inset-top));
+      right: max(10px, env(safe-area-inset-right));
+      z-index: 2;
+      display: grid;
+      gap: 6px;
+      pointer-events: none;
+      user-select: none;
+    }
+    .touch-control {
+      min-width: 44px;
+      height: 32px;
+      box-sizing: border-box;
+      padding: 8px 9px 0;
+      border: 1px solid rgba(50, 39, 26, 0.18);
+      border-radius: 999px;
+      background: rgba(255, 250, 235, 0.38);
+      color: rgba(45, 39, 30, 0.45);
+      font-size: 10px;
+      line-height: 1;
+      letter-spacing: 0.04em;
+      text-align: center;
+      text-shadow: 0 1px 0 rgba(255, 255, 255, 0.55);
+      backdrop-filter: blur(1px);
+    }
   </style>
 </head>
 <body>
-  <div id="hint" class="hint">hold to drop · P palette · R reset</div>
+  <div id="hint" class="hint">tap/hold to drop · top-right P/R</div>
+  <div class="touch-controls" aria-hidden="true">
+    <div class="touch-control">P</div>
+    <div class="touch-control">R</div>
+  </div>
   <script>
     p5.disableFriendlyErrors = true;
 
@@ -56,8 +86,10 @@
     const MAX_HOLD_MS = 1400;
     const MIN_HOLD_MS = 80;
     const EDGE_PAD = 2;
-    const COLLISION_MARGIN = 1.4;
+    const COLLISION_MARGIN = 0.9;
     const SETTLE_EPSILON = 0.18;
+    const TOUCH_ZONE_SIZE = 54;
+    const TOUCH_ZONE_GAP = 6;
 
     const PALETTES = [
       {
@@ -184,7 +216,7 @@
     }
 
     function updateHint() {
-      hintEl.textContent = `hold to drop · P palette: ${PALETTES[currentPaletteIndex].name} · R reset`;
+      hintEl.textContent = `tap/hold to drop · P/top palette: ${PALETTES[currentPaletteIndex].name} · R/top reset`;
     }
 
     function nextPalette() {
@@ -220,6 +252,7 @@
 
     function mousePressed() {
       if (millis() - lastTouchAt < 650) return false;
+      if (handleControlHit(mouseX, mouseY)) return false;
       beginPress(mouseX, mouseY);
       return false;
     }
@@ -241,7 +274,10 @@
     function touchStarted() {
       lastTouchAt = millis();
       const t = touches[0];
-      beginPress(t ? t.x : mouseX, t ? t.y : mouseY);
+      const x = t ? t.x : mouseX;
+      const y = t ? t.y : mouseY;
+      if (handleControlHit(x, y)) return false;
+      beginPress(x, y);
       return false;
     }
 
@@ -258,6 +294,22 @@
     function touchEnded() {
       lastTouchAt = millis();
       finishPress(activePress ? activePress.x : mouseX, activePress ? activePress.y : mouseY);
+      return false;
+    }
+
+    function handleControlHit(x, y) {
+      const left = width - TOUCH_ZONE_SIZE - 8;
+      const paletteTop = 8;
+      const resetTop = paletteTop + TOUCH_ZONE_SIZE + TOUCH_ZONE_GAP;
+      if (x < left || y < paletteTop || y > resetTop + TOUCH_ZONE_SIZE) return false;
+      if (y <= paletteTop + TOUCH_ZONE_SIZE) {
+        nextPalette();
+        return true;
+      }
+      if (y >= resetTop) {
+        resetSketch();
+        return true;
+      }
       return false;
     }
 
@@ -321,12 +373,13 @@
         this.createdAt = millis();
         this.seed = random(10000);
         this.sampleCount = SAMPLE_COUNT;
-        this.growthRate = random(13, 21);
+        this.growthRate = random(15, 19);
         this.angles = [];
         this.radii = [];
         this.blocked = [];
         this.growthJitter = [];
         this.visualJitter = [];
+        this.flecks = [];
         this.settled = false;
 
         for (let i = 0; i < this.sampleCount; i++) {
@@ -334,15 +387,29 @@
           this.angles.push(a);
           this.radii.push(random(START_RADIUS * 0.65, START_RADIUS * 1.35));
           this.blocked.push(false);
-          this.growthJitter.push(0.72 + noise(this.seed + i * 0.037) * 0.62);
+          this.growthJitter.push(0.9 + noise(this.seed + i * 0.037) * 0.22);
           this.visualJitter.push(this.computeVisualJitter(a, i));
         }
+        this.buildFlecks();
       }
 
       computeVisualJitter(angle, i) {
         const n1 = noise(this.seed * 0.13 + cos(angle) * 1.8, this.seed * 0.17 + sin(angle) * 1.8);
         const n2 = noise(this.seed * 0.29 + i * 0.043);
         return map(n1 * 0.68 + n2 * 0.32, 0, 1, -1, 1);
+      }
+
+      buildFlecks() {
+        const count = floor(random(9, 17));
+        for (let i = 0; i < count; i++) {
+          this.flecks.push({
+            angle: random(TWO_PI_SAFE),
+            radius: sqrt(random(0.03, 0.92)) * this.targetRadius,
+            size: random(0.75, 2.25),
+            alpha: random(12, 30),
+            tone: random()
+          });
+        }
       }
 
       isGrowing() {
@@ -368,7 +435,9 @@
           // Ray growth: each angular sample proposes a calm outward step with a
           // stable per-ray variation. The proposed radius is capped by the drop's
           // target so no ray exceeds the paint amount derived from the hold.
-          const step = this.growthRate * this.growthJitter[i] * dt;
+          const progress = constrain(current / max(1, this.targetRadius), 0, 1);
+          const easeOut = lerp(1, 0.42, smoothstep(0.68, 1, progress));
+          const step = max(0.2, this.growthRate * this.growthJitter[i] * easeOut * dt);
           const proposedRadius = min(this.targetRadius, current + step);
           const p = this.worldPoint(i, proposedRadius, false);
 
@@ -414,15 +483,30 @@
 
       worldPoint(i, radiusOverride, visual) {
         const a = this.angles[i];
-        let r = radiusOverride === undefined ? this.radii[i] : radiusOverride;
-        if (visual) {
-          const amp = min(7.5, max(1.4, r * 0.085));
-          r = max(0, r + this.visualJitter[i] * amp);
-        }
+        const baseRadius = radiusOverride === undefined ? this.radii[i] : radiusOverride;
+        const r = visual ? this.visualRadiusAt(i, baseRadius) : baseRadius;
         return {
           x: this.center.x + cos(a) * r,
           y: this.center.y + sin(a) * r
         };
+      }
+
+      worldPointFrom(angle, radius) {
+        return {
+          x: this.center.x + cos(angle) * radius,
+          y: this.center.y + sin(angle) * radius
+        };
+      }
+
+      visualRadiusAt(i, baseRadius) {
+        const prev = this.radii[(i - 1 + this.sampleCount) % this.sampleCount];
+        const next = this.radii[(i + 1) % this.sampleCount];
+        const smoothed = (prev + this.radii[i] * 2 + next) * 0.25;
+        const scaled = smoothed * (baseRadius / max(0.001, this.radii[i]));
+        const progress = constrain(smoothed / max(1, this.targetRadius), 0, 1);
+        const youngDropFade = smoothstep(0.18, 0.92, progress);
+        const amp = min(4.4, max(0.65, smoothed * 0.046)) * youngDropFade;
+        return max(0, scaled + this.visualJitter[i] * amp);
       }
 
       render() {
@@ -433,21 +517,42 @@
         // Contour/rim rendering: use stable visual-only boundary modulation with
         // curve vertices. The same jitter is reused every frame, so settled drops
         // do not wobble or diffuse after growth stops.
+        noFill();
+        stroke(red(washC), green(washC), blue(washC), 28);
+        strokeWeight(3.2);
+        this.drawContour(1.012, true);
+
         noStroke();
         fill(red(fillC), green(fillC), blue(fillC), 116);
         this.drawContour(1, true);
 
-        fill(red(washC), green(washC), blue(washC), 38);
-        this.drawContour(0.68, true);
+        fill(red(washC), green(washC), blue(washC), 30);
+        this.drawContour(0.72, true);
+
+        fill(255, 248, 226, 18);
+        this.drawContour(0.42, true);
+
+        this.renderFlecks(fillC, washC);
 
         noFill();
-        stroke(red(rimC), green(rimC), blue(rimC), 118);
-        strokeWeight(1.25);
+        stroke(red(rimC), green(rimC), blue(rimC), 96);
+        strokeWeight(1.05);
         this.drawContour(1, true);
 
-        stroke(red(washC), green(washC), blue(washC), 42);
-        strokeWeight(0.7);
-        this.drawContour(0.88, true);
+        stroke(red(washC), green(washC), blue(washC), 36);
+        strokeWeight(0.65);
+        this.drawContour(0.86, true);
+      }
+
+      renderFlecks(fillC, washC) {
+        noStroke();
+        for (const fleck of this.flecks) {
+          if (fleck.radius > this.radiusAtAngle(fleck.angle) * 0.94) continue;
+          const p = this.worldPointFrom(fleck.angle, fleck.radius);
+          const c = fleck.tone < 0.55 ? fillC : washC;
+          fill(red(c), green(c), blue(c), fleck.alpha);
+          circle(p.x, p.y, fleck.size);
+        }
       }
 
       drawContour(scale, visual) {
