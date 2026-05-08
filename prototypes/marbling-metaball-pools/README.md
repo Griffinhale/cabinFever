@@ -42,23 +42,25 @@ Each user-created pigment is a `PigmentPool` with one pigment identity/color and
 - target mass from hold duration
 - current mass
 - child lobe offsets/radii
+- cached lobe sample positions and conservative field bounds
 - curated pigment base/rim/wash colors
+- numeric RGB channels for cheaper per-cell drawing
 - seed for stable organic variation
 - settled flag
 
 Child lobes grow from tiny radii toward target radii. Same-pool child lobes are summed as one implicit field, so they merge into an organic continuous pigment pool.
 
-The sketch renders a low-resolution field at 4 px cells into an offscreen pigment layer, then composites that over a stable cream paper-grain layer.
+The sketch renders a low-resolution field into an offscreen pigment layer, then composites that over a stable cream paper-grain layer. Round two replaced the fixed 4 px field with adaptive tiers: high uses 4 px cells, medium uses 6 px cells, and low uses 8 px cells for mobile/crowded/slow frames.
 
 ## Hold mapping
 
-Hold duration is clamped from a quick-tap minimum to a capped long hold. Duration is eased, mapped to target area/mass, then split across 3-12 child lobes:
+Hold duration is clamped from a quick-tap minimum to a capped long hold. Duration is eased, mapped to target area/mass, then split across a smaller 3-8 child lobe budget, with an optional 9th lobe only for low-complexity high-quality scenes:
 
 - quick tap: minimum visible small pool
 - medium hold: broader pool with more lobes
 - long hold: larger footprint with richer asymmetric edges
 
-Mapping to area/mass rather than direct radius keeps the interaction semantically close to adding more paint.
+Mapping to area/mass rather than direct radius keeps the interaction semantically close to adding more paint. The reduced lobe count is compensated with slightly broader lobe radii, asymmetric offsets, stable edge warp, and the existing rim/seam treatment so pools remain organic rather than becoming perfect circles.
 
 ## Ownership / clipping strategy
 
@@ -85,9 +87,21 @@ Canvas clipping is implicit: only sampled cells within the canvas are rendered. 
 - Outer threshold rims and neighbor seam rims make territories readable.
 - Stable field noise gently warps lobe influence so edges are water-like without idle jitter.
 
+## Round-two performance pass
+
+Review feedback for this prototype was: metaballs were "great but laggy." The iteration keeps the same organic pigment-pool direction and targets the field rendering bottleneck:
+
+- Adaptive field quality: starts at high quality on normal desktop viewports, starts at medium on coarse-pointer/large viewports, degrades after repeated slow renders, and upgrades conservatively after settled fast frames.
+- Smaller lobe budget: long holds now top out around 8 lobes by default instead of 12, with a 9-lobe allowance only when the scene is still simple.
+- Pool bounds and candidate filtering: each pool caches conservative pixel/field bounds and precomputed lobe positions; field cells skip pools outside those bounds before doing metaball math.
+- Dirty field redraws: growing pools and press previews mark previous/current field bounds dirty, then only those regions are cleared, re-evaluated, and redrawn. Large dirty coverage falls back to a full redraw to avoid seam artifacts.
+- Cheaper per-cell drawing: pigment colors are parsed once into numeric RGB channels instead of creating p5 colors for every rendered field cell.
+
+The intended result is a responsive 10-20 pool composition on normal desktop and better touch/mobile behavior, while settled scenes still cache the final pigment layer and stop recomputing.
+
 ## Static settling
 
-Pools mutate only while growing. Lobe offsets and radii freeze once target mass is reached. When no pool is growing and there is no active press preview, the sketch stops recomputing the field and reuses the cached pigment layer. The final image should become visually static.
+Pools mutate only while growing. Lobe offsets and radii freeze once target mass is reached. When no pool is growing and there is no active press preview, the sketch stops recomputing the field and reuses the cached pigment layer. The final image should become visually static. Dirty-region updates mean a new or growing pool no longer forces a global field pass unless its bounds cover most of the canvas or the quality tier/resized surface requires a full refresh.
 
 ## What to evaluate
 
@@ -98,18 +112,25 @@ Pools mutate only while growing. Lobe offsets and radii freeze once target mass 
 - Do 10-20 pools look intentional and marbled?
 - Do neighboring pools remain readable rather than becoming one blob?
 - Are rims/seams attractive enough to compensate for approximate collision semantics?
-- Does it remain usable at 4 px field resolution on desktop and mobile?
+- Does it remain usable with adaptive 4/6/8 px field resolution on desktop and mobile?
 
 ## Known limitations
 
 - Strongest-owner clipping is not true physical displacement.
 - Pigment area is approximate after thresholding.
 - New pools do not push old material outward; near ties simply prefer newer pigment.
-- Low-resolution field sampling can look blocky on very large displays or high-contrast seams.
+- Adaptive low-resolution field sampling can look softer/blockier on very large displays, high-contrast seams, or during slow mobile/crowded interactions.
 - Very crowded scenes can still become visually busy or muddy depending on palette choices.
-- The field is recomputed globally while anything grows, so many pools can become expensive.
+- Dirty bounds are conservative and unioned into one redraw region; several far-apart simultaneous dirty areas can still redraw more cells than the theoretical minimum.
+- Quality tier changes, resize, reset, and large dirty coverage still trigger a full field redraw.
 - Boundaries are implicit/rendered, not editable vector contours.
 - Top-right reset uses a hold confirmation so accidental mobile corner taps do not clear the composition.
+
+## Manual test notes
+
+- Desktop smoke: use `python3 -m http.server 8123`, create quick taps and long holds, then build a 10-20 pool composition. Expected: interaction remains responsive enough to keep painting, rims/seams remain readable, and the final scene settles without jitter.
+- Touch/mobile smoke: tap/hold without page scrolling, use top-left palette cycling and top-right hold-reset, and confirm lower quality tiers stay visually soft rather than harshly pixelated.
+- Resize smoke: resize the browser after several pools; the surface and field buffers rebuild and pools remain visible instead of corrupting or disappearing.
 
 ## Future displacement support
 
