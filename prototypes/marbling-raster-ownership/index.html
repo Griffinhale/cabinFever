@@ -380,20 +380,26 @@ function addFrontierNeighbors(drop, idx) {
 */
 function updateSimulation() {
   let anyGrew = false;
-  let anyActive = false;
+  let anyActiveBeforeUpdate = false;
   tick++;
   let updated = 0;
   for (const drop of drops) {
     if (drop.settled) continue;
-    anyActive = true;
+    anyActiveBeforeUpdate = true;
     if (updated++ > MAX_ACTIVE_DROPS_UPDATED) break;
     const before = drop.claimedAreaCells;
     growDrop(drop, CLAIMS_PER_DROP_PER_FRAME);
     if (drop.claimedAreaCells > before) anyGrew = true;
   }
-  settled = !anyActive && !activePress;
+
+  // Static-settle detection: after every update pass, rescan cheap drop records so the last
+  // rendered frame flips to settled and then stops mutating/rendering until new input arrives.
+  const hasUnsettledDrop = drops.some((drop) => !drop.settled);
+  const nextSettled = !hasUnsettledDrop && !activePress;
+  if (settled !== nextSettled) dirty = true;
+  settled = nextSettled;
   if (anyGrew) dirty = true;
-  return anyGrew;
+  return anyGrew || anyActiveBeforeUpdate;
 }
 
 // Chooses and claims frontier cells by organic cost: distance, grain/noise, neighbor support, and jitter.
