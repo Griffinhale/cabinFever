@@ -16,90 +16,608 @@
       -webkit-user-select: none;
       -webkit-touch-callout: none;
       touch-action: none;
+      overscroll-behavior: none;
     }
     canvas {
       display: block;
       touch-action: none;
+      cursor: crosshair;
     }
   </style>
 </head>
 <body>
 <script>
 /*
-  Prototype shell and p5 lifecycle.
-  Purpose: owns the standalone browser entry point, full-screen p5 canvas, paper surface,
-  grain texture layer, and tiny hint rendering for the raster ownership marbling demo.
-  State ownership: this initial shell owns only palette choice and paper texture state;
-  later simulation modules will own grid/drop/input state while draw() coordinates them.
-  Dependencies/connections: p5.js 1.11.3 from CDN, no build tooling or app integration.
-  Performance assumptions: pixelDensity(1), cached grain layer, and no work while idle.
+  Global constants, palettes, and shared sketch state.
+  Purpose: defines the visual language, performance caps, interaction timings, and long-lived
+  objects used by the standalone raster ownership prototype.
+  State ownership: this section owns palette selection and references to input, simulation,
+  and render layers; specialized sections below own their own data structures.
+  Dependencies/connections: p5.js global mode, browser Pointer Events, and Canvas 2D smoothing.
+  Performance assumptions: a low-resolution grid with capped frontier claims is fast enough for
+  desktop and mobile when pixelDensity(1) is used and rendering is skipped while settled.
 */
 p5.disableFriendlyErrors = true;
+
+const HOLD_MS_MIN = 50;
+const HOLD_MS_MAX = 1550;
+const MIN_TARGET_AREA_CELLS = 72;
+const MAX_TARGET_AREA_RATIO = 0.045;
+const CLAIMS_PER_DROP_PER_FRAME = 13;
+const MAX_ACTIVE_DROPS_UPDATED = 80;
+const FRONTIER_SAMPLE_COUNT = 10;
+const NEIGHBORS_8 = [
+  [-1, -1], [0, -1], [1, -1],
+  [-1,  0],          [1,  0],
+  [-1,  1], [0,  1], [1,  1]
+];
 
 const PALETTES = [
   {
     name: 'traditional marbling',
     surface: '#efe4cf',
-    grain: '#b49a72',
-    ink: '#342519'
+    grain: '#a77e47',
+    hint: '#342519',
+    pigments: ['#23395b', '#7b2434', '#c58b2b', '#49633f', '#d8c1a0'],
+    rims: ['#10213c', '#4b101d', '#77531a', '#25391f', '#9a8061'],
+    wash: '#fff4d9'
+  },
+  {
+    name: 'bright playful',
+    surface: '#f4ead2',
+    grain: '#d6aa72',
+    hint: '#392b49',
+    pigments: ['#ef6f6c', '#20bfc4', '#f3c746', '#8f59d4', '#214e9f'],
+    rims: ['#b84043', '#0b7d84', '#b98710', '#573170', '#102a68'],
+    wash: '#fff8df'
+  },
+  {
+    name: 'portfolio subdued',
+    surface: '#ece2d0',
+    grain: '#9b8263',
+    hint: '#252525',
+    pigments: ['#27292d', '#9a5f49', '#52756f', '#d2b98f', '#b06f35'],
+    rims: ['#101114', '#673728', '#2f4e4b', '#90744f', '#794318'],
+    wash: '#f7efe0'
+  },
+  {
+    name: 'monochrome ink',
+    surface: '#eee7d8',
+    grain: '#aaa091',
+    hint: '#1d2630',
+    pigments: ['#111827', '#263241', '#586171', '#8d9298', '#c6c0b5'],
+    rims: ['#05070d', '#111a24', '#333b46', '#676c73', '#918a7d'],
+    wash: '#f6f1e7'
   }
 ];
 
 let currentPaletteIndex = 0;
+let owner;
+let age;
+let grainCost;
+let frontierMark;
+let gridW = 0;
+let gridH = 0;
+let cellSize = 4;
+let drops = [];
+let nextDropId = 0;
+let activePress = null;
 let paperLayer;
+let pigmentLayer;
+let rimLayer;
+let settled = true;
 let dirty = true;
+let tick = 0;
 
+/*
+  p5 lifecycle orchestration.
+  Purpose: creates the full-screen canvas, allocates simulation/render buffers, delegates per-frame
+  updates, and keeps the final image static once all drops have settled.
+  State ownership: coordinates global sketch lifecycle but does not directly mutate ownership except
+  through resetSimulation() and updateSimulation().
+  Dependencies/connections: calls input, grid, simulation, and rendering sections in order.
+  Performance assumptions: draw() exits when no growth, preview, or dirty render work remains.
+*/
 function setup() {
   pixelDensity(1);
   createCanvas(windowWidth, windowHeight);
-  createPaperLayer();
-  dirty = true;
+  canvas.elt.style.touchAction = 'none';
+  canvas.elt.addEventListener('pointerdown', handlePointerDown, { passive: false });
+  canvas.elt.addEventListener('pointerup', handlePointerUp, { passive: false });
+  canvas.elt.addEventListener('pointercancel', handlePointerCancel, { passive: false });
+  canvas.elt.addEventListener('pointerleave', handlePointerLeave, { passive: false });
+  canvas.elt.addEventListener('contextmenu', (event) => event.preventDefault());
+  resetSimulation();
 }
 
 function draw() {
-  if (!dirty) return;
+  const grew = updateSimulation();
+  if (!grew && !activePress && !dirty) return;
   renderScene();
   dirty = false;
 }
 
 function windowResized() {
   resizeCanvas(windowWidth, windowHeight);
-  createPaperLayer();
-  dirty = true;
+  resetSimulation();
 }
 
 function keyPressed() {
+  if (key === 'p' || key === 'P') {
+    currentPaletteIndex = (currentPaletteIndex + 1) % PALETTES.length;
+    createPaperLayer();
+    dirty = true;
+  }
   if (key === 'r' || key === 'R' || keyCode === ESCAPE) {
+    resetSimulation();
+  }
+}
+
+function touchStarted() { return false; }
+function touchMoved() { return false; }
+function touchEnded() { return false; }
+
+/*
+  Input and hold-to-paint mapping.
+  Purpose: captures desktop and touch pointer presses, displays a subtle in-progress preview, and
+  converts hold duration into a target owned-cell area budget when released.
+  State ownership: owns activePress only; finalized drops are handed to createDropAt().
+  Dependencies/connections: uses p5 millis(), palette selection, coordinate clamping, and grid size.
+  Performance assumptions: preview math is constant-time and does not touch ownership arrays.
+*/
+function handlePointerDown(event) {
+  event.preventDefault();
+  if (activePress && activePress.pointerId !== event.pointerId) return;
+  canvas.elt.setPointerCapture(event.pointerId);
+  const pos = eventToCanvas(event);
+  activePress = {
+    pointerId: event.pointerId,
+    x: pos.x,
+    y: pos.y,
+    startedAt: millis(),
+    paletteIndex: currentPaletteIndex,
+    pigmentIndex: nextDropId % PALETTES[currentPaletteIndex].pigments.length
+  };
+  dirty = true;
+}
+
+function handlePointerUp(event) {
+  event.preventDefault();
+  if (!activePress || activePress.pointerId !== event.pointerId) return;
+  const pos = eventToCanvas(event);
+  activePress.x = pos.x;
+  activePress.y = pos.y;
+  const holdMs = millis() - activePress.startedAt;
+  const targetAreaCells = holdDurationToAreaCells(holdMs);
+  createDropAt(activePress.x, activePress.y, targetAreaCells, activePress.paletteIndex, activePress.pigmentIndex);
+  activePress = null;
+  dirty = true;
+}
+
+function handlePointerCancel(event) {
+  event.preventDefault();
+  if (activePress && activePress.pointerId === event.pointerId) {
+    activePress = null;
     dirty = true;
   }
 }
 
+function handlePointerLeave(event) {
+  if (activePress && event.pointerType === 'mouse' && event.buttons === 0) {
+    activePress = null;
+    dirty = true;
+  }
+}
+
+function eventToCanvas(event) {
+  const rect = canvas.elt.getBoundingClientRect();
+  return {
+    x: constrain(event.clientX - rect.left, 0, width - 1),
+    y: constrain(event.clientY - rect.top, 0, height - 1)
+  };
+}
+
+// Maps hold duration to area, not radius, so the gesture means pigment amount in the ownership grid.
+function holdDurationToAreaCells(holdMs) {
+  const maxAreaCells = Math.max(MIN_TARGET_AREA_CELLS * 2, Math.floor(gridW * gridH * MAX_TARGET_AREA_RATIO));
+  const holdT = constrain((holdMs - HOLD_MS_MIN) / (HOLD_MS_MAX - HOLD_MS_MIN), 0, 1);
+  const eased = 1 - Math.pow(1 - holdT, 3);
+  return Math.round(lerp(MIN_TARGET_AREA_CELLS, maxAreaCells, eased));
+}
+
+/*
+  Grid allocation and ownership helpers.
+  Purpose: maintains flat typed arrays for owner ids, claim age, stable wetness/grain cost, and
+  frontier duplicate markers.
+  State ownership: this section owns owner/age/grainCost/frontierMark and grid dimensions.
+  Dependencies/connections: createDropAt() and growth functions use these helpers for all collision
+  and boundary decisions.
+  Performance assumptions: O(grid cell count) only during reset/resize; per-frame updates are frontier based.
+*/
+function chooseCellSize() {
+  const shortest = Math.min(windowWidth, windowHeight);
+  if (shortest < 620) return 5;
+  if (windowWidth * windowHeight > 1800 * 1000) return 4;
+  return 3;
+}
+
+function resetSimulation() {
+  cellSize = chooseCellSize();
+  gridW = Math.ceil(width / cellSize);
+  gridH = Math.ceil(height / cellSize);
+  const total = gridW * gridH;
+  owner = new Int32Array(total);
+  owner.fill(-1);
+  age = new Uint16Array(total);
+  grainCost = new Float32Array(total);
+  frontierMark = new Int32Array(total);
+  frontierMark.fill(-1);
+  for (let y = 0; y < gridH; y++) {
+    for (let x = 0; x < gridW; x++) {
+      const idx = indexAt(x, y);
+      const n1 = noise(x * 0.055, y * 0.055, 3.1);
+      const n2 = noise(x * 0.17 + 91.3, y * 0.17 - 42.1, 8.6);
+      grainCost[idx] = n1 * 0.75 + n2 * 0.25;
+    }
+  }
+  drops = [];
+  nextDropId = 0;
+  activePress = null;
+  tick = 0;
+  settled = true;
+  createPaperLayer();
+  createRenderLayers();
+  dirty = true;
+}
+
+function indexAt(x, y) { return y * gridW + x; }
+function inGrid(x, y) { return x >= 0 && y >= 0 && x < gridW && y < gridH; }
+function cellX(index) { return index % gridW; }
+function cellY(index) { return Math.floor(index / gridW); }
+function screenToCellX(x) { return constrain(Math.floor(x / cellSize), 0, gridW - 1); }
+function screenToCellY(y) { return constrain(Math.floor(y / cellSize), 0, gridH - 1); }
+
+/*
+  Drop records and strict ownership claims.
+  Purpose: creates pigment drop state and enforces that each grid cell can only ever be claimed by
+  one drop in this prototype version.
+  State ownership: owns individual drop objects in drops[]; the owner array remains the source of truth.
+  Dependencies/connections: input creates drops here; growth uses addFrontierNeighbors() and claimCell().
+  Performance assumptions: local radius search for occupied seeds is small and only runs on drop creation.
+*/
+function createDropAt(screenX, screenY, targetAreaCells, paletteIndex, pigmentIndex) {
+  const palette = PALETTES[paletteIndex];
+  const id = nextDropId++;
+  const drop = {
+    id,
+    seedX: screenToCellX(screenX),
+    seedY: screenToCellY(screenY),
+    screenX,
+    screenY,
+    targetAreaCells,
+    claimedAreaCells: 0,
+    frontier: [],
+    color: palette.pigments[pigmentIndex % palette.pigments.length],
+    rimColor: palette.rims[pigmentIndex % palette.rims.length],
+    washColor: palette.wash,
+    createdAt: millis(),
+    settled: false,
+    noiseSeed: random(1000),
+    paletteName: palette.name
+  };
+
+  let seedIndex = indexAt(drop.seedX, drop.seedY);
+  if (owner[seedIndex] !== -1) {
+    seedIndex = findNearestEmptySeed(drop.seedX, drop.seedY, 9);
+    if (seedIndex === -1) {
+      drop.settled = true;
+      drops.push(drop);
+      return;
+    }
+    drop.seedX = cellX(seedIndex);
+    drop.seedY = cellY(seedIndex);
+  }
+
+  drops.push(drop);
+  claimCell(drop, seedIndex);
+  addFrontierNeighbors(drop, seedIndex);
+  settled = false;
+  dirty = true;
+}
+
+function findNearestEmptySeed(cx, cy, radius) {
+  let best = -1;
+  let bestD = Infinity;
+  for (let r = 1; r <= radius; r++) {
+    for (let y = cy - r; y <= cy + r; y++) {
+      for (let x = cx - r; x <= cx + r; x++) {
+        if (!inGrid(x, y)) continue;
+        const idx = indexAt(x, y);
+        if (owner[idx] !== -1) continue;
+        const d = Math.abs(x - cx) + Math.abs(y - cy);
+        if (d < bestD) {
+          bestD = d;
+          best = idx;
+        }
+      }
+    }
+    if (best !== -1) return best;
+  }
+  return -1;
+}
+
+// Claims a cell only if empty; this is the strict collision/ownership guarantee for the prototype.
+function claimCell(drop, idx) {
+  if (owner[idx] !== -1 || drop.claimedAreaCells >= drop.targetAreaCells) return false;
+  owner[idx] = drop.id;
+  age[idx] = tick % 65535;
+  drop.claimedAreaCells++;
+  return true;
+}
+
+function addFrontierNeighbors(drop, idx) {
+  const x = cellX(idx);
+  const y = cellY(idx);
+  for (const [dx, dy] of NEIGHBORS_8) {
+    const nx = x + dx;
+    const ny = y + dy;
+    if (!inGrid(nx, ny)) continue;
+    const ni = indexAt(nx, ny);
+    if (owner[ni] !== -1 || frontierMark[ni] === drop.id) continue;
+    frontierMark[ni] = drop.id;
+    drop.frontier.push(ni);
+  }
+}
+
+/*
+  Frontier growth simulation.
+  Purpose: expands active pigment through empty neighboring cells until its area budget is reached or
+  all available frontier cells are blocked by edges/ownership.
+  State ownership: mutates drop frontier/settled fields and owner/age arrays through claimCell().
+  Dependencies/connections: rendering reads the resulting owner field; dirty/static-settle logic reads
+  whether any growth occurred.
+  Performance assumptions: samples a small subset of each frontier instead of sorting the full queue.
+*/
+function updateSimulation() {
+  let anyGrew = false;
+  let anyActive = false;
+  tick++;
+  let updated = 0;
+  for (const drop of drops) {
+    if (drop.settled) continue;
+    anyActive = true;
+    if (updated++ > MAX_ACTIVE_DROPS_UPDATED) break;
+    const before = drop.claimedAreaCells;
+    growDrop(drop, CLAIMS_PER_DROP_PER_FRAME);
+    if (drop.claimedAreaCells > before) anyGrew = true;
+  }
+  settled = !anyActive && !activePress;
+  if (anyGrew) dirty = true;
+  return anyGrew;
+}
+
+// Chooses and claims frontier cells by organic cost: distance, grain/noise, neighbor support, and jitter.
+function growDrop(drop, maxClaims) {
+  let claims = 0;
+  while (claims < maxClaims && drop.claimedAreaCells < drop.targetAreaCells) {
+    compactFrontier(drop);
+    if (drop.frontier.length === 0) {
+      drop.settled = true;
+      return;
+    }
+    const bestPos = chooseBestFrontierPosition(drop);
+    const idx = drop.frontier[bestPos];
+    const last = drop.frontier.pop();
+    if (bestPos < drop.frontier.length) drop.frontier[bestPos] = last;
+    frontierMark[idx] = -1;
+    if (owner[idx] !== -1) continue;
+    if (claimCell(drop, idx)) {
+      addFrontierNeighbors(drop, idx);
+      claims++;
+    }
+  }
+  if (drop.claimedAreaCells >= drop.targetAreaCells) drop.settled = true;
+}
+
+function compactFrontier(drop) {
+  if (drop.frontier.length < 32) return;
+  let write = 0;
+  for (let read = 0; read < drop.frontier.length; read++) {
+    const idx = drop.frontier[read];
+    if (owner[idx] === -1) {
+      drop.frontier[write++] = idx;
+    } else {
+      frontierMark[idx] = -1;
+    }
+  }
+  drop.frontier.length = write;
+}
+
+function chooseBestFrontierPosition(drop) {
+  let bestPos = 0;
+  let bestCost = Infinity;
+  const count = Math.min(FRONTIER_SAMPLE_COUNT, drop.frontier.length);
+  const stride = Math.max(1, Math.floor(drop.frontier.length / count));
+  const offset = (tick + drop.id * 7) % Math.max(1, stride);
+  for (let i = 0; i < count; i++) {
+    const pos = (offset + i * stride) % drop.frontier.length;
+    const idx = drop.frontier[pos];
+    const cost = growthCost(drop, idx);
+    if (cost < bestCost) {
+      bestCost = cost;
+      bestPos = pos;
+    }
+  }
+  return bestPos;
+}
+
+function growthCost(drop, idx) {
+  const x = cellX(idx);
+  const y = cellY(idx);
+  const dx = x - drop.seedX;
+  const dy = y - drop.seedY;
+  const distanceCost = Math.sqrt(dx * dx + dy * dy) * 0.045;
+  const support = neighborSupport(drop.id, x, y);
+  const supportCost = (8 - support) * 0.33;
+  const diagonalPenalty = hasOrthogonalSupport(drop.id, x, y) ? 0 : 1.15;
+  const edgeWetness = grainCost[idx] * 1.35;
+  const wobble = noise(x * 0.19, y * 0.19, drop.noiseSeed) * 0.9;
+  const jitter = ((idx * 1103515245 + drop.id * 12345 + tick) & 255) / 255 * 0.16;
+  return distanceCost + supportCost + diagonalPenalty + edgeWetness + wobble + jitter;
+}
+
+function neighborSupport(dropId, x, y) {
+  let count = 0;
+  for (const [dx, dy] of NEIGHBORS_8) {
+    const nx = x + dx;
+    const ny = y + dy;
+    if (inGrid(nx, ny) && owner[indexAt(nx, ny)] === dropId) count++;
+  }
+  return count;
+}
+
+function hasOrthogonalSupport(dropId, x, y) {
+  return (inGrid(x - 1, y) && owner[indexAt(x - 1, y)] === dropId) ||
+    (inGrid(x + 1, y) && owner[indexAt(x + 1, y)] === dropId) ||
+    (inGrid(x, y - 1) && owner[indexAt(x, y - 1)] === dropId) ||
+    (inGrid(x, y + 1) && owner[indexAt(x, y + 1)] === dropId);
+}
+
+/*
+  Rendering, smoothing, rims, and static-settle display.
+  Purpose: turns the low-resolution ownership field into a cream-paper marbling image with softened
+  pigment cells, darker organic rims, subtle washes, and a tiny hint overlay.
+  State ownership: owns cached paper/pigment/rim p5.Graphics layers; reads but does not mutate simulation.
+  Dependencies/connections: uses drop colors by owner id and dirty/settled state from simulation.
+  Performance assumptions: full-grid render only happens when dirty or previewing, then remains static.
+*/
 function createPaperLayer() {
   const palette = PALETTES[currentPaletteIndex];
   paperLayer = createGraphics(width, height);
   paperLayer.pixelDensity(1);
   paperLayer.background(palette.surface);
   paperLayer.noStroke();
-  for (let i = 0; i < Math.floor(width * height * 0.0025); i++) {
-    const alpha = random(5, 20);
-    paperLayer.fill(red(color(palette.grain)), green(color(palette.grain)), blue(color(palette.grain)), alpha);
-    paperLayer.circle(random(width), random(height), random(0.4, 1.7));
+  const grainColor = color(palette.grain);
+  const count = Math.floor(width * height * 0.0028);
+  for (let i = 0; i < count; i++) {
+    paperLayer.fill(red(grainColor), green(grainColor), blue(grainColor), random(4, 19));
+    paperLayer.circle(random(width), random(height), random(0.35, 1.9));
   }
+  paperLayer.stroke(red(grainColor), green(grainColor), blue(grainColor), 8);
+  for (let i = 0; i < Math.floor(width / 18); i++) {
+    const y = random(height);
+    paperLayer.line(0, y, width, y + random(-18, 18));
+  }
+}
+
+function createRenderLayers() {
+  pigmentLayer = createGraphics(width, height);
+  pigmentLayer.pixelDensity(1);
+  rimLayer = createGraphics(width, height);
+  rimLayer.pixelDensity(1);
 }
 
 function renderScene() {
   image(paperLayer, 0, 0, width, height);
+  renderPigments();
+  image(pigmentLayer, 0, 0, width, height);
+  image(rimLayer, 0, 0, width, height);
+  drawPressPreview();
   drawHints();
+}
+
+function renderPigments() {
+  pigmentLayer.clear();
+  rimLayer.clear();
+  pigmentLayer.noStroke();
+  rimLayer.noStroke();
+
+  for (let y = 0; y < gridH; y++) {
+    for (let x = 0; x < gridW; x++) {
+      const idx = indexAt(x, y);
+      const dropId = owner[idx];
+      if (dropId < 0) continue;
+      const drop = drops[dropId];
+      if (!drop) continue;
+      drawPigmentCell(drop, idx, x, y);
+      if (isBoundaryCell(dropId, x, y)) drawRimCell(drop, idx, x, y);
+    }
+  }
+  pigmentLayer.drawingContext.imageSmoothingEnabled = true;
+  rimLayer.drawingContext.imageSmoothingEnabled = true;
+}
+
+function drawPigmentCell(drop, idx, x, y) {
+  const c = color(drop.color);
+  const variation = (grainCost[idx] - 0.5) * 20;
+  const wash = color(drop.washColor);
+  const cx = x * cellSize + cellSize * 0.5;
+  const cy = y * cellSize + cellSize * 0.5;
+  const radius = cellSize * (1.2 + grainCost[idx] * 0.42);
+  pigmentLayer.fill(
+    constrain(red(c) + variation, 0, 255),
+    constrain(green(c) + variation, 0, 255),
+    constrain(blue(c) + variation, 0, 255),
+    170
+  );
+  pigmentLayer.circle(cx, cy, radius);
+  if ((idx + tick) % 11 === 0) {
+    pigmentLayer.fill(red(wash), green(wash), blue(wash), 18);
+    pigmentLayer.circle(cx + cellSize * 0.18, cy - cellSize * 0.12, radius * 0.55);
+  }
+}
+
+// Boundary detection marks any owned cell touching empty space or another owner for soft rim rendering.
+function isBoundaryCell(dropId, x, y) {
+  for (const [dx, dy] of NEIGHBORS_8) {
+    const nx = x + dx;
+    const ny = y + dy;
+    if (!inGrid(nx, ny)) return true;
+    const neighborOwner = owner[indexAt(nx, ny)];
+    if (neighborOwner !== dropId) return true;
+  }
+  return false;
+}
+
+// Renders rims as overlapping soft ellipses to hide square raster seams and read as pigment boundaries.
+function drawRimCell(drop, idx, x, y) {
+  const c = color(drop.rimColor);
+  const cx = x * cellSize + cellSize * 0.5;
+  const cy = y * cellSize + cellSize * 0.5;
+  const wobble = noise(x * 0.4, y * 0.4, drop.noiseSeed) - 0.5;
+  rimLayer.fill(red(c), green(c), blue(c), 82);
+  rimLayer.ellipse(cx + wobble * cellSize * 0.45, cy - wobble * cellSize * 0.3, cellSize * 1.55, cellSize * 1.35);
+  rimLayer.fill(255, 246, 225, 18);
+  rimLayer.circle(cx - wobble * cellSize * 0.25, cy + wobble * cellSize * 0.2, cellSize * 0.78);
+}
+
+function drawPressPreview() {
+  if (!activePress) return;
+  const holdMs = millis() - activePress.startedAt;
+  const areaCells = holdDurationToAreaCells(holdMs);
+  const radius = Math.sqrt(areaCells / Math.PI) * cellSize;
+  const palette = PALETTES[activePress.paletteIndex];
+  const pigment = color(palette.pigments[activePress.pigmentIndex % palette.pigments.length]);
+  noFill();
+  stroke(red(pigment), green(pigment), blue(pigment), 70);
+  strokeWeight(1);
+  circle(activePress.x, activePress.y, radius * 2);
+  noStroke();
+  fill(red(pigment), green(pigment), blue(pigment), 25);
+  circle(activePress.x, activePress.y, Math.max(9, radius * 0.32));
+  dirty = true;
 }
 
 function drawHints() {
   const palette = PALETTES[currentPaletteIndex];
+  const hint = color(palette.hint);
   noStroke();
-  fill(52, 37, 25, 122);
+  fill(red(hint), green(hint), blue(hint), 122);
   textSize(11);
   textFont('ui-monospace, SFMono-Regular, Menlo, Consolas, monospace');
   textAlign(LEFT, BOTTOM);
-  text(`hold to drop · P palette · R reset · ${palette.name}`, 12, height - 12);
+  const status = settled ? 'settled' : 'growing';
+  text(`hold to drop · P palette · R reset · ${palette.name} · ${status}`, 12, height - 12);
 }
 </script>
 </body>
