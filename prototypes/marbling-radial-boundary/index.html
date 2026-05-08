@@ -12,7 +12,7 @@
       height: 100%;
       overflow: hidden;
       touch-action: none;
-      background: #f4ead3;
+      background: #f3ead7;
       font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
     }
     canvas { display: block; }
@@ -21,12 +21,16 @@
       left: 10px;
       bottom: 9px;
       z-index: 2;
-      color: rgba(45, 39, 30, 0.48);
+      color: rgba(45, 39, 30, 0.46);
       font-size: 11px;
       letter-spacing: 0.02em;
       user-select: none;
       pointer-events: none;
-      text-shadow: 0 1px 0 rgba(255, 255, 255, 0.45);
+      text-shadow: 0 1px 0 rgba(255, 255, 255, 0.5);
+      max-width: calc(100vw - 20px);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
     }
   </style>
 </head>
@@ -35,39 +39,432 @@
   <script>
     p5.disableFriendlyErrors = true;
 
-    // Radial boundary marbling prototype shell. Later commits add press input,
-    // ray growth/collision, organic pigment rendering, and settled static frames.
+    /*
+      Marbling radial boundary growth prototype.
+
+      This sketch is intentionally standalone: p5.js from CDN, no build step, no
+      Next.js app changes. Each pigment drop is a star-shaped radial polygon with
+      many sampled rays. Rays grow slowly until they hit target radius, canvas
+      edges, or another drop's sampled occupied radial region. Rendering adds
+      stable organic modulation, translucent washes, and darker rims while the
+      simulation itself stays deterministic and static after settlement.
+    */
+
+    const TWO_PI_SAFE = Math.PI * 2;
+    const SAMPLE_COUNT = 192;
+    const START_RADIUS = 2.2;
+    const MAX_HOLD_MS = 1400;
+    const MIN_HOLD_MS = 80;
+    const EDGE_PAD = 2;
+    const COLLISION_MARGIN = 1.4;
+    const SETTLE_EPSILON = 0.18;
+
+    const PALETTES = [
+      {
+        name: 'traditional',
+        surface: '#f3ead7',
+        grainA: [124, 106, 70],
+        grainB: [255, 252, 235],
+        pigments: [
+          { fill: '#173b62', rim: '#08263f', wash: '#5f86a7' },
+          { fill: '#7d1f24', rim: '#4a0e13', wash: '#b56756' },
+          { fill: '#c28b2c', rim: '#7e5518', wash: '#e1bf6b' },
+          { fill: '#4d6438', rim: '#26381d', wash: '#8da06b' },
+          { fill: '#d8cda8', rim: '#9a875a', wash: '#fff1c9' }
+        ]
+      },
+      {
+        name: 'bright playful',
+        surface: '#fbefd8',
+        grainA: [168, 124, 78],
+        grainB: [255, 250, 235],
+        pigments: [
+          { fill: '#ef6f61', rim: '#a93d37', wash: '#ffc2a5' },
+          { fill: '#19a7a8', rim: '#0b6f76', wash: '#89e0d6' },
+          { fill: '#f5cf42', rim: '#b47e15', wash: '#fff09a' },
+          { fill: '#8157c9', rim: '#4c2b85', wash: '#c0a7ef' },
+          { fill: '#2257b8', rim: '#123477', wash: '#80a5f0' }
+        ]
+      },
+      {
+        name: 'portfolio subdued',
+        surface: '#efe4d0',
+        grainA: [104, 86, 70],
+        grainB: [255, 250, 236],
+        pigments: [
+          { fill: '#303233', rim: '#17191b', wash: '#73736e' },
+          { fill: '#a15f46', rim: '#623426', wash: '#d39b78' },
+          { fill: '#5b8988', rim: '#2f5657', wash: '#9dbdba' },
+          { fill: '#d9c9a3', rim: '#99875f', wash: '#fff0c7' },
+          { fill: '#b97945', rim: '#744223', wash: '#d7aa78' }
+        ]
+      },
+      {
+        name: 'monochrome ink',
+        surface: '#f2ede2',
+        grainA: [90, 88, 82],
+        grainB: [255, 255, 248],
+        pigments: [
+          { fill: '#0e1a24', rim: '#05090d', wash: '#53606b' },
+          { fill: '#3f4b55', rim: '#1d252d', wash: '#87929a' },
+          { fill: '#7d858b', rim: '#4e565c', wash: '#c2c7c9' },
+          { fill: '#c7c5b7', rim: '#898778', wash: '#f5f1df' }
+        ]
+      }
+    ];
+
+    let drops = [];
+    let activePress = null;
     let grainLayer;
+    let currentPaletteIndex = 0;
+    let pigmentCursor = 0;
+    let lastTouchAt = 0;
+    let frameWasSettled = false;
+
+    const hintEl = document.getElementById('hint');
 
     function setup() {
       createCanvas(windowWidth, windowHeight);
       pixelDensity(1);
+      colorMode(RGB, 255, 255, 255, 255);
       rebuildSurface();
+      updateHint();
     }
 
     function draw() {
-      image(grainLayer, 0, 0);
+      image(grainLayer, 0, 0, width, height);
+
+      let anyGrowing = false;
+      const dt = min(0.05, deltaTime / 1000 || 0.016);
+
+      // Static-settle detection: mutate simulation only while a press is active
+      // or at least one drop still has growable rays. When everything settles,
+      // noLoop() freezes the final composition until the next interaction.
+      for (const drop of drops) {
+        if (drop.isGrowing()) {
+          drop.update(dt, drops);
+          anyGrowing = true;
+        }
+      }
+
+      for (const drop of drops) drop.render();
+      renderPressPreview();
+
+      if (!activePress && !anyGrowing) {
+        if (!frameWasSettled) {
+          frameWasSettled = true;
+          redraw();
+        } else {
+          noLoop();
+        }
+      } else {
+        frameWasSettled = false;
+      }
     }
 
     function rebuildSurface() {
+      const palette = PALETTES[currentPaletteIndex];
       grainLayer = createGraphics(max(1, windowWidth), max(1, windowHeight));
       grainLayer.pixelDensity(1);
-      grainLayer.background('#f4ead3');
+      grainLayer.background(palette.surface);
       grainLayer.noStroke();
-      for (let i = 0; i < width * height * 0.018; i++) {
-        const shade = random() < 0.55 ? 255 : 160;
-        grainLayer.fill(shade, shade * 0.94, shade * 0.78, random(5, 15));
-        grainLayer.circle(random(width), random(height), random(0.4, 1.6));
+
+      const count = floor(width * height * 0.022);
+      for (let i = 0; i < count; i++) {
+        const c = random() < 0.58 ? palette.grainB : palette.grainA;
+        const alpha = random(4, 16);
+        grainLayer.fill(c[0], c[1], c[2], alpha);
+        grainLayer.circle(random(width), random(height), random(0.35, 1.65));
       }
+
+      grainLayer.stroke(255, 248, 222, 14);
+      for (let y = random(4); y < height; y += random(7, 13)) {
+        grainLayer.line(0, y, width, y + random(-2, 2));
+      }
+    }
+
+    function updateHint() {
+      hintEl.textContent = `hold to drop · P palette: ${PALETTES[currentPaletteIndex].name} · R reset`;
+    }
+
+    function nextPalette() {
+      currentPaletteIndex = (currentPaletteIndex + 1) % PALETTES.length;
+      pigmentCursor = 0;
+      rebuildSurface();
+      updateHint();
+      wake();
+    }
+
+    function resetSketch() {
+      drops = [];
+      activePress = null;
+      frameWasSettled = false;
+      rebuildSurface();
+      wake();
+    }
+
+    function wake() {
+      loop();
+      redraw();
+    }
+
+    function keyPressed() {
+      if (key === 'p' || key === 'P') nextPalette();
+      if (key === 'r' || key === 'R' || keyCode === ESCAPE) resetSketch();
     }
 
     function windowResized() {
       resizeCanvas(windowWidth, windowHeight);
       rebuildSurface();
+      wake();
     }
 
-    function keyPressed() {
-      if (key === 'r' || key === 'R' || keyCode === ESCAPE) rebuildSurface();
+    function mousePressed() {
+      if (millis() - lastTouchAt < 650) return false;
+      beginPress(mouseX, mouseY);
+      return false;
+    }
+
+    function mouseDragged() {
+      if (activePress && millis() - lastTouchAt >= 650) {
+        activePress.x = constrain(mouseX, 0, width);
+        activePress.y = constrain(mouseY, 0, height);
+      }
+      return false;
+    }
+
+    function mouseReleased() {
+      if (millis() - lastTouchAt < 650) return false;
+      finishPress(mouseX, mouseY);
+      return false;
+    }
+
+    function touchStarted() {
+      lastTouchAt = millis();
+      const t = touches[0];
+      beginPress(t ? t.x : mouseX, t ? t.y : mouseY);
+      return false;
+    }
+
+    function touchMoved() {
+      lastTouchAt = millis();
+      const t = touches[0];
+      if (activePress && t) {
+        activePress.x = constrain(t.x, 0, width);
+        activePress.y = constrain(t.y, 0, height);
+      }
+      return false;
+    }
+
+    function touchEnded() {
+      lastTouchAt = millis();
+      finishPress(activePress ? activePress.x : mouseX, activePress ? activePress.y : mouseY);
+      return false;
+    }
+
+    function beginPress(x, y) {
+      const palette = PALETTES[currentPaletteIndex];
+      const pigment = palette.pigments[pigmentCursor % palette.pigments.length];
+      pigmentCursor += 1;
+      activePress = {
+        x: constrain(x, 0, width),
+        y: constrain(y, 0, height),
+        startMs: millis(),
+        pigment,
+        paletteName: palette.name
+      };
+      wake();
+    }
+
+    function finishPress(x, y) {
+      if (!activePress) return;
+      activePress.x = constrain(x, 0, width);
+      activePress.y = constrain(y, 0, height);
+      const targetRadius = radiusFromHold(millis() - activePress.startMs);
+      drops.push(new Drop(activePress.x, activePress.y, targetRadius, activePress.pigment, activePress.paletteName));
+      activePress = null;
+      wake();
+    }
+
+    function radiusFromHold(holdMs) {
+      // Hold mapping: duration maps to paint mass/area, then converts to radius.
+      // This makes long holds add more pigment without making radius feel linear
+      // or explosive on small mobile viewports. Quick taps still get a visible drop.
+      const shortest = min(width, height);
+      const minRadius = constrain(shortest * 0.035, 16, 30);
+      const maxRadius = constrain(shortest * 0.18, 72, 150);
+      const clamped = constrain(max(holdMs, MIN_HOLD_MS), MIN_HOLD_MS, MAX_HOLD_MS);
+      const t = smoothstep(0, 1, clamped / MAX_HOLD_MS);
+      const minArea = Math.PI * minRadius * minRadius;
+      const maxArea = Math.PI * maxRadius * maxRadius;
+      return sqrt(lerp(minArea, maxArea, t) / Math.PI);
+    }
+
+    function renderPressPreview() {
+      if (!activePress) return;
+      const r = radiusFromHold(millis() - activePress.startMs);
+      const c = color(activePress.pigment.fill);
+      noFill();
+      stroke(red(c), green(c), blue(c), 80);
+      strokeWeight(1.2);
+      circle(activePress.x, activePress.y, r * 2);
+      noStroke();
+      fill(red(c), green(c), blue(c), 32);
+      circle(activePress.x, activePress.y, max(8, r * 0.28));
+    }
+
+    class Drop {
+      constructor(x, y, targetRadius, pigment, paletteName) {
+        this.center = createVector(x, y);
+        this.targetRadius = targetRadius;
+        this.pigment = pigment;
+        this.paletteName = paletteName;
+        this.createdAt = millis();
+        this.seed = random(10000);
+        this.sampleCount = SAMPLE_COUNT;
+        this.growthRate = random(13, 21);
+        this.angles = [];
+        this.radii = [];
+        this.blocked = [];
+        this.growthJitter = [];
+        this.visualJitter = [];
+        this.settled = false;
+
+        for (let i = 0; i < this.sampleCount; i++) {
+          const a = i / this.sampleCount * TWO_PI_SAFE;
+          this.angles.push(a);
+          this.radii.push(random(START_RADIUS * 0.65, START_RADIUS * 1.35));
+          this.blocked.push(false);
+          this.growthJitter.push(0.72 + noise(this.seed + i * 0.037) * 0.62);
+          this.visualJitter.push(this.computeVisualJitter(a, i));
+        }
+      }
+
+      computeVisualJitter(angle, i) {
+        const n1 = noise(this.seed * 0.13 + cos(angle) * 1.8, this.seed * 0.17 + sin(angle) * 1.8);
+        const n2 = noise(this.seed * 0.29 + i * 0.043);
+        return map(n1 * 0.68 + n2 * 0.32, 0, 1, -1, 1);
+      }
+
+      isGrowing() {
+        if (this.settled) return false;
+        for (let i = 0; i < this.sampleCount; i++) {
+          if (!this.blocked[i] && this.radii[i] < this.targetRadius - SETTLE_EPSILON) return true;
+        }
+        this.settled = true;
+        return false;
+      }
+
+      update(dt, allDrops) {
+        let moved = false;
+
+        for (let i = 0; i < this.sampleCount; i++) {
+          if (this.blocked[i]) continue;
+          const current = this.radii[i];
+          if (current >= this.targetRadius - SETTLE_EPSILON) {
+            this.radii[i] = min(current, this.targetRadius);
+            continue;
+          }
+
+          // Ray growth: each angular sample proposes a calm outward step with a
+          // stable per-ray variation. The proposed radius is capped by the drop's
+          // target so no ray exceeds the paint amount derived from the hold.
+          const step = this.growthRate * this.growthJitter[i] * dt;
+          const proposedRadius = min(this.targetRadius, current + step);
+          const p = this.worldPoint(i, proposedRadius, false);
+
+          // Collision checks: rays become permanently blocked if their proposed
+          // point exits the canvas or enters another drop's radial boundary. We
+          // do not use vertex-to-vertex distance, which was a known broken path.
+          if (!this.pointInsideCanvas(p.x, p.y) || this.collidesWithNeighbor(p.x, p.y, allDrops)) {
+            this.blocked[i] = true;
+            continue;
+          }
+
+          this.radii[i] = proposedRadius;
+          moved = true;
+        }
+
+        if (!moved && !this.isGrowing()) this.settled = true;
+      }
+
+      pointInsideCanvas(x, y) {
+        return x >= EDGE_PAD && x <= width - EDGE_PAD && y >= EDGE_PAD && y <= height - EDGE_PAD;
+      }
+
+      collidesWithNeighbor(x, y, allDrops) {
+        for (const other of allDrops) {
+          if (other === this) continue;
+          const dx = x - other.center.x;
+          const dy = y - other.center.y;
+          const d = sqrt(dx * dx + dy * dy);
+          const a = atan2(dy, dx);
+          if (d < other.radiusAtAngle(a) + COLLISION_MARGIN) return true;
+        }
+        return false;
+      }
+
+      radiusAtAngle(angle) {
+        const a = ((angle % TWO_PI_SAFE) + TWO_PI_SAFE) % TWO_PI_SAFE;
+        const pos = a / TWO_PI_SAFE * this.sampleCount;
+        const i0 = floor(pos) % this.sampleCount;
+        const i1 = (i0 + 1) % this.sampleCount;
+        const t = pos - floor(pos);
+        return lerp(this.radii[i0], this.radii[i1], t);
+      }
+
+      worldPoint(i, radiusOverride, visual) {
+        const a = this.angles[i];
+        let r = radiusOverride === undefined ? this.radii[i] : radiusOverride;
+        if (visual) {
+          const amp = min(7.5, max(1.4, r * 0.085));
+          r = max(0, r + this.visualJitter[i] * amp);
+        }
+        return {
+          x: this.center.x + cos(a) * r,
+          y: this.center.y + sin(a) * r
+        };
+      }
+
+      render() {
+        const fillC = color(this.pigment.fill);
+        const rimC = color(this.pigment.rim);
+        const washC = color(this.pigment.wash);
+
+        // Contour/rim rendering: use stable visual-only boundary modulation with
+        // curve vertices. The same jitter is reused every frame, so settled drops
+        // do not wobble or diffuse after growth stops.
+        noStroke();
+        fill(red(fillC), green(fillC), blue(fillC), 116);
+        this.drawContour(1, true);
+
+        fill(red(washC), green(washC), blue(washC), 38);
+        this.drawContour(0.68, true);
+
+        noFill();
+        stroke(red(rimC), green(rimC), blue(rimC), 118);
+        strokeWeight(1.25);
+        this.drawContour(1, true);
+
+        stroke(red(washC), green(washC), blue(washC), 42);
+        strokeWeight(0.7);
+        this.drawContour(0.88, true);
+      }
+
+      drawContour(scale, visual) {
+        beginShape();
+        for (let k = -2; k < this.sampleCount + 3; k++) {
+          const i = (k + this.sampleCount) % this.sampleCount;
+          const p = this.worldPoint(i, this.radii[i] * scale, visual);
+          curveVertex(p.x, p.y);
+        }
+        endShape(CLOSE);
+      }
+    }
+
+    function smoothstep(edge0, edge1, x) {
+      const t = constrain((x - edge0) / (edge1 - edge0), 0, 1);
+      return t * t * (3 - 2 * t);
     }
   </script>
 </body>
