@@ -528,6 +528,7 @@ function renderScene() {
   renderPigments();
   image(pigmentLayer, 0, 0, width, height);
   image(rimLayer, 0, 0, width, height);
+  drawSurfaceVignette();
   drawPressPreview();
   drawHints();
 }
@@ -537,6 +538,8 @@ function renderPigments() {
   rimLayer.clear();
   pigmentLayer.noStroke();
   rimLayer.noStroke();
+  pigmentLayer.drawingContext.filter = 'blur(0.18px)';
+  rimLayer.drawingContext.filter = 'blur(0.55px)';
 
   for (let y = 0; y < gridH; y++) {
     for (let x = 0; x < gridW; x++) {
@@ -549,8 +552,20 @@ function renderPigments() {
       if (isBoundaryCell(dropId, x, y)) drawRimCell(drop, idx, x, y);
     }
   }
+  pigmentLayer.drawingContext.filter = 'none';
+  rimLayer.drawingContext.filter = 'none';
   pigmentLayer.drawingContext.imageSmoothingEnabled = true;
   rimLayer.drawingContext.imageSmoothingEnabled = true;
+}
+
+function drawSurfaceVignette() {
+  const vignetteWidth = Math.max(width, height) * 0.055;
+  push();
+  noFill();
+  stroke(80, 55, 30, 16);
+  strokeWeight(vignetteWidth);
+  rect(-vignetteWidth * 0.5, -vignetteWidth * 0.5, width + vignetteWidth, height + vignetteWidth);
+  pop();
 }
 
 function drawPigmentCell(drop, idx, x, y) {
