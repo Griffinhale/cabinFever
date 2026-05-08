@@ -32,28 +32,514 @@
   <script>
     p5.disableFriendlyErrors = true;
 
+    /*
+      Particle/fluid-ish marbling prototype.
+
+      This sketch intentionally favors an inspectable pressure-particle model over
+      a physically accurate fluid solver. Pigment is represented by lightweight
+      tracers; each drop injects particles and a short-lived radial pressure
+      impulse that can physically push older particles away. Rendering splats the
+      particles into offscreen pigment/rim buffers so the result reads as pooled
+      marbling material rather than individual dots. Damping and settle detection
+      are deliberately strong because this architecture is only viable if the
+      composition can become a static image after interaction ends.
+    */
+
+    const PALETTES = [
+      {
+        name: 'traditional',
+        surface: '#f3ead7',
+        grain: '#b99f72',
+        pigments: [
+          { name: 'indigo', color: '#1f3f73', rim: '#102644' },
+          { name: 'oxblood', color: '#7f2430', rim: '#4d1119' },
+          { name: 'ochre', color: '#c28a2e', rim: '#7d531b' },
+          { name: 'moss', color: '#516a3a', rim: '#2f4224' },
+          { name: 'warm cream', color: '#dbc88e', rim: '#9c8545' }
+        ]
+      },
+      {
+        name: 'bright playful',
+        surface: '#fff1d7',
+        grain: '#d7b783',
+        pigments: [
+          { name: 'coral', color: '#f06f5f', rim: '#a83238' },
+          { name: 'turquoise', color: '#20a9b2', rim: '#0b6871' },
+          { name: 'lemon', color: '#f3ce3e', rim: '#a87b05' },
+          { name: 'violet', color: '#8565c7', rim: '#4c3782' },
+          { name: 'ultramarine', color: '#254fba', rim: '#17306f' }
+        ]
+      },
+      {
+        name: 'portfolio subdued',
+        surface: '#eee2cf',
+        grain: '#aa9270',
+        pigments: [
+          { name: 'charcoal', color: '#26313a', rim: '#11181e' },
+          { name: 'clay', color: '#a45f49', rim: '#683426' },
+          { name: 'muted teal', color: '#4f8a84', rim: '#2e5653' },
+          { name: 'copper', color: '#b9773f', rim: '#70411f' },
+          { name: 'bone', color: '#d7c9ac', rim: '#907f61' }
+        ]
+      },
+      {
+        name: 'monochrome ink',
+        surface: '#f5f0e5',
+        grain: '#aaa392',
+        pigments: [
+          { name: 'blue-black', color: '#101923', rim: '#030609' },
+          { name: 'slate', color: '#46505a', rim: '#222930' },
+          { name: 'gray wash', color: '#848a8b', rim: '#52595c' },
+          { name: 'pale wash', color: '#c8c7bd', rim: '#868276' }
+        ]
+      }
+    ];
+
+    const HOLD_MIN_MS = 80;
+    const HOLD_MAX_MS = 1800;
+    const SETTLE_SPEED = 0.028;
+    const SETTLE_FRAMES = 90;
+    const GRID_CELL = 28;
+    const IMPULSE_LIFE = 58;
+    const DAMPING = 0.915;
+    const BOUNDARY_PAD = 3;
+
+    let paperLayer;
+    let pigmentLayer;
+    let rimLayer;
+    let particles = [];
+    let impulses = [];
+    let activePress = null;
+    let paletteIndex = 0;
+    let pigmentCursor = 0;
+    let settled = true;
+    let quietFrames = 0;
+    let lastTouchAt = 0;
+    let maxParticles = 2200;
+
     function setup() {
       pixelDensity(1);
       createCanvas(windowWidth, windowHeight);
-      noStroke();
-      background('#f3ead7');
+      configureCaps();
+      rebuildLayers();
+      resetSketch();
     }
 
     function draw() {
-      background('#f3ead7');
-      fill(75, 55, 35, 24);
-      textSize(11);
-      textAlign(RIGHT, TOP);
-      text('particle/fluid-ish displacement probe', width - 10, 9);
+      image(paperLayer, 0, 0);
+
+      if (activePress) {
+        emitWhileHolding();
+      }
+
+      if (!settled) {
+        updateSimulation();
+      }
+
+      renderPigment();
+      image(pigmentLayer, 0, 0);
+      image(rimLayer, 0, 0);
+      drawOverlay();
+
+      if (settled && !activePress) {
+        noLoop();
+      }
+    }
+
+    function configureCaps() {
+      const smallOrTouch = min(windowWidth, windowHeight) < 760 || navigator.maxTouchPoints > 0;
+      maxParticles = smallOrTouch ? 1450 : 2300;
+    }
+
+    function rebuildLayers() {
+      paperLayer = createGraphics(windowWidth, windowHeight);
+      pigmentLayer = createGraphics(windowWidth, windowHeight);
+      rimLayer = createGraphics(windowWidth, windowHeight);
+      [paperLayer, pigmentLayer, rimLayer].forEach((g) => g.pixelDensity(1));
+      paintPaper();
+    }
+
+    function paintPaper() {
+      const palette = PALETTES[paletteIndex];
+      paperLayer.background(palette.surface);
+      paperLayer.noStroke();
+
+      // Static paper grain: regenerated only on reset/resize/palette change so the
+      // settled composition does not shimmer or mutate while idle.
+      for (let i = 0; i < width * height / 1450; i++) {
+        const x = random(width);
+        const y = random(height);
+        const a = random(5, 16);
+        const r = random(0.35, 1.2);
+        paperLayer.fill(red(color(palette.grain)), green(color(palette.grain)), blue(color(palette.grain)), a);
+        paperLayer.circle(x, y, r);
+      }
+      for (let y = 0; y < height; y += 5) {
+        paperLayer.stroke(255, 255, 245, 5);
+        paperLayer.line(0, y + noise(y * 0.04) * 2, width, y + noise(y * 0.04 + 20) * 2);
+      }
+    }
+
+    function resetSketch() {
+      particles = [];
+      impulses = [];
+      activePress = null;
+      quietFrames = 0;
+      settled = true;
+      pigmentCursor = 0;
+      pigmentLayer.clear();
+      rimLayer.clear();
+      paintPaper();
+      loop();
+    }
+
+    function currentPigment() {
+      const palette = PALETTES[paletteIndex];
+      const pigment = palette.pigments[pigmentCursor % palette.pigments.length];
+      pigmentCursor += 1;
+      return pigment;
     }
 
     function keyPressed() {
-      if (key === 'r' || key === 'R') background('#f3ead7');
+      if (key === 'r' || key === 'R') {
+        resetSketch();
+      }
+      if (key === 'p' || key === 'P') {
+        paletteIndex = (paletteIndex + 1) % PALETTES.length;
+        paintPaper();
+        updateHint();
+        loop();
+      }
+    }
+
+    function updateHint() {
+      document.getElementById('hint').textContent = `hold to drop · P palette (${PALETTES[paletteIndex].name}) · R reset`;
+    }
+
+    function startPress(x, y) {
+      const pigment = currentPigment();
+      activePress = {
+        x: constrain(x, BOUNDARY_PAD, width - BOUNDARY_PAD),
+        y: constrain(y, BOUNDARY_PAD, height - BOUNDARY_PAD),
+        startMs: millis(),
+        lastEmitMs: millis(),
+        emitted: 0,
+        pigment
+      };
+      settled = false;
+      quietFrames = 0;
+      loop();
+
+      // Immediate seed feedback keeps quick taps visible. The release later emits
+      // only the remaining budget so a tap is not double-counted as two drops.
+      const plan = holdPlan(HOLD_MIN_MS);
+      const seedCount = min(32, floor(plan.count * 0.72));
+      injectPigment(activePress.x, activePress.y, pigment, seedCount, plan.radius * 0.55, plan.impulseRadius * 0.55, plan.impulseStrength * 0.65, true);
+      activePress.emitted += seedCount;
+    }
+
+    function finishPress() {
+      if (!activePress) return;
+      const elapsed = millis() - activePress.startMs;
+      const plan = holdPlan(elapsed);
+      const remaining = max(8, plan.count - activePress.emitted);
+      injectPigment(activePress.x, activePress.y, activePress.pigment, remaining, plan.radius, plan.impulseRadius, plan.impulseStrength, false);
+      activePress = null;
+      settled = false;
+      loop();
+    }
+
+    function emitWhileHolding() {
+      const now = millis();
+      if (now - activePress.lastEmitMs < 155) return;
+      const plan = holdPlan(now - activePress.startMs);
+      const desiredSoFar = floor(plan.count * 0.62);
+      const tranche = constrain(desiredSoFar - activePress.emitted, 0, 26);
+      if (tranche > 0) {
+        injectPigment(activePress.x, activePress.y, activePress.pigment, tranche, plan.radius * 0.42, plan.impulseRadius * 0.36, plan.impulseStrength * 0.28, true);
+        activePress.emitted += tranche;
+      }
+      activePress.lastEmitMs = now;
+    }
+
+    function holdPlan(durationMs) {
+      const clamped = constrain(durationMs, HOLD_MIN_MS, HOLD_MAX_MS);
+      const t = (clamped - HOLD_MIN_MS) / (HOLD_MAX_MS - HOLD_MIN_MS);
+      const eased = 1 - pow(1 - t, 2.35);
+
+      // Hold mapping is area-biased: particle mass climbs faster than radius so a
+      // long hold feels like adding more paint, not just using a wider brush.
+      const count = floor(lerp(56, 390, eased));
+      const radius = sqrt(lerp(11 * 11, 58 * 58, eased));
+      const impulseRadius = lerp(45, 170, eased);
+      const impulseStrength = lerp(1.15, 5.4, eased);
+      return { t, eased, count, radius, impulseRadius, impulseStrength };
+    }
+
+    function injectPigment(x, y, pigment, count, radius, impulseRadius, impulseStrength, isTrickle) {
+      settled = false;
+      quietFrames = 0;
+
+      // Splatting/injection: particles are born in a noisy disk with small outward
+      // velocity. We keep each particle's original color, which preserves palette
+      // identity even when later palettes are selected.
+      for (let i = 0; i < count; i++) {
+        const a = random(TWO_PI);
+        const d = radius * sqrt(random()) * random(0.25, 1.12);
+        const wobble = noise(x * 0.01 + i * 0.13, y * 0.01) * 0.9 + 0.55;
+        const px = constrain(x + cos(a) * d * wobble, BOUNDARY_PAD, width - BOUNDARY_PAD);
+        const py = constrain(y + sin(a) * d * wobble, BOUNDARY_PAD, height - BOUNDARY_PAD);
+        const outward = isTrickle ? random(0.08, 0.5) : random(0.18, 1.05);
+        particles.push({
+          x: px,
+          y: py,
+          vx: cos(a + random(-0.45, 0.45)) * outward,
+          vy: sin(a + random(-0.45, 0.45)) * outward,
+          color: pigment.color,
+          rim: pigment.rim,
+          radius: random(5.8, 10.8),
+          alpha: random(30, 55),
+          age: 0
+        });
+      }
+
+      // Pressure impulse is the main displacement mechanism. Unlike a pure blob
+      // sketch, this affects older particles too, making new drops visibly shove
+      // and stretch material that was already on the water surface.
+      impulses.push({
+        x, y,
+        radius: impulseRadius,
+        strength: impulseStrength,
+        life: IMPULSE_LIFE,
+        maxLife: IMPULSE_LIFE
+      });
+
+      if (particles.length > maxParticles) {
+        // Performance tradeoff: drop oldest tracers when over cap. This sacrifices
+        // exact pigment mass but keeps mobile viable and avoids O(n) splatting from
+        // growing without bound during comparison testing.
+        particles.splice(0, particles.length - maxParticles);
+      }
+    }
+
+    function updateSimulation() {
+      const grid = buildGrid();
+      let maxSpeed = 0;
+
+      for (const p of particles) {
+        p.age += 1;
+
+        applyPressureForces(p);
+        applySeparationForce(p, grid);
+        applyWetCurl(p);
+
+        p.vx *= DAMPING;
+        p.vy *= DAMPING;
+        if (abs(p.vx) + abs(p.vy) < 0.012) {
+          p.vx = 0;
+          p.vy = 0;
+        }
+
+        p.x += p.vx;
+        p.y += p.vy;
+        constrainParticleToCanvas(p);
+        maxSpeed = max(maxSpeed, sqrt(p.vx * p.vx + p.vy * p.vy));
+      }
+
+      for (let i = impulses.length - 1; i >= 0; i--) {
+        impulses[i].life -= 1;
+        if (impulses[i].life <= 0) impulses.splice(i, 1);
+      }
+
+      // Settle detection: no input, no live pressure impulses, and tiny velocity
+      // for a sustained window. When settled, draw() calls noLoop() so the final
+      // image is static and the sketch stops burning CPU.
+      if (!activePress && impulses.length === 0 && maxSpeed < SETTLE_SPEED) {
+        quietFrames += 1;
+      } else {
+        quietFrames = 0;
+      }
+      if (!activePress && quietFrames > SETTLE_FRAMES) {
+        settled = true;
+        for (const p of particles) {
+          p.vx = 0;
+          p.vy = 0;
+        }
+      }
+    }
+
+    function applyPressureForces(p) {
+      for (const impulse of impulses) {
+        const dx = p.x - impulse.x;
+        const dy = p.y - impulse.y;
+        const d2 = dx * dx + dy * dy;
+        const r2 = impulse.radius * impulse.radius;
+        if (d2 > r2 || d2 < 0.001) continue;
+        const d = sqrt(d2);
+        const falloff = pow(1 - d / impulse.radius, 2.1);
+        const ageFade = impulse.life / impulse.maxLife;
+        const push = impulse.strength * falloff * ageFade * 0.105;
+        p.vx += (dx / d) * push;
+        p.vy += (dy / d) * push;
+      }
+    }
+
+    function applyWetCurl(p) {
+      // Subtle curl/noise flow gives wet drift while particles are active. It is
+      // gated by age and live impulses so it enriches spreading without becoming
+      // endless idle animation.
+      if (impulses.length === 0 && p.age > 160) return;
+      const fade = impulses.length > 0 ? 1 : max(0, 1 - p.age / 260);
+      if (fade <= 0) return;
+      const n1 = noise(p.x * 0.0045, p.y * 0.0045, frameCount * 0.004);
+      const n2 = noise(p.x * 0.0045 + 80, p.y * 0.0045 - 30, frameCount * 0.004);
+      const angle = (n1 - n2) * TWO_PI * 1.6;
+      p.vx += cos(angle) * 0.018 * fade;
+      p.vy += sin(angle) * 0.018 * fade;
+    }
+
+    function buildGrid() {
+      const grid = new Map();
+      for (let i = 0; i < particles.length; i++) {
+        const p = particles[i];
+        const key = gridKey(p.x, p.y);
+        if (!grid.has(key)) grid.set(key, []);
+        grid.get(key).push(i);
+      }
+      return grid;
+    }
+
+    function gridKey(x, y) {
+      return `${floor(x / GRID_CELL)},${floor(y / GRID_CELL)}`;
+    }
+
+    function applySeparationForce(p, grid) {
+      // Local spreading prevents dense drops from collapsing into visible dots.
+      // A spatial hash keeps this near O(n) instead of scanning every pair.
+      const gx = floor(p.x / GRID_CELL);
+      const gy = floor(p.y / GRID_CELL);
+      let pushes = 0;
+      for (let oy = -1; oy <= 1; oy++) {
+        for (let ox = -1; ox <= 1; ox++) {
+          const bucket = grid.get(`${gx + ox},${gy + oy}`);
+          if (!bucket) continue;
+          for (const idx of bucket) {
+            const q = particles[idx];
+            if (q === p) continue;
+            const dx = p.x - q.x;
+            const dy = p.y - q.y;
+            const d2 = dx * dx + dy * dy;
+            if (d2 > 58 || d2 < 0.05) continue;
+            const d = sqrt(d2);
+            const s = (1 - d / 7.6) * 0.009;
+            p.vx += (dx / d) * s;
+            p.vy += (dy / d) * s;
+            pushes += 1;
+            if (pushes > 7) return;
+          }
+        }
+      }
+    }
+
+    function constrainParticleToCanvas(p) {
+      if (p.x < BOUNDARY_PAD) { p.x = BOUNDARY_PAD; p.vx *= -0.08; p.vy *= 0.72; }
+      if (p.x > width - BOUNDARY_PAD) { p.x = width - BOUNDARY_PAD; p.vx *= -0.08; p.vy *= 0.72; }
+      if (p.y < BOUNDARY_PAD) { p.y = BOUNDARY_PAD; p.vy *= -0.08; p.vx *= 0.72; }
+      if (p.y > height - BOUNDARY_PAD) { p.y = height - BOUNDARY_PAD; p.vy *= -0.08; p.vx *= 0.72; }
+    }
+
+    function renderPigment() {
+      pigmentLayer.clear();
+      rimLayer.clear();
+      pigmentLayer.noStroke();
+      rimLayer.noFill();
+
+      for (const p of particles) {
+        const c = color(p.color);
+        const rim = color(p.rim);
+        const speed = sqrt(p.vx * p.vx + p.vy * p.vy);
+        const stretch = constrain(speed * 2.1, 0, 4.5);
+        const r = p.radius + stretch;
+
+        // Rendering splat: soft translucent disks overlap into pigment washes.
+        // A darker outer ring suggests marbling/oil boundaries without threshold
+        // filters or expensive full-screen blur passes.
+        pigmentLayer.fill(red(c), green(c), blue(c), p.alpha * 0.32);
+        pigmentLayer.circle(p.x, p.y, r * 2.65);
+        pigmentLayer.fill(red(c), green(c), blue(c), p.alpha * 0.52);
+        pigmentLayer.circle(p.x, p.y, r * 1.45);
+        pigmentLayer.fill(255, 255, 245, 6);
+        pigmentLayer.circle(p.x - r * 0.16, p.y - r * 0.16, r * 0.78);
+
+        rimLayer.stroke(red(rim), green(rim), blue(rim), 17);
+        rimLayer.strokeWeight(1.15);
+        rimLayer.circle(p.x, p.y, r * 2.12);
+      }
+    }
+
+    function drawOverlay() {
+      if (activePress) {
+        const plan = holdPlan(millis() - activePress.startMs);
+        noFill();
+        stroke(70, 55, 38, 38);
+        strokeWeight(1);
+        circle(activePress.x, activePress.y, plan.radius * 2);
+        noStroke();
+      }
+
+      fill(75, 55, 35, 24);
+      textSize(11);
+      textAlign(RIGHT, TOP);
+      const state = settled ? 'settled' : `${particles.length}/${maxParticles} particles`;
+      text(`${PALETTES[paletteIndex].name} · ${state}`, width - 10, 9);
+    }
+
+    function pointerFromTouch() {
+      if (touches && touches.length > 0) {
+        return { x: touches[0].x, y: touches[0].y };
+      }
+      return { x: mouseX, y: mouseY };
+    }
+
+    function mousePressed() {
+      if (millis() - lastTouchAt < 650) return false;
+      startPress(mouseX, mouseY);
+      return false;
+    }
+
+    function mouseReleased() {
+      if (millis() - lastTouchAt < 650) return false;
+      finishPress();
+      return false;
+    }
+
+    function touchStarted() {
+      lastTouchAt = millis();
+      const p = pointerFromTouch();
+      startPress(p.x, p.y);
+      return false;
+    }
+
+    function touchEnded() {
+      lastTouchAt = millis();
+      finishPress();
+      return false;
     }
 
     function windowResized() {
       resizeCanvas(windowWidth, windowHeight);
+      configureCaps();
+      rebuildLayers();
+      for (const p of particles) {
+        p.x = constrain(p.x, BOUNDARY_PAD, width - BOUNDARY_PAD);
+        p.y = constrain(p.y, BOUNDARY_PAD, height - BOUNDARY_PAD);
+      }
+      settled = false;
+      quietFrames = 0;
+      loop();
     }
+
+    updateHint();
   </script>
 </body>
 </html>
