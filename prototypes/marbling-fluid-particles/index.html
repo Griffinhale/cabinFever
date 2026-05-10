@@ -1,0 +1,1408 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+  <title>Marbling — fluid particles (synthesis)</title>
+  <script src="https://cdn.jsdelivr.net/npm/p5@1.11.3/lib/p5.min.js"></script>
+  <script>window.p5 && (p5.disableFriendlyErrors = true);</script>
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: #f4eddf;
+      touch-action: none;
+      overscroll-behavior: none;
+      -webkit-user-select: none;
+      user-select: none;
+    }
+    canvas { display: block; touch-action: none; }
+    #hint {
+      position: fixed;
+      left: 10px;
+      bottom: 8px;
+      z-index: 10;
+      color: rgba(45, 35, 25, 0.46);
+      font: 11px/1.35 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      letter-spacing: 0.02em;
+      pointer-events: none;
+      text-shadow: 0 1px 0 rgba(255, 255, 255, 0.35);
+    }
+    #cornerActions {
+      position: fixed;
+      right: 8px;
+      bottom: 8px;
+      z-index: 11;
+      color: rgba(45, 35, 25, 0.34);
+      font: 10px/1.35 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      pointer-events: none;
+      text-align: right;
+    }
+  </style>
+</head>
+<body>
+  <div id="hint">hold to drop · P palette · R reset</div>
+  <div id="cornerActions">tap top-left: palette<br>hold top-right: reset</div>
+  <script>
+    /*
+      Marbling — fluid particles (synthesis prototype).
+
+      Combines three architectures:
+
+      * SDF prototype (prototypes/marbling-shader-sdf):
+          paper grain, rim darkening, stain bloom, granulation, vein —
+          ported from the fragment shader to JS pixel writes.
+
+      * Particle-displacement prototype (prototypes/marbling-particle-displacement):
+          velocity-based particle physics — each press creates an *impulse*
+          (transient outward force) that pushes existing particles. Particles
+          have vx/vy with damping, optional separation force, and a tiny curl
+          noise that makes settling look "wet" rather than mechanical.
+
+      * Metaball-pools prototype (prototypes/marbling-metaball-pools), refined:
+          inverse-square field summation per drop with strongest-owner
+          clipping, two-pigment muddy seam blend at low margins, coordinate-
+          space domain warp (anisotropic radial vs tangential) for fluid
+          edges, inner sub-metaballs for interior color swirls, satellite
+          ejection when one drop engulfs another's particles.
+
+      The key conceptual move from refined metaball: pool-bound lobes become
+      independent particles. A "drop" is just a semantic group that shares a
+      pigment; its particles are positioned freely in screen space and pushed
+      by impulses, not constrained to angular offsets from a fixed center.
+    */
+
+    // ---- Constants ----------------------------------------------------------
+
+    const DEBUG_PERF = false;
+    const QUALITY_TIERS = [
+      { name: 'high',   cellSize: 4, slowMs: 18, fastMs: 10 },
+      { name: 'medium', cellSize: 6, slowMs: 15, fastMs: 8 },
+      { name: 'low',    cellSize: 8, slowMs: 13, fastMs: 7 }
+    ];
+    const FIELD_THRESHOLD = 0.92;
+    const FIELD_RIM_BAND = 0.42;
+    const FIELD_INFLUENCE_FACTOR = 2.35;
+    const DIRTY_PADDING_CELLS = 3;
+    const FULL_REDRAW_COVERAGE = 0.52;
+    const MAX_HOLD_MS = 2100;
+    const MIN_HOLD_MS = 80;
+    const RESET_HOLD_MS = 750;
+    const CORNER_ACTION_SIZE = 72;
+    const SETTLE_EPSILON = 0.985;
+
+    // Particle physics (lifted from particle-displacement, tuned for the
+    // synthesis: no wet-curl during settled state, faster damping than the
+    // donor since we don't want long idle drift).
+    const MAX_DROPS = 32;
+    const MAX_PARTICLES = 280;          // 32 drops × ~8 particles, with overhead
+    const PARTICLE_DAMPING = 0.86;
+    const FREEZE_SPEED = 0.07;
+    const SETTLE_SPEED = 0.045;
+    const SETTLE_FRAMES = 18;
+    const SEPARATION_AGE_LIMIT = 36;    // frames; after this, particles stop separating
+    const CURL_AGE_LIMIT = 22;
+    const CURL_STRENGTH = 0.085;
+
+    // Impulse: transient outward force created by each press. Pushes existing
+    // particles for IMPULSE_LIFE frames with quadratic falloff. While the
+    // press is active, a *preview* impulse exists with the same math but
+    // gets reset every frame — gives mid-press visual feedback.
+    const IMPULSE_LIFE = 28;
+    const IMPULSE_RADIUS_FACTOR = 1.95; // impulse radius = R_drop × this
+    const IMPULSE_STRENGTH_FACTOR = 0.022;
+
+    // Two-pigment seam blend (refined metaball R2).
+    const SEAM_BAND = 0.55;
+    const SEAM_BLEND_MAX = 0.42;
+
+    // Anisotropic + tendril boundary warp (refined metaball D3).
+    const DOMAIN_WARP_PX = 14;
+    const RADIAL_WARP_BOOST = 1.85;
+    const TANGENTIAL_WARP_DAMP = 0.45;
+    const TENDRIL_WARP_PX = 9;
+
+    // Inner sub-metaballs per drop (refined metaball D2, "metaball within
+    // metaball"): a few interior particles with intensity ∈ [-1, 1] tinting
+    // pigment toward `wash` (positive) or `rim` (negative).
+    const INNER_LOBE_MIN = 4;
+    const INNER_LOBE_MAX = 8;
+    const INNER_TINT_STRENGTH = 0.34;
+
+    // Satellite spawning at contact zones (refined metaball D4): when a new
+    // drop overlaps an existing drop's particles, eject small fleck particles
+    // of the existing drop's color outside the new drop's radius.
+    const SATELLITES_PER_EVENT = 2;
+    const MAX_SATELLITES_PER_DROP = 8;
+    const SATELLITE_PROXIMITY_FACTOR = 1.35;
+
+    // SDF-style surface treatment thresholds.
+    const STAIN_RADIUS_PX = 36;        // bloom range outside the drop
+    const STAIN_STRENGTH = 0.085;      // max paper tint toward pigment color
+    const GRANULATION_DEPTH = 0.045;   // how much the speckle subtracts (0..1)
+    const VEIN_DEPTH = 0.06;           // ± shift in pigment from vein noise
+    const RIM_BAND_PX = 5.5;           // edge softness in rim pixels
+
+    // ---- Palettes -----------------------------------------------------------
+    // Same shape as refined metaball: each palette has surface, grain, hint
+    // (used for status overlays), and an array of pigments with base/rim/wash.
+    const PALETTES = [
+      {
+        name: 'traditional marbling',
+        surface: '#f3ead8',
+        grain: '#d8c6a8',
+        hint: '#3a2a21',
+        accent: '#b78c5b',
+        pigments: [
+          { base: '#173b62', rim: '#0b2138', wash: '#6f8fb0' },
+          { base: '#7d2630', rim: '#42121a', wash: '#b96f68' },
+          { base: '#c18a2f', rim: '#765119', wash: '#dfbd71' },
+          { base: '#53673a', rim: '#2c381f', wash: '#9aa574' },
+          { base: '#d9c8a4', rim: '#8f7650', wash: '#f2e6c9' }
+        ]
+      },
+      {
+        name: 'bright playful',
+        surface: '#fbf2df',
+        grain: '#e1cfaa',
+        hint: '#24212b',
+        accent: '#fc9f80',
+        pigments: [
+          { base: '#f0645f', rim: '#9e2d32', wash: '#ffaaa0' },
+          { base: '#17a6a5', rim: '#08666d', wash: '#8bdad2' },
+          { base: '#f3cf38', rim: '#a77c0d', wash: '#ffe988' },
+          { base: '#8066c8', rim: '#46337d', wash: '#b9a6ed' },
+          { base: '#2351c6', rim: '#142a77', wash: '#7e9dea' }
+        ]
+      },
+      {
+        name: 'portfolio subdued',
+        surface: '#f1eadc',
+        grain: '#d0c2aa',
+        hint: '#2b2925',
+        accent: '#c79768',
+        pigments: [
+          { base: '#29313a', rim: '#11161b', wash: '#737b83' },
+          { base: '#a85f47', rim: '#653225', wash: '#d7a18b' },
+          { base: '#4f827f', rim: '#294a49', wash: '#9abcb7' },
+          { base: '#d8c6a0', rim: '#856f49', wash: '#f0e4c4' },
+          { base: '#b8733b', rim: '#70401f', wash: '#d6a06b' }
+        ]
+      },
+      {
+        name: 'monochrome ink',
+        surface: '#f5f1e8',
+        grain: '#cbc2b1',
+        hint: '#171a20',
+        accent: '#576579',
+        pigments: [
+          { base: '#101b2a', rim: '#05090f', wash: '#657287' },
+          { base: '#3e4855', rim: '#1b2129', wash: '#8b95a1' },
+          { base: '#777a76', rim: '#3d403f', wash: '#babcb3' },
+          { base: '#b6b7aa', rim: '#74786d', wash: '#deded2' }
+        ]
+      }
+    ];
+
+    // ---- Sketch state -------------------------------------------------------
+
+    let drops = [];          // Drop[]: semantic groups (pigment, createdAt, ...)
+    let particles = [];      // flat list, hot path. Each has .dropId back-ref
+    let impulses = [];       // transient outward forces
+    let previewImpulse = null; // mid-press preview impulse (rebuilt each frame)
+    let activePress = null;
+    let paletteIndex = 0;
+    let pigmentIndex = 0;
+    let nextDropId = 0;
+    let dirty = true;
+    let settled = true;
+    let quietFrames = 0;
+    let qualityIndex = 0;
+    let quality = QUALITY_TIERS[qualityIndex];
+    let fieldCols = 0;
+    let fieldRows = 0;
+    let field = [];
+    let dirtyRects = [];
+    let fullFieldDirty = true;
+    let paperLayer;
+    let pigmentLayer;
+    let lastDrawHadMotion = false;
+    let pendingReset = null;
+    let lastRenderMs = 0;
+    let slowFrameStreak = 0;
+    let fastFrameStreak = 0;
+    let lastPreviewRect = null;
+
+    // ---- p5 lifecycle -------------------------------------------------------
+
+    function setup() {
+      pixelDensity(1);
+      const cnv = createCanvas(windowWidth, windowHeight);
+      cnv.elt.addEventListener('contextmenu', (e) => e.preventDefault());
+      chooseInitialQuality();
+      rebuildSurfaces();
+      updateHint();
+    }
+
+    function draw() {
+      let moving = false;
+      if (activePress) moving = true;
+
+      // Particle physics step. Always runs while there are live impulses or
+      // unsettled particles; stops when everything's still and no press is
+      // active. We never noLoop(): the simulation is cheap when settled and
+      // p5's draw skip below already keeps the static frame static.
+      const physicsActive = updateParticleSimulation();
+      if (physicsActive) moving = true;
+
+      markActivePreviewDirty();
+
+      settled = !activePress && !physicsActive;
+      if (moving || dirty || lastDrawHadMotion) {
+        adaptQuality(moving || !!activePress);
+        renderScene();
+        dirty = false;
+      } else {
+        image(paperLayer, 0, 0);
+        image(pigmentLayer, 0, 0);
+      }
+      lastDrawHadMotion = moving;
+    }
+
+    function rebuildSurfaces() {
+      fieldCols = Math.ceil(width / quality.cellSize);
+      fieldRows = Math.ceil(height / quality.cellSize);
+      field = new Array(fieldCols * fieldRows);
+      paperLayer = createGraphics(width, height);
+      pigmentLayer = createGraphics(width, height);
+      pigmentLayer.pixelDensity(1);
+      paperLayer.pixelDensity(1);
+      renderPaper();
+      for (const drop of drops) drop.updateGeometry();
+      lastPreviewRect = null;
+      markFullFieldDirty();
+    }
+
+    // SDF-style paper render. Direct pixel writes with an fbm-shaped grain
+    // and a gentle vignette — more textured than the refined metaball's
+    // scattered-circle paper, but still cached so palette switch is the
+    // only redraw cost.
+    function renderPaper() {
+      const palette = PALETTES[paletteIndex];
+      const surfaceRgb = parseHexRgb(palette.surface);
+      const grainRgb = parseHexRgb(palette.grain);
+      paperLayer.loadPixels();
+      const px = paperLayer.pixels;
+      const w = paperLayer.width;
+      const h = paperLayer.height;
+      const cx = w * 0.5;
+      const cy = h * 0.5;
+      const vignDiag = Math.sqrt(cx * cx + cy * cy);
+      // Per-pixel paper would be too slow at full screen size; render at
+      // half-resolution and let bilinear filtering do the rest. Good enough
+      // since paper grain is meant to be soft anyway.
+      const step = 2;
+      for (let y = 0; y < h; y += step) {
+        for (let x = 0; x < w; x += step) {
+          // SDF prototype's paperSurface, ported. fbm via p5's noise calls.
+          const broad = noise(x * 0.0035 + 4, y * 0.0035);
+          const grain1 = noise(x * 0.95, y * 0.95);
+          const grain2 = noise(x * 0.21 + 19, y * 0.21);
+          const grainV = grain1 * 0.32 + grain2 * 0.68;
+          const fibers = Math.sin((x + noise(x * 0.006, y * 0.006) * 32) * 0.035) * 0.5 + 0.5;
+          const broadShift = (broad - 0.5) * 0.055 * 255;
+          const mixT = 0.030 + grainV * 0.045 + fibers * 0.012;
+          let r = surfaceRgb.r + broadShift;
+          let g = surfaceRgb.g + broadShift;
+          let b = surfaceRgb.b + broadShift;
+          r += (grainRgb.r - r) * mixT;
+          g += (grainRgb.g - g) * mixT;
+          b += (grainRgb.b - b) * mixT;
+          // Vignette (subtle, edges slightly darker).
+          const dx = x - cx;
+          const dy = y - cy;
+          const dn = Math.sqrt(dx * dx + dy * dy) / vignDiag;
+          const vign = smoothstep(0.88, 0.18, dn);
+          const vMul = 0.94 + 0.08 * vign;
+          r = clampByte(r * vMul);
+          g = clampByte(g * vMul);
+          b = clampByte(b * vMul);
+          // Splat the color into a step×step block.
+          for (let dy2 = 0; dy2 < step && y + dy2 < h; dy2++) {
+            let off = ((y + dy2) * w + x) * 4;
+            for (let dx2 = 0; dx2 < step && x + dx2 < w; dx2++) {
+              px[off] = r;
+              px[off + 1] = g;
+              px[off + 2] = b;
+              px[off + 3] = 255;
+              off += 4;
+            }
+          }
+        }
+      }
+      paperLayer.updatePixels();
+    }
+
+    function renderScene() {
+      image(paperLayer, 0, 0);
+      renderPigmentField();
+      image(pigmentLayer, 0, 0);
+      renderPressPreview();
+    }
+
+    // ---- Field evaluation ---------------------------------------------------
+
+    function renderPigmentField() {
+      const startedAt = performance.now();
+      const rects = consumeDirtyRects();
+      clearPigmentRects(rects);
+      evaluateField(rects);
+
+      pigmentLayer.loadPixels();
+      const pix = pigmentLayer.pixels;
+      const layerW = pigmentLayer.width;
+      const layerH = pigmentLayer.height;
+      const cellSize = quality.cellSize;
+
+      for (const rect of rects) {
+        for (let gy = rect.y0; gy < rect.y1; gy++) {
+          for (let gx = rect.x0; gx < rect.x1; gx++) {
+            const cell = field[gx + gy * fieldCols];
+            if (!cell) continue;
+            // Owned cell: paint pigment with full SDF-style treatment.
+            // Unowned but near-pigment cell: paint stain bloom.
+            if (cell.owner >= 0) {
+              const drop = drops[cell.owner];
+              if (!drop) continue;
+              const second = cell.secondOwner >= 0 ? drops[cell.secondOwner] : null;
+              writePigmentCell(pix, layerW, layerH, cellSize, gx, gy, cell, drop, second);
+            } else if (cell.stainOwner >= 0) {
+              const drop = drops[cell.stainOwner];
+              if (!drop) continue;
+              writeStainCell(pix, layerW, layerH, cellSize, gx, gy, cell, drop);
+            }
+          }
+        }
+      }
+
+      pigmentLayer.updatePixels();
+
+      lastRenderMs = performance.now() - startedAt;
+      if (DEBUG_PERF) {
+        const cells = rects.reduce((sum, rect) => sum + rectArea(rect), 0);
+        console.log(`[fluid] ${quality.name} ${quality.cellSize}px ${cells}/${fieldCols * fieldRows} cells ${drops.length} drops ${particles.length} particles ${lastRenderMs.toFixed(1)}ms`);
+      }
+    }
+
+    // Per-cell field eval. For each owned drop we accumulate a per-drop sum
+    // (since one drop is many particles) and pick the strongest drop. The
+    // stainOwner is tracked for unowned cells: nearest drop within
+    // STAIN_RADIUS_PX gets to bloom into the paper there.
+    function evaluateField(rects) {
+      const cellSize = quality.cellSize;
+      // Per-drop running sums; reused across cells via reset.
+      const dropSum = new Float32Array(drops.length);
+      const dropAge = new Float64Array(drops.length);
+      for (let i = 0; i < drops.length; i++) dropAge[i] = drops[i].createdAt;
+
+      for (const rect of rects) {
+        const candDrops = dropsForRect(rect);
+        for (let gy = rect.y0; gy < rect.y1; gy++) {
+          const y = gy * cellSize + cellSize * 0.5;
+          for (let gx = rect.x0; gx < rect.x1; gx++) {
+            const x = gx * cellSize + cellSize * 0.5;
+
+            // Reset per-cell sums for the candidate drops only.
+            for (const di of candDrops) dropSum[di] = 0;
+
+            // Sum metaball field per drop. We evaluate each candidate drop's
+            // particle list with anisotropic + tendril warp, just like
+            // refined metaball but per-particle now.
+            for (const di of candDrops) {
+              dropSum[di] = drops[di].fieldAt(x, y);
+            }
+
+            // Find best and second.
+            let best = -1, bestF = 0, bestAge = -1;
+            let second = -1, secondF = 0;
+            for (const di of candDrops) {
+              const f = dropSum[di];
+              if (f <= 0) continue;
+              const newerTie = Math.abs(f - bestF) < 0.045 && dropAge[di] > bestAge;
+              if (f > bestF || (f > FIELD_THRESHOLD && newerTie)) {
+                second = best;
+                secondF = bestF;
+                best = di;
+                bestF = f;
+                bestAge = dropAge[di];
+              } else if (f > secondF) {
+                second = di;
+                secondF = f;
+              }
+            }
+
+            const idx = gx + gy * fieldCols;
+            if (bestF >= FIELD_THRESHOLD) {
+              field[idx] = {
+                owner: best, secondOwner: second,
+                strength: bestF, margin: bestF - secondF,
+                stainOwner: -1, stainStrength: 0
+              };
+            } else {
+              // No owner — but the cell may be close enough to the strongest
+              // drop to receive a stain bloom (paper tinted toward pigment).
+              // Threshold for stain is a bit below FIELD_THRESHOLD so the
+              // stain transitions smoothly into the painted body.
+              const stainOwner = (best >= 0 && bestF > 0.18) ? best : -1;
+              field[idx] = {
+                owner: -1, secondOwner: -1,
+                strength: bestF, margin: 0,
+                stainOwner, stainStrength: bestF
+              };
+            }
+          }
+        }
+      }
+    }
+
+    function dropsForRect(rect) {
+      const candidates = [];
+      for (let i = 0; i < drops.length; i++) {
+        const d = drops[i];
+        if (d.fieldRect && rectsOverlap(d.fieldRect, rect)) candidates.push(i);
+      }
+      return candidates;
+    }
+
+    // Cardinal-neighbour disagreement test for rim shading. Same trick as
+    // refined metaball; cheap, stable.
+    function hasDifferentNeighbor(gx, gy, ownerId) {
+      const checks = [[1, 0], [-1, 0], [0, 1], [0, -1]];
+      for (const [dx, dy] of checks) {
+        const nx = gx + dx, ny = gy + dy;
+        if (nx < 0 || ny < 0 || nx >= fieldCols || ny >= fieldRows) return true;
+        const n = field[nx + ny * fieldCols];
+        if (!n || n.owner !== ownerId) return true;
+      }
+      return false;
+    }
+
+    // ---- Cell painters ------------------------------------------------------
+
+    function writePigmentCell(pix, layerW, layerH, cellSize, gx, gy, cell, drop, second) {
+      const cxp = gx * cellSize + cellSize * 0.5;
+      const cyp = gy * cellSize + cellSize * 0.5;
+      const x0 = gx * cellSize;
+      const y0 = gy * cellSize;
+
+      const neighborRim = hasDifferentNeighbor(gx, gy, cell.owner);
+      // Edge proximity: how far from the threshold contour we are (0 = just
+      // inside the boundary, 1 = deep interior).
+      const edgeT = constrain((cell.strength - FIELD_THRESHOLD) / FIELD_RIM_BAND, 0, 1);
+      const alphaBase = 110 + 90 * edgeT;             // softer alpha gradient than baseline
+      const rimT = neighborRim ? 0.74 : Math.max(0, 1 - edgeT) * 0.62;
+      const washT = constrain((cell.strength - 1.5) / 3.2, 0, 0.48);
+      const washed = mixRgb(drop.rgb.base, drop.rgb.wash, washT);
+      let c = mixRgb(washed, drop.rgb.rim, rimT);
+
+      // SDF-style vein: directional fbm streaks within pigment body. Uses
+      // angle-from-drop-center so streaks read as flowing outward.
+      const rel = drop.relativeTo(cxp, cyp);
+      const veinNoise = noise(
+        Math.atan2(rel.y, rel.x) * 4 + drop.seed * 9,
+        Math.sqrt(rel.x * rel.x + rel.y * rel.y) * 0.07
+      );
+      const veinShift = (veinNoise - 0.5) * VEIN_DEPTH * (1 - rimT);
+      c = {
+        r: c.r * (1 + veinShift),
+        g: c.g * (1 + veinShift),
+        b: c.b * (1 + veinShift)
+      };
+
+      // SDF-style granulation: fine-frequency noise subtracts a tiny amount
+      // (creates "tooth" / paper-bite specks).
+      const granule = noise(cxp * 1.65 + drop.seed * 311, cyp * 1.65 - drop.seed * 17);
+      const granShift = (1 - smoothstep(0.35, 0.96, granule)) * GRANULATION_DEPTH * 255;
+      c = { r: c.r - granShift, g: c.g - granShift, b: c.b - granShift };
+
+      // D2 — interior sub-metaball tint (positive: wash, negative: rim).
+      const innerField = drop.innerFieldAt(cxp, cyp);
+      if (innerField !== 0) {
+        const interiorT = 1 - edgeT;
+        const tintMag = Math.min(1, Math.abs(innerField)) * INNER_TINT_STRENGTH * interiorT;
+        if (tintMag > 0.005) {
+          const tintColor = innerField > 0 ? drop.rgb.wash : drop.rgb.rim;
+          c = mixRgb(c, tintColor, tintMag);
+        }
+      }
+
+      // R2 — two-pigment seam blend at low margin.
+      if (second && cell.margin >= 0) {
+        const seamT = (1 - smoothstep(0, SEAM_BAND, cell.margin)) * SEAM_BLEND_MAX;
+        if (seamT > 0.001) {
+          const partner = mixRgb(second.rgb.base, second.rgb.wash, washT);
+          c = mixRgb(c, partner, seamT);
+        }
+      }
+
+      // Per-cell color jitter so cell boundaries don't read as a checker grid.
+      const stable = stableNoise(gx, gy, drop.seed);
+      const noiseShift = (stable - 0.5) * 10;
+      const r = clampByte(c.r + noiseShift);
+      const g = clampByte(c.g + noiseShift);
+      const b = clampByte(c.b + noiseShift);
+      const a = neighborRim ? 178 : (alphaBase | 0);
+
+      writeBlock(pix, layerW, layerH, x0, y0, cellSize, r, g, b, a);
+    }
+
+    // Stain bloom for unowned cells near a drop. Small alpha tint of the
+    // drop's color into the paper. Falls off as cell.strength drops.
+    function writeStainCell(pix, layerW, layerH, cellSize, gx, gy, cell, drop) {
+      const x0 = gx * cellSize;
+      const y0 = gy * cellSize;
+      // Strength is in [0, FIELD_THRESHOLD); remap to [0, 1] over [0.18, 0.92].
+      const t = constrain((cell.strength - 0.18) / (FIELD_THRESHOLD - 0.18), 0, 1);
+      const tint = STAIN_STRENGTH * t * t;             // quadratic falloff
+      if (tint < 0.005) return;
+      const r = clampByte(drop.rgb.base.r);
+      const g = clampByte(drop.rgb.base.g);
+      const b = clampByte(drop.rgb.base.b);
+      const a = (255 * tint) | 0;                      // stain is alpha-blended
+      writeBlock(pix, layerW, layerH, x0, y0, cellSize, r, g, b, a);
+    }
+
+    function writeBlock(pix, layerW, layerH, x0, y0, cellSize, r, g, b, a) {
+      for (let py = 0; py < cellSize; py++) {
+        const yy = y0 + py;
+        if (yy < 0 || yy >= layerH) continue;
+        let off = (yy * layerW + x0) * 4;
+        for (let px = 0; px < cellSize; px++) {
+          const xx = x0 + px;
+          if (xx >= 0 && xx < layerW) {
+            pix[off]     = r;
+            pix[off + 1] = g;
+            pix[off + 2] = b;
+            pix[off + 3] = a;
+          }
+          off += 4;
+        }
+      }
+    }
+
+    // ---- Drop / Particle classes -------------------------------------------
+
+    class Drop {
+      constructor(id, x, y, mass, lobeCount, pigment, seed) {
+        this.id = id;
+        this.center = { x, y };           // press position; used for vein/inner field origin
+        this.createdAt = millis();
+        this.color = pigment;
+        this.rgb = {
+          base: parseHexRgb(pigment.base),
+          rim: parseHexRgb(pigment.rim),
+          wash: parseHexRgb(pigment.wash)
+        };
+        this.targetMass = mass;
+        this.seed = seed;
+        this.particles = [];
+        this.innerLobes = [];
+        this.satelliteCount = 0;
+        this.fieldRect = null;
+        this.pixelBounds = null;
+        this.makeParticles(lobeCount);
+        this.makeInnerLobes();
+        this.updateGeometry();
+      }
+
+      relativeTo(x, y) {
+        return { x: x - this.center.x, y: y - this.center.y };
+      }
+
+      makeParticles(count) {
+        randomSeed(Math.floor(this.seed));
+        const baseRadius = Math.sqrt(this.targetMass / Math.PI);
+        let weights = [];
+        let total = 0;
+        for (let i = 0; i < count; i++) {
+          const w = random(0.55, 1.45);
+          weights.push(w);
+          total += w;
+        }
+        for (let i = 0; i < count; i++) {
+          const angle = (TWO_PI * i / count) + random(-0.55, 0.55);
+          const offset = i === 0 ? 0 : random(baseRadius * 0.12, baseRadius * 0.64);
+          const lobeMass = this.targetMass * weights[i] / total * random(0.88, 1.22);
+          const targetRadius = Math.sqrt(lobeMass / Math.PI) * random(1.55, 2.12);
+          const px = this.center.x + Math.cos(angle) * offset;
+          const py = this.center.y + Math.sin(angle) * offset;
+          // Initial outward velocity gives the "splat" feel — particles
+          // flick outward from the press point and damp to rest.
+          const outward = random(0.18, 1.05);
+          const p = {
+            x: px,
+            y: py,
+            vx: Math.cos(angle + random(-0.45, 0.45)) * outward,
+            vy: Math.sin(angle + random(-0.45, 0.45)) * outward,
+            mass: lobeMass,
+            radius: 2 + random(0, 2),                 // current/visible
+            targetRadius,
+            radius2: 4,                               // updated in updateGeometry
+            growthVariation: random(0.72, 1.22),
+            phase: random(1000),
+            phaseCos: 0,
+            phaseSin: 0,
+            age: 0,
+            quietFrames: 0,
+            state: 'active',
+            isSatellite: false,
+            dropId: this.id,
+            // For ownerInfluenceRect cull:
+            influenceRadius: 0,
+            influence2: 0
+          };
+          p.phaseCos = Math.cos(p.phase);
+          p.phaseSin = Math.sin(p.phase);
+          this.particles.push(p);
+          particles.push(p);                          // also into the flat list
+        }
+      }
+
+      makeInnerLobes() {
+        randomSeed(Math.floor(this.seed) ^ 0x5a17);
+        const baseRadius = Math.sqrt(this.targetMass / Math.PI);
+        const count = Math.floor(lerp(INNER_LOBE_MIN, INNER_LOBE_MAX + 0.99,
+          constrain(this.targetMass / 18000, 0, 1)));
+        for (let i = 0; i < count; i++) {
+          const angle = random(0, TWO_PI);
+          const offset = random(0, baseRadius * 0.62);
+          this.innerLobes.push({
+            dx: Math.cos(angle) * offset,
+            dy: Math.sin(angle) * offset,
+            radius: random(baseRadius * 0.18, baseRadius * 0.42),
+            intensity: random(-0.95, 0.95)
+          });
+        }
+      }
+
+      // Recompute per-particle influence and the drop-level fieldRect from
+      // current particle positions and current/visible radii.
+      updateGeometry() {
+        const cellSize = quality.cellSize;
+        let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+        const totalWarp = DOMAIN_WARP_PX + TENDRIL_WARP_PX;
+        for (const p of this.particles) {
+          const inflR = Math.max(8, p.radius * FIELD_INFLUENCE_FACTOR + 10) + totalWarp;
+          p.influenceRadius = inflR;
+          p.influence2 = inflR * inflR;
+          p.radius2 = p.radius * p.radius;
+          x0 = Math.min(x0, p.x - inflR);
+          y0 = Math.min(y0, p.y - inflR);
+          x1 = Math.max(x1, p.x + inflR);
+          y1 = Math.max(y1, p.y + inflR);
+        }
+        if (x0 === Infinity) {
+          this.pixelBounds = null;
+          this.fieldRect = null;
+          return;
+        }
+        this.pixelBounds = { x0, y0, x1, y1 };
+        this.fieldRect = clampRect({
+          x0: Math.floor(x0 / cellSize) - 1,
+          y0: Math.floor(y0 / cellSize) - 1,
+          x1: Math.ceil(x1 / cellSize) + 1,
+          y1: Math.ceil(y1 / cellSize) + 1
+        });
+      }
+
+      containsPoint(x, y) {
+        const b = this.pixelBounds;
+        return !!b && x >= b.x0 && x <= b.x1 && y >= b.y0 && y <= b.y1;
+      }
+
+      // Sum metaball field over this drop's particles, with anisotropic +
+      // tendril domain warp on the input sample. Cull per-particle by
+      // influence² so we touch only what actually contributes.
+      fieldAt(x, y) {
+        const rx = x - this.center.x;
+        const ry = y - this.center.y;
+        const r = Math.sqrt(rx * rx + ry * ry) + 0.001;
+        const urx = rx / r;
+        const ury = ry / r;
+        const wx = noise(x * 0.011 + this.seed * 0.001, y * 0.011 + 13.7) - 0.5;
+        const wy = noise(x * 0.011 + this.seed * 0.001 + 31.7, y * 0.011 - 5.1) - 0.5;
+        const wRadial = wx * urx + wy * ury;
+        const wTan = wx * (-ury) + wy * urx;
+        const wxAnis = (RADIAL_WARP_BOOST * wRadial * urx) + (TANGENTIAL_WARP_DAMP * wTan * (-ury));
+        const wyAnis = (RADIAL_WARP_BOOST * wRadial * ury) + (TANGENTIAL_WARP_DAMP * wTan * urx);
+        const tendX = noise(x * 0.0042 + this.seed * 0.0007, y * 0.0042 + 7.7) - 0.5;
+        const tendY = noise(x * 0.0042 - this.seed * 0.0007, y * 0.0042 + 11.3) - 0.5;
+        const sx = x + wxAnis * (DOMAIN_WARP_PX * 2) + tendX * (TENDRIL_WARP_PX * 2);
+        const sy = y + wyAnis * (DOMAIN_WARP_PX * 2) + tendY * (TENDRIL_WARP_PX * 2);
+
+        let sum = 0;
+        for (const p of this.particles) {
+          const ddx = sx - p.x;
+          const ddy = sy - p.y;
+          if (ddx * ddx + ddy * ddy > p.influence2) continue;
+          // Per-particle minor warp for sub-blob asymmetry.
+          const warp = (stableNoise(Math.floor(sx * 0.025), Math.floor(sy * 0.025), this.seed + p.phase) - 0.5) * p.radius * 0.10;
+          const dx = ddx + p.phaseCos * warp;
+          const dy = ddy + p.phaseSin * warp;
+          const d2 = dx * dx + dy * dy + 18;
+          sum += p.radius2 / d2;
+        }
+        return sum;
+      }
+
+      innerFieldAt(x, y) {
+        let sum = 0;
+        for (const il of this.innerLobes) {
+          const dx = x - (this.center.x + il.dx);
+          const dy = y - (this.center.y + il.dy);
+          const d2 = dx * dx + dy * dy;
+          const cutoff = il.radius * il.radius * 9;
+          if (d2 > cutoff) continue;
+          const f = (il.radius * il.radius) / (d2 + 4);
+          sum += f * il.intensity;
+        }
+        return sum;
+      }
+    }
+
+    // ---- Particle simulation -----------------------------------------------
+
+    function updateParticleSimulation() {
+      // Particle radius growth (animate from initial 2 px → targetRadius).
+      let anyGrowing = false;
+      for (const p of particles) {
+        if (p.radius < p.targetRadius - 0.05) {
+          p.radius = lerp(p.radius, p.targetRadius, 0.045 * p.growthVariation);
+          anyGrowing = true;
+        }
+      }
+
+      // Build optional grid for separation force (only if any particles are
+      // young enough to warrant it).
+      let useGrid = false;
+      for (const p of particles) {
+        if (p.age < SEPARATION_AGE_LIMIT) { useGrid = true; break; }
+      }
+      const grid = useGrid ? buildSpatialGrid() : null;
+
+      const pressureActive = impulses.length > 0 || previewImpulse !== null;
+      let maxSpeed = 0;
+      for (const p of particles) {
+        const beforeX = p.x, beforeY = p.y;
+        p.age++;
+        // Live impulses (committed presses).
+        applyImpulseForces(p, impulses);
+        // Preview impulse during a hold.
+        if (previewImpulse) applyImpulseForces(p, [previewImpulse]);
+        // Mild separation while young.
+        if (grid && p.age < SEPARATION_AGE_LIMIT) applySeparationForce(p, grid);
+        // Subtle wet-curl while young or while pressure is live.
+        if (p.age < CURL_AGE_LIMIT || pressureActive) applyCurl(p);
+        // Damping → freeze.
+        p.vx *= PARTICLE_DAMPING;
+        p.vy *= PARTICLE_DAMPING;
+        const sp = Math.sqrt(p.vx * p.vx + p.vy * p.vy);
+        if (sp < FREEZE_SPEED) {
+          p.vx = 0;
+          p.vy = 0;
+        }
+        p.x += p.vx;
+        p.y += p.vy;
+        constrainParticleToCanvas(p);
+        const moved = Math.abs(p.x - beforeX) + Math.abs(p.y - beforeY);
+        const finalSp = Math.sqrt(p.vx * p.vx + p.vy * p.vy);
+        if (!pressureActive && finalSp < SETTLE_SPEED) {
+          p.quietFrames++;
+          if (p.quietFrames > 14) p.state = 'cooling';
+        } else {
+          p.quietFrames = 0;
+        }
+        if (moved > 0.05) maxSpeed = Math.max(maxSpeed, finalSp);
+      }
+
+      // Decay impulses.
+      for (let i = impulses.length - 1; i >= 0; i--) {
+        impulses[i].life--;
+        if (impulses[i].life <= 0) impulses.splice(i, 1);
+      }
+
+      // Settle detection: no live activity for long enough → mark settled.
+      if (!activePress && impulses.length === 0 && previewImpulse === null && maxSpeed < SETTLE_SPEED && !anyGrowing) {
+        quietFrames++;
+      } else {
+        quietFrames = 0;
+      }
+
+      // Recompute per-drop bounds since particles moved.
+      let geometryDirty = false;
+      for (const drop of drops) {
+        const prevRect = drop.fieldRect;
+        drop.updateGeometry();
+        if (!rectsEqual(prevRect, drop.fieldRect)) {
+          if (prevRect) markDirtyRect(prevRect);
+          if (drop.fieldRect) markDirtyRect(drop.fieldRect);
+          geometryDirty = true;
+        } else if (maxSpeed > FREEZE_SPEED) {
+          // Particles moved within the same rect; still need re-render.
+          if (drop.fieldRect) markDirtyRect(drop.fieldRect);
+          geometryDirty = true;
+        }
+      }
+      if (geometryDirty) dirty = true;
+      const stillMoving = impulses.length > 0 || previewImpulse !== null ||
+                          maxSpeed > FREEZE_SPEED || anyGrowing;
+      return stillMoving;
+    }
+
+    function applyImpulseForces(p, list) {
+      for (const imp of list) {
+        const dx = p.x - imp.x;
+        const dy = p.y - imp.y;
+        const d2 = dx * dx + dy * dy;
+        const r2 = imp.radius * imp.radius;
+        if (d2 > r2 || d2 < 0.001) continue;
+        const d = Math.sqrt(d2);
+        const falloff = Math.pow(1 - d / imp.radius, 2.1);
+        const ageFade = imp.life / imp.maxLife;
+        const push = imp.strength * falloff * ageFade;
+        p.vx += (dx / d) * push;
+        p.vy += (dy / d) * push;
+      }
+    }
+
+    function applySeparationForce(p, grid) {
+      const cs = 32; // grid cell size
+      const cx = Math.floor(p.x / cs);
+      const cy = Math.floor(p.y / cs);
+      let fx = 0, fy = 0;
+      for (let oy = -1; oy <= 1; oy++) {
+        for (let ox = -1; ox <= 1; ox++) {
+          const key = (cx + ox) + ',' + (cy + oy);
+          const cell = grid.get(key);
+          if (!cell) continue;
+          for (const q of cell) {
+            if (q === p) continue;
+            const dx = p.x - q.x;
+            const dy = p.y - q.y;
+            const d2 = dx * dx + dy * dy;
+            const minR = (p.radius + q.radius) * 0.55;
+            if (d2 > minR * minR || d2 < 0.0001) continue;
+            const d = Math.sqrt(d2);
+            const overlap = (minR - d) / minR;
+            const k = 0.18 * overlap * overlap;
+            fx += (dx / d) * k;
+            fy += (dy / d) * k;
+          }
+        }
+      }
+      p.vx += fx;
+      p.vy += fy;
+    }
+
+    function buildSpatialGrid() {
+      const cs = 32;
+      const grid = new Map();
+      for (const p of particles) {
+        const cx = Math.floor(p.x / cs);
+        const cy = Math.floor(p.y / cs);
+        const key = cx + ',' + cy;
+        let arr = grid.get(key);
+        if (!arr) { arr = []; grid.set(key, arr); }
+        arr.push(p);
+      }
+      return grid;
+    }
+
+    function applyCurl(p) {
+      const t = millis() * 0.001;
+      const n1 = noise(p.x * 0.0045, p.y * 0.0045, t * 0.4);
+      const n2 = noise(p.x * 0.0045 + 80, p.y * 0.0045 - 30, t * 0.4);
+      const angle = (n1 - n2) * TWO_PI * 1.6;
+      // Curl strength fades as the particle ages (so settled particles stay still).
+      const fade = Math.max(0, 1 - p.age / (CURL_AGE_LIMIT * 1.6));
+      p.vx += Math.cos(angle) * CURL_STRENGTH * fade;
+      p.vy += Math.sin(angle) * CURL_STRENGTH * fade;
+    }
+
+    function constrainParticleToCanvas(p) {
+      const pad = 6;
+      if (p.x < pad) { p.x = pad; if (p.vx < 0) p.vx = -p.vx * 0.45; }
+      if (p.x > width - pad) { p.x = width - pad; if (p.vx > 0) p.vx = -p.vx * 0.45; }
+      if (p.y < pad) { p.y = pad; if (p.vy < 0) p.vy = -p.vy * 0.45; }
+      if (p.y > height - pad) { p.y = height - pad; if (p.vy > 0) p.vy = -p.vy * 0.45; }
+    }
+
+    // ---- Drop lifecycle -----------------------------------------------------
+
+    function spawnDropAt(x, y, holdMs, pigment) {
+      const mass = holdToMass(holdMs);
+      const t = holdToUnit(holdMs);
+      const lobeCount = Math.floor(lerp(3, 9, t));
+      const seed = random(1000000);
+      const id = nextDropId++;
+      // Cap drops: evict oldest drop's particles.
+      while (drops.length >= MAX_DROPS) {
+        const oldest = drops.shift();
+        // Remove its particles from the flat list.
+        for (let i = particles.length - 1; i >= 0; i--) {
+          if (particles[i].dropId === oldest.id) particles.splice(i, 1);
+        }
+        if (oldest.fieldRect) markDirtyRect(oldest.fieldRect);
+      }
+
+      const drop = new Drop(id, x, y, mass, lobeCount, pigment, seed);
+      // D1 — incompressible-shell push baked into existing particles' velocity.
+      // Plus impulse for ongoing decay-pushing.
+      applyOneShotDisplacement(drop);
+      spawnSatellites(drop);
+      drops.push(drop);
+
+      // Live impulse — pushes existing particles for IMPULSE_LIFE frames.
+      const Rnew = Math.sqrt(mass / Math.PI);
+      impulses.push({
+        x, y,
+        radius: Rnew * IMPULSE_RADIUS_FACTOR,
+        strength: Rnew * IMPULSE_STRENGTH_FACTOR,
+        life: IMPULSE_LIFE,
+        maxLife: IMPULSE_LIFE
+      });
+
+      if (lastPreviewRect) markDirtyRect(lastPreviewRect);
+      if (drop.fieldRect) markDirtyRect(drop.fieldRect);
+      lastPreviewRect = null;
+      settled = false;
+      dirty = true;
+    }
+
+    // One-shot displacement: same incompressible-shell formula as refined
+    // metaball D1, but applied as an *instant* velocity impulse on each
+    // existing particle. The live impulse above adds a decaying force on top.
+    function applyOneShotDisplacement(newDrop) {
+      const cx = newDrop.center.x;
+      const cy = newDrop.center.y;
+      const Rnew = Math.sqrt(newDrop.targetMass / Math.PI);
+      const R2 = Rnew * Rnew;
+      for (const p of particles) {
+        if (p.dropId === newDrop.id) continue;
+        const dx = p.x - cx;
+        const dy = p.y - cy;
+        const d = Math.sqrt(dx * dx + dy * dy);
+        if (d < 0.5) continue;
+        const safeR = Math.max(d, Rnew * 0.5);
+        let push = R2 / (2 * safeR);
+        if (d < Rnew) push += (Rnew - d) * 0.55;
+        const cap = 8;                     // velocity cap (px/frame)
+        if (push > cap) push = cap;
+        if (push < 0.05) continue;
+        const ux = dx / d;
+        const uy = dy / d;
+        p.vx += ux * push;
+        p.vy += uy * push;
+        // Wake the particle so it integrates physics again.
+        p.state = 'active';
+        p.quietFrames = 0;
+        p.age = Math.min(p.age, SEPARATION_AGE_LIMIT - 1);
+      }
+    }
+
+    // D4 — satellites at contact zones. For each existing drop's particle
+    // that's within SATELLITE_PROXIMITY_FACTOR × Rnew, eject a small fleck
+    // particle of that drop's color outside the new drop's footprint.
+    function spawnSatellites(newDrop) {
+      const cx = newDrop.center.x;
+      const cy = newDrop.center.y;
+      const Rnew = Math.sqrt(newDrop.targetMass / Math.PI);
+      for (const drop of drops) {
+        if (drop === newDrop) continue;
+        let perEvent = 0;
+        const room = MAX_SATELLITES_PER_DROP - drop.satelliteCount;
+        if (room <= 0) continue;
+        for (const p of drop.particles) {
+          if (p.isSatellite) continue;
+          const dx = p.x - cx;
+          const dy = p.y - cy;
+          const d = Math.sqrt(dx * dx + dy * dy);
+          if (d > Rnew * SATELLITE_PROXIMITY_FACTOR || d < 0.5) continue;
+          if (perEvent >= SATELLITES_PER_EVENT || perEvent >= room) break;
+          const ux = dx / d;
+          const uy = dy / d;
+          const ejectDist = Rnew + p.radius * 0.55 + random(8, 26);
+          const sx = cx + ux * ejectDist;
+          const sy = cy + uy * ejectDist;
+          const sRadius = Math.max(4, p.radius * random(0.18, 0.34));
+          const sat = {
+            x: sx,
+            y: sy,
+            vx: ux * random(0.5, 1.6),
+            vy: uy * random(0.5, 1.6),
+            mass: 50,
+            radius: sRadius,
+            targetRadius: sRadius,
+            radius2: sRadius * sRadius,
+            growthVariation: 1.6,
+            phase: random(1000),
+            phaseCos: 0,
+            phaseSin: 0,
+            age: 0,
+            quietFrames: 0,
+            state: 'active',
+            isSatellite: true,
+            dropId: drop.id,
+            influenceRadius: 0,
+            influence2: 0
+          };
+          sat.phaseCos = Math.cos(sat.phase);
+          sat.phaseSin = Math.sin(sat.phase);
+          drop.particles.push(sat);
+          particles.push(sat);
+          drop.satelliteCount++;
+          perEvent++;
+        }
+        if (perEvent > 0) drop.updateGeometry();
+      }
+    }
+
+    // ---- Press & preview impulse -------------------------------------------
+
+    function startPress(x, y) {
+      const corner = handleCornerActionStart(x, y);
+      if (corner) return;
+      activePress = {
+        x: constrain(x, 0, width),
+        y: constrain(y, 0, height),
+        startedAt: millis(),
+        pigment: choosePigment()
+      };
+      lastPreviewRect = null;
+      markActivePreviewDirty();
+    }
+
+    function endPress() {
+      if (!activePress) return;
+      const held = millis() - activePress.startedAt;
+      previewImpulse = null;
+      spawnDropAt(activePress.x, activePress.y, held, activePress.pigment);
+      activePress = null;
+    }
+
+    // Each frame the press is held: rebuild a preview impulse so existing
+    // particles are visibly being pushed by the would-be drop. This is the
+    // physics-simulation analogue of refined metaball's preview displacement.
+    function markActivePreviewDirty() {
+      if (!activePress) {
+        previewImpulse = null;
+        lastPreviewRect = null;
+        return;
+      }
+      const held = millis() - activePress.startedAt;
+      const mass = holdToMass(held);
+      const Rnew = Math.sqrt(mass / Math.PI);
+      previewImpulse = {
+        x: activePress.x,
+        y: activePress.y,
+        radius: Rnew * IMPULSE_RADIUS_FACTOR,
+        // Preview impulse is *replenished* every frame (life set high so the
+        // ageFade in applyImpulseForces stays at ~1). Smaller per-frame strength
+        // so we don't accelerate runaway over time.
+        strength: Rnew * IMPULSE_STRENGTH_FACTOR * 0.45,
+        life: IMPULSE_LIFE,
+        maxLife: IMPULSE_LIFE
+      };
+      // Mark the preview footprint dirty so the press-preview ring renders
+      // each frame even on otherwise-static cells.
+      const cs = quality.cellSize;
+      const previewRect = clampRect({
+        x0: Math.floor((activePress.x - Rnew * IMPULSE_RADIUS_FACTOR) / cs) - 1,
+        y0: Math.floor((activePress.y - Rnew * IMPULSE_RADIUS_FACTOR) / cs) - 1,
+        x1: Math.ceil((activePress.x + Rnew * IMPULSE_RADIUS_FACTOR) / cs) + 1,
+        y1: Math.ceil((activePress.y + Rnew * IMPULSE_RADIUS_FACTOR) / cs) + 1
+      });
+      if (lastPreviewRect) markDirtyRect(lastPreviewRect);
+      if (previewRect) markDirtyRect(previewRect);
+      lastPreviewRect = previewRect;
+      dirty = true;
+    }
+
+    function renderPressPreview() {
+      if (!activePress) return;
+      const palette = PALETTES[paletteIndex];
+      const held = millis() - activePress.startedAt;
+      const t = holdToUnit(held);
+      noFill();
+      stroke(35, 25, 18, 34 + 28 * t);
+      strokeWeight(1);
+      const r = Math.sqrt(holdToMass(held) / Math.PI) * 1.15;
+      circle(activePress.x, activePress.y, r * 2);
+      stroke(255, 250, 238, 60);
+      circle(activePress.x, activePress.y, Math.max(8, r * 0.6));
+    }
+
+    // ---- Adaptive quality + dirty rects (lifted from refined metaball) -----
+
+    function chooseInitialQuality() {
+      const cellsAtHigh = Math.ceil(windowWidth / QUALITY_TIERS[0].cellSize) * Math.ceil(windowHeight / QUALITY_TIERS[0].cellSize);
+      const mobile = window.matchMedia && window.matchMedia('(pointer: coarse)').matches;
+      qualityIndex = mobile || cellsAtHigh > 90000 ? 1 : 0;
+      quality = QUALITY_TIERS[qualityIndex];
+    }
+
+    function adaptQuality(interacting) {
+      if (fullFieldDirty && dirtyRects.length === 0) return;
+      const crowded = drops.length > 14 || particles.length > 140;
+      const slow = lastRenderMs > quality.slowMs || (interacting && crowded && qualityIndex === 0);
+      const fast = settled && lastRenderMs > 0 && lastRenderMs < quality.fastMs && drops.length < 12;
+      slowFrameStreak = slow ? slowFrameStreak + 1 : 0;
+      fastFrameStreak = fast ? fastFrameStreak + 1 : 0;
+      if (slowFrameStreak >= 3 && qualityIndex < QUALITY_TIERS.length - 1) {
+        setQuality(qualityIndex + 1);
+        slowFrameStreak = 0;
+        fastFrameStreak = 0;
+      } else if (fastFrameStreak >= 90 && qualityIndex > 0) {
+        setQuality(qualityIndex - 1);
+        slowFrameStreak = 0;
+        fastFrameStreak = 0;
+      }
+    }
+
+    function setQuality(nextIndex) {
+      if (nextIndex === qualityIndex) return;
+      qualityIndex = nextIndex;
+      quality = QUALITY_TIERS[qualityIndex];
+      fieldCols = Math.ceil(width / quality.cellSize);
+      fieldRows = Math.ceil(height / quality.cellSize);
+      field = new Array(fieldCols * fieldRows);
+      for (const drop of drops) drop.updateGeometry();
+      lastPreviewRect = null;
+      markFullFieldDirty();
+    }
+
+    function markFullFieldDirty() {
+      fullFieldDirty = true;
+      dirtyRects = [];
+      dirty = true;
+    }
+
+    function markDirtyRect(rect) {
+      if (!rect || fullFieldDirty) {
+        dirty = true;
+        return;
+      }
+      const clamped = clampRect(expandRect(rect, DIRTY_PADDING_CELLS));
+      if (!clamped) return;
+      dirtyRects.push(clamped);
+      dirty = true;
+    }
+
+    function consumeDirtyRects() {
+      if (fullFieldDirty || dirtyRects.length === 0) {
+        fullFieldDirty = false;
+        dirtyRects = [];
+        return [{ x0: 0, y0: 0, x1: fieldCols, y1: fieldRows }];
+      }
+      const rect = dirtyRects.reduce((merged, next) => unionRects(merged, next));
+      dirtyRects = [];
+      const coverage = rectArea(rect) / Math.max(1, fieldCols * fieldRows);
+      if (coverage > FULL_REDRAW_COVERAGE) {
+        return [{ x0: 0, y0: 0, x1: fieldCols, y1: fieldRows }];
+      }
+      return [rect];
+    }
+
+    function clearPigmentRects(rects) {
+      const cellSize = quality.cellSize;
+      for (const rect of rects) {
+        const px = rect.x0 * cellSize;
+        const py = rect.y0 * cellSize;
+        const pw = (rect.x1 - rect.x0) * cellSize + cellSize;
+        const ph = (rect.y1 - rect.y0) * cellSize + cellSize;
+        pigmentLayer.drawingContext.clearRect(px, py, pw, ph);
+      }
+    }
+
+    function unionRects(a, b) {
+      return {
+        x0: Math.min(a.x0, b.x0),
+        y0: Math.min(a.y0, b.y0),
+        x1: Math.max(a.x1, b.x1),
+        y1: Math.max(a.y1, b.y1)
+      };
+    }
+    function expandRect(rect, cells) {
+      return { x0: rect.x0 - cells, y0: rect.y0 - cells, x1: rect.x1 + cells, y1: rect.y1 + cells };
+    }
+    function clampRect(rect) {
+      const c = {
+        x0: constrain(Math.floor(rect.x0), 0, fieldCols),
+        y0: constrain(Math.floor(rect.y0), 0, fieldRows),
+        x1: constrain(Math.ceil(rect.x1), 0, fieldCols),
+        y1: constrain(Math.ceil(rect.y1), 0, fieldRows)
+      };
+      if (c.x1 <= c.x0 || c.y1 <= c.y0) return null;
+      return c;
+    }
+    function rectsOverlap(a, b) {
+      return a.x0 < b.x1 && a.x1 > b.x0 && a.y0 < b.y1 && a.y1 > b.y0;
+    }
+    function rectArea(r) {
+      return Math.max(0, r.x1 - r.x0) * Math.max(0, r.y1 - r.y0);
+    }
+    function rectsEqual(a, b) {
+      if (!a && !b) return true;
+      if (!a || !b) return false;
+      return a.x0 === b.x0 && a.y0 === b.y0 && a.x1 === b.x1 && a.y1 === b.y1;
+    }
+
+    // ---- Misc utilities ----------------------------------------------------
+
+    function parseHexRgb(hex) {
+      const raw = hex.replace('#', '');
+      return {
+        r: parseInt(raw.slice(0, 2), 16),
+        g: parseInt(raw.slice(2, 4), 16),
+        b: parseInt(raw.slice(4, 6), 16)
+      };
+    }
+    function mixRgb(a, b, t) {
+      return {
+        r: a.r + (b.r - a.r) * t,
+        g: a.g + (b.g - a.g) * t,
+        b: a.b + (b.b - a.b) * t
+      };
+    }
+    function clampByte(v) {
+      return v < 0 ? 0 : v > 255 ? 255 : v | 0;
+    }
+    function smoothstep(edge0, edge1, x) {
+      const t = (edge1 === edge0) ? 0 : (x - edge0) / (edge1 - edge0);
+      const ct = t < 0 ? 0 : t > 1 ? 1 : t;
+      return ct * ct * (3 - 2 * ct);
+    }
+    function stableNoise(x, y, seed) {
+      return noise(x * 0.13 + seed * 0.0007, y * 0.13 - seed * 0.0003);
+    }
+
+    function holdToUnit(ms) {
+      const c = constrain(ms, MIN_HOLD_MS, MAX_HOLD_MS);
+      const t = (c - MIN_HOLD_MS) / (MAX_HOLD_MS - MIN_HOLD_MS);
+      return t * t * (3 - 2 * t);
+    }
+    function holdToMass(ms) {
+      const minArea = 1600;
+      const maxArea = Math.min(width * height * 0.105, 36000);
+      return lerp(minArea, maxArea, holdToUnit(ms));
+    }
+    function choosePigment() {
+      const palette = PALETTES[paletteIndex];
+      const pigment = palette.pigments[pigmentIndex % palette.pigments.length];
+      pigmentIndex++;
+      return pigment;
+    }
+
+    // ---- Corner actions, palette, reset ------------------------------------
+
+    function handleCornerActionStart(x, y) {
+      if (isTopLeftAction(x, y)) { nextPalette(); return true; }
+      if (isTopRightAction(x, y)) { startResetHold(x, y); return true; }
+      return false;
+    }
+    function isTopLeftAction(x, y) {
+      return x < CORNER_ACTION_SIZE && y < CORNER_ACTION_SIZE;
+    }
+    function isTopRightAction(x, y) {
+      return x > width - CORNER_ACTION_SIZE && y < CORNER_ACTION_SIZE;
+    }
+    function startResetHold(x, y) {
+      cancelResetHold();
+      pendingReset = {
+        x, y, completed: false,
+        timer: window.setTimeout(() => {
+          if (!pendingReset) return;
+          pendingReset.completed = true;
+          resetAll();
+        }, RESET_HOLD_MS)
+      };
+      dirty = true;
+    }
+    function cancelResetHold() {
+      if (!pendingReset) return;
+      window.clearTimeout(pendingReset.timer);
+      pendingReset = null;
+      dirty = true;
+    }
+    function finishCornerActionHold() {
+      if (pendingReset && !pendingReset.completed) { cancelResetHold(); return true; }
+      if (pendingReset && pendingReset.completed) { pendingReset = null; return true; }
+      return false;
+    }
+    function nextPalette() {
+      paletteIndex = (paletteIndex + 1) % PALETTES.length;
+      pigmentIndex = 0;
+      renderPaper();
+      updateHint();
+      markFullFieldDirty();
+    }
+    function resetAll() {
+      if (pendingReset) {
+        window.clearTimeout(pendingReset.timer);
+        pendingReset = null;
+      }
+      drops = [];
+      particles = [];
+      impulses = [];
+      previewImpulse = null;
+      activePress = null;
+      lastPreviewRect = null;
+      pigmentLayer.clear();
+      renderPaper();
+      markFullFieldDirty();
+      settled = true;
+      quietFrames = 0;
+    }
+    function updateHint() {
+      const el = document.getElementById('hint');
+      el.textContent = `hold to drop · P palette · R reset · ${PALETTES[paletteIndex].name}`;
+    }
+
+    // ---- Input glue --------------------------------------------------------
+
+    function keyPressed() {
+      if (key === 'p' || key === 'P') nextPalette();
+      if (key === 'r' || key === 'R' || keyCode === ESCAPE) resetAll();
+    }
+    function touchStarted() { return false; }
+    function touchMoved() { return false; }
+    function touchEnded() { return false; }
+    function mousePressed() {
+      if (touches && touches.length) return false;
+      startPress(mouseX, mouseY);
+      return false;
+    }
+    function mouseReleased() {
+      if (touches && touches.length) return false;
+      if (finishCornerActionHold()) return false;
+      endPress();
+      return false;
+    }
+    function mouseDragged() {
+      // No drag mode in synthesis — hold anchors the press position.
+      return false;
+    }
+    function windowResized() {
+      resizeCanvas(windowWidth, windowHeight);
+      chooseInitialQuality();
+      rebuildSurfaces();
+    }
+
+    document.addEventListener('gesturestart', e => e.preventDefault());
+    document.addEventListener('touchmove', e => e.preventDefault(), { passive: false });
+  </script>
+</body>
+</html>

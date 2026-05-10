@@ -106,6 +106,20 @@
     const RADIAL_WARP_BOOST = 1.85;
     const TANGENTIAL_WARP_DAMP = 0.45;
     const TENDRIL_WARP_PX = 9;
+    // D4 — satellite spawning at contact zones. When a new pool engulfs or
+    // closely overlaps an existing pool's lobe, eject a small "fleck" of the
+    // existing pool's pigment outside the new pool's radius. Kept
+    // conservative so the field doesn't drown in tiny lobes after a long
+    // session.
+    const SATELLITES_PER_EVENT = 2;
+    const MAX_SATELLITES_PER_POOL = 8;
+    const SATELLITE_PROXIMITY_FACTOR = 1.35; // d < Rnew * this triggers eject
+    // Mid-press preview displacement: while a hold is active, existing
+    // pools' lobes animate toward where they'd land if released now. The
+    // user sees how big the drop will be by how much it deforms neighbours.
+    // Set just under 1.0 so commit feels like a small settling push, not a
+    // jolt back from preview to committed state.
+    const PREVIEW_DISPLACEMENT_FACTOR = 0.78;
     const FULL_REDRAW_COVERAGE = 0.52;
     const MAX_HOLD_MS = 2100;
     const MIN_HOLD_MS = 80;
@@ -539,6 +553,10 @@
         lastPreviewRect = null;
         return;
       }
+      // Drive mid-press preview displacement on every frame the press is
+      // active. Cheap (per-pool, per-lobe) and keeps the lerp targets
+      // current as the user holds longer.
+      applyPreviewDisplacement();
       const preview = previewPoolFromPress(activePress);
       if (lastPreviewRect) markDirtyRect(lastPreviewRect);
       markDirtyRect(preview.fieldRect);
@@ -629,6 +647,10 @@
       if (!activePress) return;
       const held = millis() - activePress.startedAt;
       const pool = createPool(activePress.x, activePress.y, held, activePress.color, activePress.seed, false);
+      // Clear preview push first so applyDisplacement adds onto a clean
+      // committed target. Otherwise the preview push would get baked in
+      // *and* applyDisplacement would re-add it.
+      clearPreviewDisplacement();
       // D1 — push surrounding pools out of the way before adding the new one
       // to the list, so applyDisplacement only walks pre-existing pools.
       applyDisplacement(pool);
@@ -645,6 +667,11 @@
     // capped to DISPLACEMENT_MAX_PX. Lobes that fall *inside* the new pool's
     // radius get an extra eject (DISPLACEMENT_INSIDE_BOOST × penetration) so
     // they aren't rendered underneath the new pigment.
+    //
+    // D4 — also detects engulf/contact events and spawns a small number of
+    // satellite "fleck" lobes for the existing pool just outside the new
+    // pool's radius, in the eject direction. This is how real marbling
+    // shows pigment squeezed sideways when a new drop lands on it.
     function applyDisplacement(newPool) {
       const cx = newPool.center.x;
       const cy = newPool.center.y;
@@ -653,14 +680,23 @@
       for (const pool of pools) {
         if (pool.preview) continue;
         let touched = false;
+        let satellitesSpawnedThisEvent = 0;
+        const pendingSatellites = [];
+        // Satellite cap math: only count non-satellite lobes when computing
+        // remaining headroom, so satellites don't crowd out their own slot.
+        const existingSatelliteCount = pool.lobes.reduce(
+          (n, l) => n + (l.isSatellite ? 1 : 0), 0);
+        const satelliteRoom = Math.max(0,
+          MAX_SATELLITES_PER_POOL - existingSatelliteCount);
+
         for (const lobe of pool.lobes) {
-          // Lobe's current screen position, including any prior displacement.
+          if (lobe.isSatellite) continue; // don't push satellites recursively
           const lx = pool.center.x + Math.cos(lobe.angle) * lobe.offsetNow + lobe.displaceX;
           const ly = pool.center.y + Math.sin(lobe.angle) * lobe.offsetNow + lobe.displaceY;
           const dx = lx - cx;
           const dy = ly - cy;
           const d = Math.sqrt(dx * dx + dy * dy);
-          if (d < 0.5) continue; // exactly on top of the new pool — leave alone
+          if (d < 0.5) continue;
           const safeR = Math.max(d, Rnew * 0.5);
           let push = R2 / (2 * safeR);
           if (d < Rnew) push += (Rnew - d) * DISPLACEMENT_INSIDE_BOOST;
@@ -671,10 +707,116 @@
           lobe.displaceTargetX += ux * push;
           lobe.displaceTargetY += uy * push;
           touched = true;
+
+          // D4 — satellite eject for lobes near or inside the new pool.
+          // Stop adding once we've hit per-event or per-pool caps.
+          if (satellitesSpawnedThisEvent < SATELLITES_PER_EVENT &&
+              satellitesSpawnedThisEvent < satelliteRoom &&
+              d < Rnew * SATELLITE_PROXIMITY_FACTOR) {
+            const ejectDist = Rnew + lobe.radius * 0.55 + random(8, 26);
+            const ejectX = cx + ux * ejectDist;
+            const ejectY = cy + uy * ejectDist;
+            const sxRel = ejectX - pool.center.x;
+            const syRel = ejectY - pool.center.y;
+            const sAngle = Math.atan2(syRel, sxRel);
+            const sOffset = Math.sqrt(sxRel * sxRel + syRel * syRel);
+            const sRadius = Math.max(4, lobe.radius * random(0.18, 0.34));
+            pendingSatellites.push({
+              angle: sAngle,
+              offsetTarget: sOffset,
+              offsetNow: sOffset,             // appears instantly
+              radius: sRadius,
+              targetRadius: sRadius,
+              growthVariation: 1.6,           // fast settle if anything bumps it
+              phase: random(1000),
+              displaceX: 0,
+              displaceY: 0,
+              displaceTargetX: 0,
+              displaceTargetY: 0,
+              previewPushX: 0,
+              previewPushY: 0,
+              isSatellite: true
+            });
+            satellitesSpawnedThisEvent++;
+          }
+        }
+        if (pendingSatellites.length) {
+          pool.lobes.push(...pendingSatellites);
+          touched = true;
         }
         if (touched) {
-          // Wake the pool's update loop. settled flips back to true once the
-          // displacement lerp catches up to the new target.
+          pool.settled = false;
+          pool.updateGeometry();
+          markDirtyRect(pool.fieldRect);
+        }
+      }
+    }
+
+    // Mid-press preview displacement. While a hold is active, compute the
+    // push that *would* be applied if the user released right now, and write
+    // it into each lobe's previewPushX/Y. The lerp in pool.update() uses
+    // (displaceTarget + previewPush) as its target, so preview shows up live.
+    // Called from markActivePreviewDirty each frame during a press.
+    function applyPreviewDisplacement() {
+      if (!activePress) return;
+      const held = millis() - activePress.startedAt;
+      const massPreview = holdToMass(held);
+      const Rnew = Math.sqrt(massPreview / Math.PI);
+      const R2 = Rnew * Rnew;
+      const cx = activePress.x;
+      const cy = activePress.y;
+      for (const pool of pools) {
+        if (pool.preview) continue;
+        let touched = false;
+        for (const lobe of pool.lobes) {
+          if (lobe.isSatellite) continue;
+          // Compute against the committed-target screen position so the
+          // preview math is stable while the lerp is mid-flight.
+          const lx = pool.center.x + Math.cos(lobe.angle) * lobe.offsetNow + lobe.displaceTargetX;
+          const ly = pool.center.y + Math.sin(lobe.angle) * lobe.offsetNow + lobe.displaceTargetY;
+          const dx = lx - cx;
+          const dy = ly - cy;
+          const d = Math.sqrt(dx * dx + dy * dy);
+          if (d < 0.5) {
+            lobe.previewPushX = 0;
+            lobe.previewPushY = 0;
+            continue;
+          }
+          const safeR = Math.max(d, Rnew * 0.5);
+          let push = R2 / (2 * safeR);
+          if (d < Rnew) push += (Rnew - d) * DISPLACEMENT_INSIDE_BOOST;
+          if (push > DISPLACEMENT_MAX_PX) push = DISPLACEMENT_MAX_PX;
+          push *= PREVIEW_DISPLACEMENT_FACTOR;
+          const ux = dx / d;
+          const uy = dy / d;
+          const newPx = ux * push;
+          const newPy = uy * push;
+          if (Math.abs(newPx - lobe.previewPushX) > 0.05 ||
+              Math.abs(newPy - lobe.previewPushY) > 0.05) {
+            lobe.previewPushX = newPx;
+            lobe.previewPushY = newPy;
+            touched = true;
+          }
+        }
+        if (touched) {
+          pool.settled = false;
+          markDirtyRect(pool.fieldRect);
+        }
+      }
+    }
+
+    // Press cancelled: zero out previewPush so the lerp returns to committed.
+    function clearPreviewDisplacement() {
+      for (const pool of pools) {
+        let touched = false;
+        for (const lobe of pool.lobes) {
+          if (lobe.previewPushX !== 0 || lobe.previewPushY !== 0) {
+            lobe.previewPushX = 0;
+            lobe.previewPushY = 0;
+            touched = true;
+          }
+        }
+        if (touched) {
           pool.settled = false;
           markDirtyRect(pool.fieldRect);
         }
@@ -839,12 +981,17 @@
             growthVariation: random(0.72, 1.22),
             phase: random(1000),
             // D1 — displacement state. displaceX/Y is the live position offset
-            // in screen coords; displaceTargetX/Y is what the update loop is
-            // animating toward. New drops add into Target; lerp catches up.
+            // in screen coords; displaceTargetX/Y is the *committed* target.
+            // previewPushX/Y is a transient push from the in-progress press
+            // (added on top of displaceTargetX during the lerp); cleared on
+            // commit (folded into displaceTargetX) or on cancel.
             displaceX: 0,
             displaceY: 0,
             displaceTargetX: 0,
-            displaceTargetY: 0
+            displaceTargetY: 0,
+            previewPushX: 0,
+            previewPushY: 0,
+            isSatellite: false
           });
         }
       }
@@ -877,8 +1024,8 @@
         // the lerp catches up. Compute once whether any lobe still owes a
         // displacement step.
         const hasPendingDisplacement = this.lobes.some(l =>
-          Math.abs(l.displaceTargetX - l.displaceX) > 0.05 ||
-          Math.abs(l.displaceTargetY - l.displaceY) > 0.05
+          Math.abs((l.displaceTargetX + l.previewPushX) - l.displaceX) > 0.05 ||
+          Math.abs((l.displaceTargetY + l.previewPushY) - l.displaceY) > 0.05
         );
         if (this.settled && !hasPendingDisplacement) return false;
 
@@ -902,8 +1049,12 @@
           }
           // D1 — displacement lerp. Always runs (even when growth is done) so
           // a settled pool can still play out a push from a new neighbour.
-          const dxRem = lobe.displaceTargetX - lobe.displaceX;
-          const dyRem = lobe.displaceTargetY - lobe.displaceY;
+          // The lerp target combines the committed displaceTarget with the
+          // (transient) previewPush so the user sees mid-press feedback.
+          const tgtX = lobe.displaceTargetX + lobe.previewPushX;
+          const tgtY = lobe.displaceTargetY + lobe.previewPushY;
+          const dxRem = tgtX - lobe.displaceX;
+          const dyRem = tgtY - lobe.displaceY;
           if (Math.abs(dxRem) > 0.05 || Math.abs(dyRem) > 0.05) {
             lobe.displaceX += dxRem * DISPLACEMENT_RAMP;
             lobe.displaceY += dyRem * DISPLACEMENT_RAMP;

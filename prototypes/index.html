@@ -97,7 +97,28 @@
       All static HTML; nothing under <code>src/</code> is involved.
     </p>
 
-    <h2>Spikes (under evaluation)</h2>
+    <h2>Synthesis</h2>
+    <ul>
+      <li>
+        <a class="row" href="./marbling-fluid-particles/">
+          <span class="name">Fluid particles · SDF + particle displacement + metaballs</span>
+          <span class="tag spike">synthesis</span>
+        </a>
+        <div class="desc">
+          Particle-displacement physics (impulses, separation, wet curl)
+          drives a flat list of independent particles. Each drop&rsquo;s
+          particles sum into a metaball field with anisotropic + tendril
+          domain warp; cells are owned by the strongest-contributing drop,
+          with two-pigment muddy blend at seams and inner sub-metaballs for
+          interior swirls. SDF-style surface treatment painted per cell:
+          fbm paper grain, vein streaks, granulation specks, rim darken,
+          and stain bloom into nearby paper. Mid-press preview impulse so
+          existing pigment visibly reacts while you hold.
+        </div>
+      </li>
+    </ul>
+
+    <h2>Earlier spikes (under evaluation)</h2>
     <ul>
       <li>
         <a class="row" href="./marbling-shader-sdf-spike/">
@@ -133,9 +154,12 @@
           (new drops push existing pools&rsquo; lobes outward,
           asymmetrically — pools stretch),
           <strong>inner sub-metaballs</strong> for fluid interior
-          color swirls (&ldquo;metaball within metaball&rdquo;), and
-          <strong>anisotropic boundary</strong> with tendril noise so
-          edges finger out radially instead of wobbling isotropically.
+          color swirls (&ldquo;metaball within metaball&rdquo;),
+          <strong>anisotropic boundary</strong> with tendril noise,
+          <strong>satellite spawning</strong> at contact zones (older
+          pigment squeezed sideways when a new drop lands on it), and
+          <strong>mid-press preview</strong> displacement so neighbours
+          deform live as you hold.
           Compare back-to-back against the frozen baseline below.
         </div>
       </li>
