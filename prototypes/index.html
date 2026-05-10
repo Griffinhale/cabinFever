@@ -126,10 +126,17 @@
           <span class="tag spike">refine</span>
         </a>
         <div class="desc">
-          Direct pixel writes (replaces per-cell Canvas2D fill — was the
-          dominant cost behind &ldquo;laggy&rdquo;), two-pigment muddy seam
-          blend, single-octave Perlin domain warp on field input. Compare
-          back-to-back against the frozen baseline below.
+          Perf: direct pixel writes (replaces per-cell Canvas2D fill).
+          Visual: two-pigment muddy seam blend; coordinate-space domain
+          warp.
+          Marbling-feel: <strong>volume-conserving displacement</strong>
+          (new drops push existing pools&rsquo; lobes outward,
+          asymmetrically — pools stretch),
+          <strong>inner sub-metaballs</strong> for fluid interior
+          color swirls (&ldquo;metaball within metaball&rdquo;), and
+          <strong>anisotropic boundary</strong> with tendril noise so
+          edges finger out radially instead of wobbling isotropically.
+          Compare back-to-back against the frozen baseline below.
         </div>
       </li>
     </ul>

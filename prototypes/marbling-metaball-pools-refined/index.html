@@ -78,6 +78,34 @@
     // Same idea Spike A applied to the SDF; transplants here unchanged.
     const SEAM_BAND = 0.55;
     const SEAM_BLEND_MAX = 0.42;
+    // D1 — volume-conserving displacement on drop creation. When a new pool
+    // appears, surrounding pools' lobes get pushed outward following an
+    // incompressible-shell formula: a particle at radius r outside the new
+    // pool of radius R ends up at sqrt(r²+R²), so its displacement is
+    // approximately R²/(2r) for r >> R. Capped to DISPLACEMENT_MAX_PX so a
+    // close lobe doesn't get launched off-screen, and only applied if it
+    // exceeds DISPLACEMENT_MIN_PX (cheap noise floor).
+    const DISPLACEMENT_MAX_PX = 92;
+    const DISPLACEMENT_MIN_PX = 0.6;
+    const DISPLACEMENT_RAMP = 0.085;        // per-frame lerp toward target
+    const DISPLACEMENT_INSIDE_BOOST = 0.55; // extra eject if lobe is inside new pool radius
+    // D2 — inner sub-lobes per pool ("metaball within metaball"). Each pool
+    // generates a small set of interior metaballs that contribute to a
+    // secondary field used purely for color modulation: where the inner
+    // field is high, pigment tints toward `wash` (lighter); where low, it
+    // tints toward `rim` (darker). This is what gives each pool internal
+    // fluid swirls instead of a uniform color body.
+    const INNER_LOBE_MIN = 4;
+    const INNER_LOBE_MAX = 8;
+    const INNER_TINT_STRENGTH = 0.34;
+    // D3 — anisotropic boundary noise. Domain warp is decomposed into radial
+    // and tangential components relative to the pool center; radial is
+    // amplified, tangential is dampened. Plus a coarser "tendril noise" that
+    // contributes only at low frequency, creating Saffman-Taylor-style
+    // fingering at the outer edge.
+    const RADIAL_WARP_BOOST = 1.85;
+    const TANGENTIAL_WARP_DAMP = 0.45;
+    const TENDRIL_WARP_PX = 9;
     const FULL_REDRAW_COVERAGE = 0.52;
     const MAX_HOLD_MS = 2100;
     const MIN_HOLD_MS = 80;
@@ -346,6 +374,8 @@
       const x0 = gx * cellSize;
       const y0 = gy * cellSize;
 
+      const cx = gx * cellSize + cellSize * 0.5;
+      const cy = gy * cellSize + cellSize * 0.5;
       const n = stableNoise(gx, gy, pool.seed);
       const edgeT = constrain((cell.strength - FIELD_THRESHOLD) / FIELD_RIM_BAND, 0, 1);
       const alphaBase = 82 + 72 * constrain(edgeT, 0, 1);
@@ -353,6 +383,21 @@
       const washT = constrain((cell.strength - 1.5) / 3.2, 0, 0.48);
       const washed = mixRgb(pool.rgb.base, pool.rgb.wash, washT);
       let c = mixRgb(washed, pool.rgb.rim, rimT);
+
+      // D2 — interior sub-metaball tint. Inner field is positive in
+      // wash-tinted regions, negative in rim-tinted regions. Strength of the
+      // tint scales with distance from the outer edge (low edgeT → deep
+      // interior → tints visible; high edgeT → near boundary → reserve
+      // visual budget for the rim itself).
+      const innerField = pool.innerFieldAt(cx, cy);
+      if (innerField !== 0) {
+        const interiorT = 1 - edgeT;
+        const tintMag = Math.min(1, Math.abs(innerField)) * INNER_TINT_STRENGTH * interiorT;
+        if (tintMag > 0.005) {
+          const tintColor = innerField > 0 ? pool.rgb.wash : pool.rgb.rim;
+          c = mixRgb(c, tintColor, tintMag);
+        }
+      }
 
       // R2 — two-pigment seam blend.
       if (second && cell.margin >= 0) {
@@ -584,11 +629,56 @@
       if (!activePress) return;
       const held = millis() - activePress.startedAt;
       const pool = createPool(activePress.x, activePress.y, held, activePress.color, activePress.seed, false);
+      // D1 — push surrounding pools out of the way before adding the new one
+      // to the list, so applyDisplacement only walks pre-existing pools.
+      applyDisplacement(pool);
       pools.push(pool);
       if (lastPreviewRect) markDirtyRect(lastPreviewRect);
       markDirtyRect(pool.fieldRect);
       lastPreviewRect = null;
       activePress = null;
+    }
+
+    // D1 — incompressible-shell-style displacement of existing pools when a
+    // new pool is created. For each existing lobe at distance r from the new
+    // pool's center, push it outward by approximately R²/(2·max(r, R/2)),
+    // capped to DISPLACEMENT_MAX_PX. Lobes that fall *inside* the new pool's
+    // radius get an extra eject (DISPLACEMENT_INSIDE_BOOST × penetration) so
+    // they aren't rendered underneath the new pigment.
+    function applyDisplacement(newPool) {
+      const cx = newPool.center.x;
+      const cy = newPool.center.y;
+      const Rnew = Math.sqrt(newPool.targetMass / Math.PI);
+      const R2 = Rnew * Rnew;
+      for (const pool of pools) {
+        if (pool.preview) continue;
+        let touched = false;
+        for (const lobe of pool.lobes) {
+          // Lobe's current screen position, including any prior displacement.
+          const lx = pool.center.x + Math.cos(lobe.angle) * lobe.offsetNow + lobe.displaceX;
+          const ly = pool.center.y + Math.sin(lobe.angle) * lobe.offsetNow + lobe.displaceY;
+          const dx = lx - cx;
+          const dy = ly - cy;
+          const d = Math.sqrt(dx * dx + dy * dy);
+          if (d < 0.5) continue; // exactly on top of the new pool — leave alone
+          const safeR = Math.max(d, Rnew * 0.5);
+          let push = R2 / (2 * safeR);
+          if (d < Rnew) push += (Rnew - d) * DISPLACEMENT_INSIDE_BOOST;
+          if (push < DISPLACEMENT_MIN_PX) continue;
+          if (push > DISPLACEMENT_MAX_PX) push = DISPLACEMENT_MAX_PX;
+          const ux = dx / d;
+          const uy = dy / d;
+          lobe.displaceTargetX += ux * push;
+          lobe.displaceTargetY += uy * push;
+          touched = true;
+        }
+        if (touched) {
+          // Wake the pool's update loop. settled flips back to true once the
+          // displacement lerp catches up to the new target.
+          pool.settled = false;
+          markDirtyRect(pool.fieldRect);
+        }
+      }
     }
 
     function handleCornerActionStart(x, y) {
@@ -716,10 +806,12 @@
         this.settled = false;
         this.preview = preview;
         this.lobes = [];
+        this.innerLobes = []; // D2 — sub-metaballs for interior color modulation
         this.sampleLobes = [];
         this.pixelBounds = null;
         this.fieldRect = null;
         this.makeLobes(lobeCount);
+        this.makeInnerLobes();
         this.updateGeometry();
       }
 
@@ -745,30 +837,81 @@
             radius: 2 + random(0, 2),
             targetRadius,
             growthVariation: random(0.72, 1.22),
-            phase: random(1000)
+            phase: random(1000),
+            // D1 — displacement state. displaceX/Y is the live position offset
+            // in screen coords; displaceTargetX/Y is what the update loop is
+            // animating toward. New drops add into Target; lerp catches up.
+            displaceX: 0,
+            displaceY: 0,
+            displaceTargetX: 0,
+            displaceTargetY: 0
+          });
+        }
+      }
+
+      // D2 — generate interior sub-metaballs. Their offsets are sampled inside
+      // the pool's effective radius; their `intensity` (∈ [-1, 1]) encodes
+      // which way they tint pigment (negative → toward rim, positive → toward
+      // wash). Stored in pool-local coords; renderer transforms to screen.
+      makeInnerLobes() {
+        randomSeed(floor(this.seed) ^ 0x5a17);
+        const baseRadius = sqrt(this.targetMass / PI);
+        const count = floor(lerp(INNER_LOBE_MIN, INNER_LOBE_MAX + 0.99,
+          constrain(this.targetMass / 18000, 0, 1)));
+        for (let i = 0; i < count; i++) {
+          const angle = random(0, TWO_PI);
+          const offset = random(0, baseRadius * 0.62);
+          this.innerLobes.push({
+            dx: cos(angle) * offset,
+            dy: sin(angle) * offset,
+            radius: random(baseRadius * 0.18, baseRadius * 0.42),
+            intensity: random(-0.95, 0.95)
           });
         }
       }
 
       update() {
-        if (this.preview || this.settled) return false;
+        if (this.preview) return false;
+        // Pools that are otherwise settled but still have un-played
+        // displacement (a new drop pushed them) need to keep updating until
+        // the lerp catches up. Compute once whether any lobe still owes a
+        // displacement step.
+        const hasPendingDisplacement = this.lobes.some(l =>
+          Math.abs(l.displaceTargetX - l.displaceX) > 0.05 ||
+          Math.abs(l.displaceTargetY - l.displaceY) > 0.05
+        );
+        if (this.settled && !hasPendingDisplacement) return false;
+
         const previousRect = this.fieldRect;
         const before = this.currentMass;
-        this.currentMass = lerp(this.currentMass, this.targetMass, this.growthRate);
+        if (this.currentMass < this.targetMass) {
+          this.currentMass = lerp(this.currentMass, this.targetMass, this.growthRate);
+        }
         const progress = constrain(this.currentMass / this.targetMass, 0, 1);
         let moving = Math.abs(this.currentMass - before) > 0.2;
         for (const lobe of this.lobes) {
-          const targetR = lobe.targetRadius * sqrt(progress);
-          const nextR = lerp(lobe.radius, targetR, 0.045 * lobe.growthVariation);
-          const nextOffset = lerp(lobe.offsetNow, lobe.offsetTarget, 0.032 * lobe.growthVariation);
-          if (Math.abs(nextR - lobe.radius) > 0.05 || Math.abs(nextOffset - lobe.offsetNow) > 0.04) moving = true;
-          lobe.radius = nextR;
-          // Drift is only during growth; once settled these offsets freeze.
-          const drift = (noise(this.seed * 0.001, lobe.phase, progress * 1.7) - 0.5) * 4 * (1 - progress);
-          lobe.offsetNow = nextOffset + drift;
+          if (progress < 0.998) {
+            const targetR = lobe.targetRadius * sqrt(progress);
+            const nextR = lerp(lobe.radius, targetR, 0.045 * lobe.growthVariation);
+            const nextOffset = lerp(lobe.offsetNow, lobe.offsetTarget, 0.032 * lobe.growthVariation);
+            if (Math.abs(nextR - lobe.radius) > 0.05 || Math.abs(nextOffset - lobe.offsetNow) > 0.04) moving = true;
+            lobe.radius = nextR;
+            // Drift is only during growth; once settled these offsets freeze.
+            const drift = (noise(this.seed * 0.001, lobe.phase, progress * 1.7) - 0.5) * 4 * (1 - progress);
+            lobe.offsetNow = nextOffset + drift;
+          }
+          // D1 — displacement lerp. Always runs (even when growth is done) so
+          // a settled pool can still play out a push from a new neighbour.
+          const dxRem = lobe.displaceTargetX - lobe.displaceX;
+          const dyRem = lobe.displaceTargetY - lobe.displaceY;
+          if (Math.abs(dxRem) > 0.05 || Math.abs(dyRem) > 0.05) {
+            lobe.displaceX += dxRem * DISPLACEMENT_RAMP;
+            lobe.displaceY += dyRem * DISPLACEMENT_RAMP;
+            moving = true;
+          }
         }
         if (progress >= SETTLE_EPSILON && !moving) this.settled = true;
-        if (progress >= 0.998) {
+        if (progress >= 0.998 && !hasPendingDisplacement) {
           this.currentMass = this.targetMass;
           for (const lobe of this.lobes) {
             lobe.radius = lobe.targetRadius;
@@ -793,8 +936,12 @@
         let x1 = -Infinity;
         let y1 = -Infinity;
         for (const lobe of this.lobes) {
-          const lx = this.center.x + cos(lobe.angle) * lobe.offsetNow;
-          const ly = this.center.y + sin(lobe.angle) * lobe.offsetNow;
+          // D1 — displacement is added in screen coordinates after the
+          // angular offset, so pools deform asymmetrically when neighbours
+          // push them: lobes closer to the new drop get pushed harder, so
+          // the pool stretches away.
+          const lx = this.center.x + cos(lobe.angle) * lobe.offsetNow + lobe.displaceX;
+          const ly = this.center.y + sin(lobe.angle) * lobe.offsetNow + lobe.displaceY;
           const influenceRadius = Math.max(8, lobe.radius * FIELD_INFLUENCE_FACTOR + 10);
           const warpRadius = lobe.radius * 0.18;
           // Per-lobe directional warp budget + global coord-space warp budget.
@@ -831,15 +978,34 @@
       }
 
       fieldAt(x, y) {
-        // R3 — coordinate-space domain warp on the input sample. One Perlin
-        // octave per axis, seeded by pool so sibling pools don't co-warp.
-        // The whole pool deforms together (all lobes share this offset),
-        // which is what we want for marbling: the pool's silhouette
-        // becomes fluid while individual lobes still combine smoothly.
-        const wx = noise(x * 0.011 + this.seed * 0.001, y * 0.011 + 13.7);
-        const wy = noise(x * 0.011 + this.seed * 0.001 + 31.7, y * 0.011 - 5.1);
-        const sx = x + (wx - 0.5) * (DOMAIN_WARP_PX * 2);
-        const sy = y + (wy - 0.5) * (DOMAIN_WARP_PX * 2);
+        // R3 + D3 — coordinate-space domain warp, decomposed into radial and
+        // tangential components relative to the pool center so the boundary
+        // can finger outward instead of wobbling isotropically.
+        //
+        // 1. Sample two-channel Perlin noise to get a "raw" warp vector (wx, wy).
+        // 2. Project (wx, wy) onto the radial unit (ur) and tangential unit
+        //    (ut = perp(ur)). Boost radial, dampen tangential.
+        // 3. Add a coarser tendril noise (lower frequency, smaller amplitude)
+        //    so finger lengths are uneven and look organic, not periodic.
+        const rx = x - this.center.x;
+        const ry = y - this.center.y;
+        const r = Math.sqrt(rx * rx + ry * ry) + 0.001;
+        const urx = rx / r;
+        const ury = ry / r;
+
+        const wx = noise(x * 0.011 + this.seed * 0.001, y * 0.011 + 13.7) - 0.5;
+        const wy = noise(x * 0.011 + this.seed * 0.001 + 31.7, y * 0.011 - 5.1) - 0.5;
+        // Radial / tangential decomposition. utx = -ury, uty = urx.
+        const wRadial = wx * urx + wy * ury;
+        const wTan = wx * (-ury) + wy * urx;
+        const wxAnis = (RADIAL_WARP_BOOST * wRadial * urx) + (TANGENTIAL_WARP_DAMP * wTan * (-ury));
+        const wyAnis = (RADIAL_WARP_BOOST * wRadial * ury) + (TANGENTIAL_WARP_DAMP * wTan * urx);
+
+        const tendX = noise(x * 0.0042 + this.seed * 0.0007, y * 0.0042 + 7.7) - 0.5;
+        const tendY = noise(x * 0.0042 - this.seed * 0.0007, y * 0.0042 + 11.3) - 0.5;
+
+        const sx = x + wxAnis * (DOMAIN_WARP_PX * 2) + tendX * (TENDRIL_WARP_PX * 2);
+        const sy = y + wyAnis * (DOMAIN_WARP_PX * 2) + tendY * (TENDRIL_WARP_PX * 2);
 
         let sum = 0;
         for (const lobe of this.sampleLobes) {
@@ -853,6 +1019,26 @@
           const dy = roughDy + lobe.phaseSin * warp;
           const d2 = dx * dx + dy * dy + 18;
           sum += lobe.radius2 / d2;
+        }
+        return sum;
+      }
+
+      // D2 — evaluate the inner sub-metaball field at (x, y). Returns a
+      // signed scalar in roughly [-1, 1] used to tint the cell color.
+      // Cheap: a handful of inverse-square-distance lookups inside the
+      // pool's footprint. Called once per owned cell during render.
+      innerFieldAt(x, y) {
+        let sum = 0;
+        for (const il of this.innerLobes) {
+          const dx = x - (this.center.x + il.dx);
+          const dy = y - (this.center.y + il.dy);
+          const d2 = dx * dx + dy * dy;
+          // Effective culling radius (3x lobe radius). Beyond it the field
+          // is too small to matter visually, and we save the divide.
+          const cutoff = il.radius * il.radius * 9;
+          if (d2 > cutoff) continue;
+          const f = (il.radius * il.radius) / (d2 + 4);
+          sum += f * il.intensity;
         }
         return sum;
       }
