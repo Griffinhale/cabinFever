@@ -350,31 +350,49 @@
         float secondScore = 1.0e6;
         float bestSdf = 1.0e6;
         int owner = -1;
-        int secondOwner = -1;
+        // GLSL ES 1.00 strict (ANGLE) rejects post-loop indexing of uniform
+        // arrays with a runtime int. Capture owner/runner-up data inside the
+        // loop where the index is the loop symbol i, then read the captured
+        // values after the loop instead of dynamically indexing again.
+        vec4 bestGeom = vec4(0.0);
+        vec4 bestColor = vec4(0.0);
+        vec4 bestRim = vec4(0.0);
+        vec3 secondFill = vec3(0.0);
+        bool hasSecond = false;
 
         for (int i = 0; i < MAX_DROPS; i++) {
           if (i >= u_dropCount) { break; }
           vec4 geom = u_dropGeom[i];
-          float growth01 = clamp(geom.z / max(u_dropRim[i].a, 1.0), 0.0, 1.0);
+          vec4 colorI = u_dropColor[i];
+          vec4 rimI = u_dropRim[i];
+          float growth01 = clamp(geom.z / max(rimI.a, 1.0), 0.0, 1.0);
           float sdf = dropSignedDistance(px, geom, growth01);
           float score = ownershipScore(px, geom, growth01);
 
           if (score < bestScore) {
+            // Demote previous best to runner-up before promoting current.
+            if (owner >= 0) {
+              secondFill = bestColor.rgb;
+              hasSecond = true;
+            }
             secondScore = bestScore;
-            secondOwner = owner;
             bestScore = score;
             bestSdf = sdf;
+            bestGeom = geom;
+            bestColor = colorI;
+            bestRim = rimI;
             owner = i;
           } else if (score < secondScore) {
             secondScore = score;
-            secondOwner = i;
+            secondFill = colorI.rgb;
+            hasSecond = true;
           }
         }
 
         if (owner >= 0 && bestSdf < 5.5) {
-          vec4 geom = u_dropGeom[owner];
-          vec4 fillData = u_dropColor[owner];
-          vec4 rimData = u_dropRim[owner];
+          vec4 geom = bestGeom;
+          vec4 fillData = bestColor;
+          vec4 rimData = bestRim;
           vec3 fill = fillData.rgb;
           vec3 rim = rimData.rgb;
           float radius = max(geom.z, 1.0);
@@ -401,9 +419,7 @@
           float gap = abs(secondScore - bestScore);
           float seamWidth = mix(0.10, 0.30, clamp(radius / 120.0, 0.0, 1.0));
           float blend = (1.0 - smoothstep(0.0, seamWidth, gap)) * 0.45;
-          vec3 neighborFill = (secondOwner >= 0)
-            ? u_dropColor[secondOwner].rgb
-            : fill;
+          vec3 neighborFill = hasSecond ? secondFill : fill;
 
           // Tight accent kept for granulation: when two pigments almost-perfectly
           // overlap (gap ~ 0) the marbler can still see a fine line of crystallised
