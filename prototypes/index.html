@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>cabinFever marbling prototypes</title>
+  <style>
+    :root { color-scheme: light; }
+    html, body {
+      margin: 0;
+      background: #f4efe3;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      color: #2d261d;
+    }
+    main {
+      max-width: 760px;
+      margin: 6vh auto 12vh;
+      padding: 0 6vw;
+    }
+    h1 {
+      font-size: 18px;
+      letter-spacing: 0.02em;
+      font-weight: 600;
+      margin: 0 0 4px;
+    }
+    .lede {
+      font-size: 12px;
+      color: rgba(45, 38, 29, 0.66);
+      line-height: 1.55;
+      margin: 0 0 28px;
+    }
+    h2 {
+      font-size: 12px;
+      font-weight: 600;
+      margin: 28px 0 6px;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      color: rgba(45, 38, 29, 0.62);
+    }
+    ul {
+      list-style: none;
+      padding: 0;
+      margin: 0;
+      border-top: 1px solid rgba(64, 50, 31, 0.12);
+    }
+    li {
+      border-bottom: 1px solid rgba(64, 50, 31, 0.12);
+    }
+    a.row {
+      display: flex;
+      align-items: baseline;
+      gap: 12px;
+      padding: 10px 4px;
+      text-decoration: none;
+      color: inherit;
+    }
+    a.row:hover {
+      background: rgba(64, 50, 31, 0.05);
+    }
+    .name {
+      font-size: 13px;
+      font-weight: 500;
+      flex: 1;
+    }
+    .tag {
+      font-size: 10px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: rgba(45, 38, 29, 0.5);
+    }
+    .tag.spike { color: #6c4a1a; }
+    .desc {
+      font-size: 11px;
+      color: rgba(45, 38, 29, 0.6);
+      padding: 0 4px 8px;
+      line-height: 1.5;
+      margin-top: -4px;
+    }
+    footer {
+      margin-top: 36px;
+      font-size: 11px;
+      color: rgba(45, 38, 29, 0.42);
+      line-height: 1.55;
+    }
+    code {
+      background: rgba(64, 50, 31, 0.08);
+      padding: 1px 4px;
+      border-radius: 3px;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>cabinFever · marbling prototypes</h1>
+    <p class="lede">
+      Six frozen prototypes plus two short-lived spikes for the SDF shape direction.
+      All static HTML; nothing under <code>src/</code> is involved.
+    </p>
+
+    <h2>Spikes (under evaluation)</h2>
+    <ul>
+      <li>
+        <a class="row" href="./marbling-shader-sdf-spike/">
+          <span class="name">Shader / SDF — Spike A</span>
+          <span class="tag spike">spike A</span>
+        </a>
+        <div class="desc">
+          In-place fixes to the SDF prototype: coordinate-space domain warp,
+          two-owner pigment blend at seams, growth-aware warp amplitude.
+        </div>
+      </li>
+      <li>
+        <a class="row" href="./marbling-hybrid-raster-shader/">
+          <span class="name">Hybrid · raster ownership + shader surface — Spike B</span>
+          <span class="tag spike">spike B</span>
+        </a>
+        <div class="desc">
+          Raster sim drives owner ids into a texture; shader resolves seams
+          from cardinal-neighbour disagreement and applies SDF-style surface
+          treatment with a domain-warped lookup.
+        </div>
+      </li>
+    </ul>
+
+    <h2>Frozen baselines (do not edit)</h2>
+    <ul>
+      <li>
+        <a class="row" href="./marbling-radial-boundary/">
+          <span class="name">Radial boundary</span>
+          <span class="tag">baseline</span>
+        </a>
+      </li>
+      <li>
+        <a class="row" href="./marbling-particle-displacement/">
+          <span class="name">Particle displacement</span>
+          <span class="tag">baseline</span>
+        </a>
+      </li>
+      <li>
+        <a class="row" href="./marbling-metaball-pools/">
+          <span class="name">Metaball pools</span>
+          <span class="tag">baseline</span>
+        </a>
+      </li>
+      <li>
+        <a class="row" href="./marbling-raster-ownership/">
+          <span class="name">Raster ownership</span>
+          <span class="tag">baseline</span>
+        </a>
+      </li>
+      <li>
+        <a class="row" href="./marbling-boundary-relaxation/">
+          <span class="name">Boundary relaxation</span>
+          <span class="tag">baseline</span>
+        </a>
+      </li>
+      <li>
+        <a class="row" href="./marbling-shader-sdf/">
+          <span class="name">Shader / SDF (frozen baseline)</span>
+          <span class="tag">baseline</span>
+        </a>
+      </li>
+    </ul>
+
+    <footer>
+      Branch: <code>proto/marbling-spike-compare</code>. This branch only exists
+      so both spikes and all six frozen baselines can be compared from a single
+      <code>python3 -m http.server</code>. It does not merge to main.
+    </footer>
+  </main>
+</body>
+</html>

@@ -1,0 +1,1180 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>Marbling Hybrid (Raster + Shader) Prototype</title>
+  <style>
+    html,
+    body {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: #f4efe3;
+      touch-action: none;
+      overscroll-behavior: none;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+    }
+
+    canvas {
+      display: block;
+      position: fixed;
+      inset: 0;
+      width: 100vw !important;
+      height: 100vh !important;
+      touch-action: none;
+    }
+
+    .status {
+      position: fixed;
+      left: 12px;
+      top: 10px;
+      z-index: 4;
+      max-width: min(520px, calc(100vw - 24px));
+      padding: 7px 9px;
+      border: 1px solid rgba(64, 50, 31, 0.18);
+      border-radius: 9px;
+      background: rgba(250, 246, 236, 0.84);
+      color: rgba(45, 38, 29, 0.74);
+      font-size: 11px;
+      line-height: 1.35;
+      letter-spacing: 0.01em;
+      pointer-events: none;
+      user-select: none;
+      box-shadow: 0 8px 28px rgba(44, 32, 18, 0.08);
+      opacity: 0;
+      transition: opacity 180ms ease;
+    }
+
+    .status.visible { opacity: 1; }
+    .status.error { color: #5d2020; border-color: rgba(115, 38, 38, 0.28); }
+    .status.warn { color: #5b4422; border-color: rgba(132, 91, 30, 0.28); }
+
+    .hint {
+      position: fixed;
+      left: 12px;
+      bottom: 10px;
+      z-index: 2;
+      color: rgba(45, 38, 29, 0.48);
+      font-size: 11px;
+      letter-spacing: 0.03em;
+      line-height: 1.45;
+      pointer-events: none;
+      user-select: none;
+      text-shadow: 0 1px 8px rgba(250, 246, 236, 0.75);
+    }
+
+    .tap-zone {
+      position: fixed;
+      z-index: 3;
+      width: 54px;
+      height: 54px;
+      opacity: 0;
+      touch-action: none;
+    }
+
+    #palette-zone { left: 0; top: 0; }
+    #reset-zone { right: 0; top: 0; }
+  </style>
+</head>
+<body>
+  <div id="status" class="status visible">Starting marbling renderer…</div>
+  <div id="hint" class="hint">hold to drop · P palette · R reset</div>
+  <button id="palette-zone" class="tap-zone" aria-label="cycle palette"></button>
+  <button id="reset-zone" class="tap-zone" aria-label="reset"></button>
+
+  <script>
+    /*
+      Marbling hybrid (raster ownership + shader surface) prototype — Spike B.
+
+      Hypothesis: outsourcing pigment ownership to the raster grid (which already
+      produces convincingly circular drops with seam balance) and reusing the SDF
+      prototype's surface treatment (paper grain, rim, granulation, stain bloom)
+      is cleaner than fixing the SDF.
+
+      Provenance (top-of-file, per spike plan):
+
+        Simulation half — lifted from prototypes/marbling-raster-ownership:
+          ownership grid + frontier expansion (createDropAt, claimCell,
+          addFrontierNeighbors, growDrop, compactFrontier) — index.html:243-478
+          sector-balance scoring (growthCost / sectorBalanceTargetRadius /
+          chooseBestFrontierPosition) — index.html:480-635
+          input handling and hold→area mapping pattern — index.html:180-238
+
+        Surface treatment — lifted from prototypes/marbling-shader-sdf:
+          fragment shader paperSurface + palette uniforms — index.html:225-324
+          startup ladder (FORCE_2D_FALLBACK, canCreateWebGLContext,
+          setupFallback2D, switchToFallback2D) — index.html:392-471
+          domain warp (Spike A) idea applied to texture-lookup uv — see below
+
+        Bridge (new): per-frame upload of an RGBA8 ownership texture indexed
+        by drop id; fragment shader resolves owner via cell-centered sampling
+        and four cardinal neighbour lookups for seam blending.
+    */
+
+    const statusEl = document.getElementById('status');
+    const hintEl = document.getElementById('hint');
+
+    function setStatus(message, level = 'info', persist = false) {
+      if (!statusEl) return;
+      statusEl.textContent = message;
+      statusEl.className = `status visible ${level === 'error' ? 'error' : level === 'warn' ? 'warn' : ''}`.trim();
+      if (!persist && level === 'info') {
+        window.clearTimeout(setStatus.hideTimer);
+        setStatus.hideTimer = window.setTimeout(() => statusEl.classList.remove('visible'), 1800);
+      }
+    }
+
+    function reportStartupIssue(message, detail) {
+      if (detail) console.warn(message, detail);
+      setStatus(message, 'warn', true);
+    }
+
+    window.addEventListener('error', (event) => {
+      const message = event.message || 'Unknown script error';
+      console.error('Visible startup error:', event.error || message);
+      setStatus(`Renderer error: ${message}`, 'error', true);
+    });
+
+    window.addEventListener('unhandledrejection', (event) => {
+      const reason = event.reason && (event.reason.message || String(event.reason));
+      console.error('Visible unhandled rejection:', event.reason);
+      setStatus(`Renderer promise error: ${reason || 'unknown rejection'}`, 'error', true);
+    });
+
+    const P5_CDN_URL = 'https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.11.3/p5.min.js';
+    const P5_LOAD_TIMEOUT_MS = 3500;
+    const p5Load = { loaded: false, failed: false, timer: 0 };
+
+    function loadP5AfterDiagnostics() {
+      setStatus('Loading p5 renderer dependency…', 'info', true);
+      const script = document.createElement('script');
+      script.src = P5_CDN_URL;
+      script.async = true;
+      script.onload = () => {
+        p5Load.loaded = true;
+        window.clearTimeout(p5Load.timer);
+        if (window.p5) window.p5.disableFriendlyErrors = true;
+        setStatus('p5 loaded; starting renderer…', 'info');
+      };
+      script.onerror = () => {
+        p5Load.failed = true;
+        window.clearTimeout(p5Load.timer);
+        setStatus('p5 failed to load from CDN. Static page is visible, but canvas interaction needs p5/network access.', 'error', true);
+      };
+      p5Load.timer = window.setTimeout(() => {
+        if (!p5Load.loaded) {
+          p5Load.failed = true;
+          setStatus('p5 CDN load timed out. Static page is visible, but canvas interaction needs p5/network access.', 'error', true);
+        }
+      }, P5_LOAD_TIMEOUT_MS);
+      document.head.appendChild(script);
+    }
+
+    // ---- Constants shared by both halves ------------------------------------
+    const MAX_DROPS = 32;          // matches SDF prototype, per spike plan
+    const MIN_HOLD_MS = 35;
+    const MAX_HOLD_MS = 1800;
+    const MIN_DROP_AREA = 26 * 26 * Math.PI;
+    const MAX_DROP_AREA = 122 * 122 * Math.PI;
+    const EDGE_MARGIN_PX = 8;
+    const MIN_EDGE_LIMIT_RADIUS = 10;
+
+    // Raster sim constants (lifted verbatim from raster-ownership/index.html:42-58).
+    const MIN_TARGET_AREA_CELLS = 72;
+    const MAX_TARGET_AREA_RATIO = 0.045;
+    const CLAIMS_PER_DROP_PER_FRAME = 13;
+    const MAX_ACTIVE_DROPS_UPDATED = 80;
+    const FRONTIER_SAMPLE_COUNT = 30;
+    const UNDERFILLED_SECTOR_SAMPLE_COUNT = 14;
+    const SECTOR_COUNT = 32;
+    const RING_LEAD_CELLS = 2.15;
+    const INNER_FILL_SLACK_CELLS = 1.35;
+    const RADIUS_OVERSHOOT_ALLOWANCE = 1.11;
+    const NEIGHBORS_8 = [
+      [-1, -1], [0, -1], [1, -1],
+      [-1,  0],          [1,  0],
+      [-1,  1], [0,  1], [1,  1]
+    ];
+
+    const PALETTES = [
+      {
+        name: 'traditional marbling',
+        surface: '#f4efe3', grain: '#c7b99d',
+        pigments: ['#17375f', '#7e2631', '#c08b32', '#3f5f46', '#efe1bf'],
+        rims: ['#09192d', '#4c1018', '#80530f', '#203623', '#c8b071'],
+        accent: '#b78c5b'
+      },
+      {
+        name: 'bright playful',
+        surface: '#fff1dc', grain: '#e0bb8e',
+        pigments: ['#ee6d66', '#16aeba', '#f1d451', '#7d5ad6', '#244ba8'],
+        rims: ['#aa3231', '#0b6674', '#bd8e18', '#4b2b8d', '#10245c'],
+        accent: '#fc9f80'
+      },
+      {
+        name: 'portfolio subdued',
+        surface: '#eee7db', grain: '#b7a995',
+        pigments: ['#20262b', '#9b5d48', '#527b78', '#ead7b5', '#b8723f'],
+        rims: ['#07090b', '#643427', '#284744', '#bda87d', '#794118'],
+        accent: '#c79768'
+      },
+      {
+        name: 'monochrome ink',
+        surface: '#f2efe7', grain: '#b9b2a5',
+        pigments: ['#07101d', '#283241', '#5d6570', '#aab0b2', '#d7d2c5'],
+        rims: ['#010307', '#121923', '#373e48', '#777d82', '#aaa294'],
+        accent: '#576579'
+      }
+    ];
+
+    // ---- Shaders -----------------------------------------------------------
+    const VERT_SHADER = `
+      precision highp float;
+      attribute vec3 aPosition;
+      varying vec2 vUv;
+      void main() {
+        vUv = aPosition.xy * 0.5 + 0.5;
+        gl_Position = vec4(aPosition.xy, 0.0, 1.0);
+      }
+    `;
+
+    // Fragment shader: surface treatment lifted from shader-sdf prototype, but
+    // ownership is read from u_ownership (RGBA8 texture, R = ownerId+1, 0 = empty).
+    // Color of each owner is read from u_dropColor[]; rim from u_dropRim[];
+    // geometry (centerPx, radius, seed) from u_dropGeom[] for stain bloom and
+    // boundary noise.
+    const FRAG_SHADER = `
+      precision highp float;
+
+      const int MAX_DROPS = ${MAX_DROPS};
+
+      uniform vec2 u_resolution;
+      uniform vec2 u_gridSize;       // (gridW, gridH)
+      uniform int u_dropCount;
+      uniform vec3 u_surface;
+      uniform vec3 u_grain;
+      uniform vec3 u_accent;
+
+      uniform sampler2D u_ownership;
+      uniform vec4 u_dropGeom[MAX_DROPS];   // (cx01, cy01_flipped, radiusPx, seed)
+      uniform vec4 u_dropColor[MAX_DROPS];  // (r, g, b, age01)
+      uniform vec4 u_dropRim[MAX_DROPS];    // (r, g, b, targetRadiusPx)
+
+      varying vec2 vUv;
+
+      float hash12(vec2 p) {
+        vec3 p3 = fract(vec3(p.xyx) * 0.1031);
+        p3 += dot(p3, p3.yzx + 33.33);
+        return fract((p3.x + p3.y) * p3.z);
+      }
+
+      float noise(vec2 p) {
+        vec2 i = floor(p);
+        vec2 f = fract(p);
+        vec2 u = f * f * (3.0 - 2.0 * f);
+        return mix(
+          mix(hash12(i + vec2(0.0, 0.0)), hash12(i + vec2(1.0, 0.0)), u.x),
+          mix(hash12(i + vec2(0.0, 1.0)), hash12(i + vec2(1.0, 1.0)), u.x),
+          u.y
+        );
+      }
+
+      float fbm(vec2 p) {
+        float v = 0.0;
+        float a = 0.5;
+        for (int i = 0; i < 4; i++) {
+          v += a * noise(p);
+          p = mat2(1.62, -1.18, 1.18, 1.62) * p + 8.3;
+          a *= 0.5;
+        }
+        return v;
+      }
+
+      // Domain warp lifted from Spike A. Applied to texture lookup UV so a clean
+      // raster boundary becomes a fluid boundary in screen space.
+      vec2 domainWarp(vec2 uv, float seed) {
+        vec2 px = uv * u_resolution;
+        vec2 q = vec2(fbm(px * 0.006 + seed),
+                      fbm(px * 0.006 + seed + 31.7));
+        vec2 r = vec2(fbm(px * 0.012 + 4.0 * q + seed * 1.3),
+                      fbm(px * 0.012 + 4.0 * q + seed * 2.7));
+        return r - 0.5;
+      }
+
+      vec3 paperSurface(vec2 uv, vec2 px) {
+        float broad = fbm(px * 0.0035 + 4.0);
+        float grain = noise(px * 0.95) * 0.32 + noise(px * 0.21 + 19.0) * 0.68;
+        float fibers = sin((px.x + fbm(px * 0.006) * 32.0) * 0.035) * 0.5 + 0.5;
+        vec3 paper = u_surface;
+        paper += (broad - 0.5) * 0.055;
+        paper = mix(paper, u_grain, 0.030 + grain * 0.045 + fibers * 0.012);
+        float vignette = smoothstep(0.88, 0.18, distance(uv, vec2(0.5)));
+        paper *= mix(0.94, 1.02, vignette);
+        return paper;
+      }
+
+      // Sample owner id at a UV by snapping to the cell center. Bilinear filter
+      // would average byte-encoded ids, which is meaningless; cell-snap reads
+      // the canonical id of the cell that owns that pixel.
+      int sampleOwner(vec2 uv) {
+        vec2 cellUv = (floor(uv * u_gridSize) + 0.5) / u_gridSize;
+        // texture y is flipped vs canvas y; the JS upload writes rows in
+        // bottom-up order so this lookup matches.
+        float r = texture2D(u_ownership, cellUv).r;
+        return int(r * 255.0 + 0.5) - 1;
+      }
+
+      void main() {
+        vec2 uv = vUv;
+        vec2 px = uv * u_resolution;
+        vec3 color = paperSurface(uv, px);
+
+        // Cheap warp seed: fbm at the pixel level. Real per-drop seed is
+        // applied per drop below for stain/granule sampling.
+        vec2 globalWarp = domainWarp(uv, 7.0);
+        // Warp amplitude in UV space, capped to ~3 cells so seams stay
+        // recognisable. The cap also keeps large drops from melting into one
+        // another and losing their identity.
+        vec2 warpUv = uv + globalWarp * (3.0 / u_gridSize);
+
+        int o0 = sampleOwner(warpUv);
+        if (o0 < 0) {
+          // Empty cell — but a settled drop nearby may bloom a stain into the
+          // paper. Iterate drops, accumulate stain by SDF distance to centerPx.
+          for (int i = 0; i < MAX_DROPS; i++) {
+            if (i >= u_dropCount) break;
+            vec4 geom = u_dropGeom[i];
+            float radius = max(geom.z, 1.0);
+            vec2 centerPx = geom.xy * u_resolution;
+            float d = length(px - centerPx) - radius;
+            float stainMask = 1.0 - smoothstep(12.0, 42.0, d);
+            float growth01 = clamp(radius / max(u_dropRim[i].a, 1.0), 0.0, 1.0);
+            color = mix(color, u_dropColor[i].rgb, stainMask * (0.05 + growth01 * 0.03));
+          }
+          gl_FragColor = vec4(clamp(color, 0.0, 1.0), 1.0);
+          return;
+        }
+
+        // Neighbour sampling for seam strength. Step is one cell in UV.
+        vec2 step1 = 1.0 / u_gridSize;
+        int oW = sampleOwner(warpUv - vec2(step1.x, 0.0));
+        int oE = sampleOwner(warpUv + vec2(step1.x, 0.0));
+        int oN = sampleOwner(warpUv - vec2(0.0, step1.y));
+        int oS = sampleOwner(warpUv + vec2(0.0, step1.y));
+
+        // Disagreement: count of cardinal neighbours that disagree with center.
+        // Pick the most-common disagreeing owner for the blend partner.
+        int disagree = 0;
+        int neighbour = -1;
+        if (oW != o0) { disagree++; neighbour = oW; }
+        if (oE != o0) { disagree++; if (neighbour < 0 || oE == neighbour) neighbour = oE; }
+        if (oN != o0) { disagree++; if (neighbour < 0 || oN == neighbour) neighbour = oN; }
+        if (oS != o0) { disagree++; if (neighbour < 0 || oS == neighbour) neighbour = oS; }
+
+        // Two-step neighbour for wider seam blending — gives raster regions the
+        // muddy color band feel you'd see between adjacent pigments. This is
+        // cheap (one extra texture sample per axis) and avoids needing a real
+        // distance field.
+        vec2 step2 = 2.0 / u_gridSize;
+        int oW2 = sampleOwner(warpUv - vec2(step2.x, 0.0));
+        int oE2 = sampleOwner(warpUv + vec2(step2.x, 0.0));
+        int oN2 = sampleOwner(warpUv - vec2(0.0, step2.y));
+        int oS2 = sampleOwner(warpUv + vec2(0.0, step2.y));
+        int wider = 0;
+        if (oW2 != o0 && oW2 >= 0) wider++;
+        if (oE2 != o0 && oE2 >= 0) wider++;
+        if (oN2 != o0 && oN2 >= 0) wider++;
+        if (oS2 != o0 && oS2 >= 0) wider++;
+        // If immediate neighbours all agreed but 2-step neighbours don't, treat
+        // that as a soft pre-seam (fade-in band).
+        float softSeam = (disagree == 0) ? float(wider) * 0.18 : 0.0;
+
+        vec4 ownerGeom = u_dropGeom[0];
+        vec4 ownerColor = u_dropColor[0];
+        vec4 ownerRim = u_dropRim[0];
+        // GLSL ES 1.0 cannot dynamically index uniform arrays in some impls.
+        // Walk the array once to hit the matched indices. MAX_DROPS = 32 is
+        // small enough that this is cheap relative to the fbm calls above.
+        vec4 neighGeom = ownerGeom;
+        vec4 neighColor = ownerColor;
+        vec4 neighRim = ownerRim;
+        for (int i = 0; i < MAX_DROPS; i++) {
+          if (i >= u_dropCount) break;
+          if (i == o0) {
+            ownerGeom = u_dropGeom[i];
+            ownerColor = u_dropColor[i];
+            ownerRim = u_dropRim[i];
+          }
+          if (neighbour >= 0 && i == neighbour) {
+            neighGeom = u_dropGeom[i];
+            neighColor = u_dropColor[i];
+            neighRim = u_dropRim[i];
+          }
+        }
+
+        float radius = max(ownerGeom.z, 1.0);
+        float ageLayer = ownerColor.a;
+        float growth01 = clamp(radius / max(ownerRim.a, 1.0), 0.0, 1.0);
+        vec2 centerPx = ownerGeom.xy * u_resolution;
+        vec2 rel = px - centerPx;
+        float radial = length(rel) / radius;
+
+        // Pseudo-SDF from raster: distance to nearest disagreeing neighbour
+        // approximates a signed distance. We use the fraction of disagreeing
+        // cardinals as a normalised "edge proximity" — 0 inside a pure cell,
+        // up to 1 at strong corners. The stain/rim/granulation effects from
+        // the SDF prototype keyed on bestSdf are reproduced here from this
+        // proximity instead.
+        float edgeProximity = float(disagree) * 0.25 + softSeam;
+        float edgeMask = smoothstep(0.0, 0.7, edgeProximity);
+        float bodyMask = 1.0 - smoothstep(0.0, 0.4, edgeProximity);
+        float rimMask = smoothstep(0.55, 0.95, edgeProximity);
+
+        // Adaptive seam blend (Spike A2/A3 idea, applied to raster seams).
+        // Larger drops diffuse pigment further; we get this by tying the band
+        // to disagreeing-neighbour count rather than a free parameter — the
+        // raster sim already produces wider transition zones around large pools.
+        float blend = clamp(edgeProximity, 0.0, 1.0) * 0.45;
+        // Tight accent line: only at strong corners (3+ disagreeing
+        // cardinals), and weakly. This is the marbler's crystallised edge.
+        float accentLine = smoothstep(0.6, 0.9, edgeProximity);
+
+        float seedMix = ownerGeom.w;
+        float wash = fbm(px * 0.018 + seedMix * 24.0);
+        float granule = noise(px * 1.65 + seedMix * 311.0);
+        float vein = fbm(vec2(atan(rel.y, rel.x) * 4.0 + seedMix * 9.0, radial * 7.5));
+
+        vec3 fill = ownerColor.rgb;
+        vec3 partner = (neighbour >= 0) ? neighColor.rgb : fill;
+        vec3 rim = ownerRim.rgb;
+
+        vec3 pigment = mix(fill, partner, blend);
+        pigment = mix(pigment, rim, rimMask * 0.55);
+        pigment = mix(pigment, u_accent, accentLine * bodyMask * 0.06);
+        pigment *= 0.88 + wash * 0.22 - ageLayer * 0.035;
+        pigment -= (1.0 - smoothstep(0.35, 0.96, granule)) * 0.035;
+        pigment += (vein - 0.5) * 0.065 * (1.0 - rimMask) * mix(1.15, 0.85, growth01);
+
+        vec3 stainedPaper = mix(color, pigment, (0.07 + growth01 * 0.04));
+        // Raster ownership means we are inside an owned cell; opacity is high
+        // by default with edgeMask softening just the fluid boundary.
+        float bodyAlpha = mix(0.95, 0.70, edgeMask);
+        color = mix(stainedPaper, pigment, bodyAlpha);
+        color = mix(color, rim, rimMask * mix(0.30, 0.20, growth01));
+        color = mix(color, u_accent, accentLine * 0.05);
+
+        gl_FragColor = vec4(clamp(color, 0.0, 1.0), 1.0);
+      }
+    `;
+
+    const FORCE_2D_FALLBACK = new URLSearchParams(window.location.search).has('fallback2d');
+
+    // ---- Shared sketch state -----------------------------------------------
+    let theShader;
+    let rendererMode = 'shader';
+    let currentCanvas = null;
+    let controlsAttached = false;
+    let activePress = null;
+    let currentPaletteIndex = 0;
+    let lastMs = 0;
+    let dropId = 0;
+
+    // Raster sim state (lifted naming from raster-ownership).
+    let owner;            // Int32Array, -1 = empty, otherwise drop array index
+    let age;
+    let grainCost;
+    let frontierMark;
+    let gridW = 0;
+    let gridH = 0;
+    let cellSize = 4;
+    let drops = [];       // index in this array == ownerId; capped to MAX_DROPS
+    let tick = 0;
+    let settled = true;
+    let dirty = true;
+
+    // Ownership texture buffer + p5 image used to upload it each frame.
+    let ownerImage = null;
+    let ownerTexInterpolationApplied = false;
+
+    function setup() {
+      setStatus('Checking WebGL and shader support…', 'info', true);
+      if (FORCE_2D_FALLBACK) { setupFallback2D('Forced 2D fallback via ?fallback2d'); return; }
+      if (!canCreateWebGLContext()) { setupFallback2D('WebGL unavailable; using 2D fallback'); return; }
+
+      try {
+        currentCanvas = createCanvas(windowWidth, windowHeight, WEBGL);
+        currentCanvas.elt.addEventListener('contextmenu', (event) => event.preventDefault());
+        pixelDensity(1);
+        noStroke();
+        theShader = createShader(VERT_SHADER, FRAG_SHADER);
+        shader(theShader);
+        resetShader();
+        rendererMode = 'shader';
+        lastMs = millis();
+        resetSimulation();
+        updateHint();
+        attachPointerEvents(currentCanvas.elt);
+        setStatus('Hybrid renderer ready', 'info');
+        loop();
+      } catch (error) {
+        console.warn('Shader startup failed; falling back to 2D renderer.', error);
+        setupFallback2D(`Shader failed; using 2D fallback (${shortError(error)})`);
+      }
+    }
+
+    function canCreateWebGLContext() {
+      try {
+        const probe = document.createElement('canvas');
+        return !!(probe.getContext('webgl') || probe.getContext('experimental-webgl'));
+      } catch (error) {
+        console.warn('WebGL preflight threw.', error);
+        return false;
+      }
+    }
+
+    function setupFallback2D(reason) {
+      try { if (currentCanvas && currentCanvas.remove) currentCanvas.remove(); } catch (_) {}
+      rendererMode = 'fallback2d';
+      currentCanvas = createCanvas(windowWidth, windowHeight);
+      currentCanvas.elt.addEventListener('contextmenu', (event) => event.preventDefault());
+      pixelDensity(1);
+      noStroke();
+      lastMs = millis();
+      resetSimulation();
+      updateHint();
+      attachPointerEvents(currentCanvas.elt);
+      reportStartupIssue(reason || 'Using 2D fallback renderer');
+      loop();
+    }
+
+    function switchToFallback2D(reason) {
+      if (rendererMode === 'fallback2d') return;
+      console.warn('Switching to 2D fallback:', reason);
+      setupFallback2D(reason);
+    }
+
+    function shortError(error) {
+      return error && error.message ? error.message.split('\n')[0].slice(0, 90) : 'unknown error';
+    }
+
+    function draw() {
+      const now = millis();
+      lastMs = now;
+
+      const grew = updateSimulation();
+      const wasSettled = settled;
+
+      if (rendererMode === 'shader') {
+        try {
+          renderShader();
+        } catch (error) {
+          switchToFallback2D(`Shader render failed; using 2D fallback (${shortError(error)})`);
+          renderFallback2D();
+        }
+      } else {
+        renderFallback2D();
+      }
+
+      if (settled && !wasSettled && !grew) noLoop();
+    }
+
+    // ---- Cell grid helpers (lifted from raster-ownership/index.html:243-290) -
+    function chooseCellSize() {
+      const shortest = Math.min(windowWidth, windowHeight);
+      if (shortest < 620) return 5;
+      if (windowWidth * windowHeight > 1800 * 1000) return 4;
+      return 3;
+    }
+
+    function resetSimulation() {
+      cellSize = chooseCellSize();
+      gridW = Math.ceil(width / cellSize);
+      gridH = Math.ceil(height / cellSize);
+      const total = gridW * gridH;
+      owner = new Int32Array(total);
+      owner.fill(-1);
+      age = new Uint16Array(total);
+      grainCost = new Float32Array(total);
+      frontierMark = new Int32Array(total);
+      frontierMark.fill(-1);
+      for (let y = 0; y < gridH; y++) {
+        for (let x = 0; x < gridW; x++) {
+          const idx = indexAt(x, y);
+          const n1 = noise(x * 0.055, y * 0.055, 3.1);
+          const n2 = noise(x * 0.17 + 91.3, y * 0.17 - 42.1, 8.6);
+          grainCost[idx] = n1 * 0.75 + n2 * 0.25;
+        }
+      }
+      drops = [];
+      dropId = 0;
+      activePress = null;
+      tick = 0;
+      settled = true;
+      dirty = true;
+      ownerImage = createImage(gridW, gridH);
+      ownerTexInterpolationApplied = false;
+    }
+
+    function indexAt(x, y) { return y * gridW + x; }
+    function inGrid(x, y) { return x >= 0 && y >= 0 && x < gridW && y < gridH; }
+    function cellX(index) { return index % gridW; }
+    function cellY(index) { return Math.floor(index / gridW); }
+    function screenToCellX(x) { return constrain(Math.floor(x / cellSize), 0, gridW - 1); }
+    function screenToCellY(y) { return constrain(Math.floor(y / cellSize), 0, gridH - 1); }
+
+    // ---- Drop + claim (lifted from raster-ownership/index.html:300-399) ----
+    function createDropAt(screenX, screenY, targetAreaCells, paletteIndex, pigmentIndex) {
+      const palette = PALETTES[paletteIndex];
+      // Cap at MAX_DROPS — owner ids are stored as bytes (id+1) in the texture.
+      while (drops.length >= MAX_DROPS) {
+        // FIFO eviction: clear the oldest drop's cells back to empty so its id
+        // can be reused. Cheaper than re-indexing all cells.
+        const oldest = drops.shift();
+        for (let i = 0; i < owner.length; i++) {
+          if (owner[i] === oldest.id) owner[i] = -1;
+        }
+        // Re-id remaining drops to keep ids dense and bounded by MAX_DROPS.
+        for (let n = 0; n < drops.length; n++) {
+          const d = drops[n];
+          if (d.id === n) continue;
+          for (let i = 0; i < owner.length; i++) if (owner[i] === d.id) owner[i] = n;
+          d.id = n;
+        }
+        dropId = drops.length;
+      }
+
+      const id = dropId++;
+      const drop = {
+        id,
+        seedX: screenToCellX(screenX),
+        seedY: screenToCellY(screenY),
+        screenX,
+        screenY,
+        targetAreaCells,
+        targetRadiusCells: Math.sqrt(targetAreaCells / Math.PI),
+        maxAllowedRadiusCells: Math.sqrt(targetAreaCells / Math.PI) * RADIUS_OVERSHOOT_ALLOWANCE,
+        claimedAreaCells: 0,
+        frontier: [],
+        sectorClaims: new Uint16Array(SECTOR_COUNT),
+        sectorMaxRadius: new Float32Array(SECTOR_COUNT),
+        sectorHasFrontier: new Uint8Array(SECTOR_COUNT),
+        openSectorCount: SECTOR_COUNT,
+        blockedSectorRatio: 0,
+        color: palette.pigments[pigmentIndex % palette.pigments.length],
+        rimColor: palette.rims[pigmentIndex % palette.rims.length],
+        seed: random(0.01, 99.0),
+        ageLayer: drops.length / MAX_DROPS,
+        createdAt: millis(),
+        settled: false,
+        paletteName: palette.name
+      };
+
+      let seedIndex = indexAt(drop.seedX, drop.seedY);
+      if (owner[seedIndex] !== -1) {
+        seedIndex = findNearestEmptySeed(drop.seedX, drop.seedY, 9);
+        if (seedIndex === -1) {
+          drop.settled = true;
+          drops.push(drop);
+          return;
+        }
+        drop.seedX = cellX(seedIndex);
+        drop.seedY = cellY(seedIndex);
+      }
+      drops.push(drop);
+      claimCell(drop, seedIndex);
+      addFrontierNeighbors(drop, seedIndex);
+      settled = false;
+      dirty = true;
+    }
+
+    function findNearestEmptySeed(cx, cy, radius) {
+      let best = -1; let bestD = Infinity;
+      for (let r = 1; r <= radius; r++) {
+        for (let y = cy - r; y <= cy + r; y++) {
+          for (let x = cx - r; x <= cx + r; x++) {
+            if (!inGrid(x, y)) continue;
+            const idx = indexAt(x, y);
+            if (owner[idx] !== -1) continue;
+            const d = Math.abs(x - cx) + Math.abs(y - cy);
+            if (d < bestD) { bestD = d; best = idx; }
+          }
+        }
+        if (best !== -1) return best;
+      }
+      return -1;
+    }
+
+    function claimCell(drop, idx) {
+      if (owner[idx] !== -1 || drop.claimedAreaCells >= drop.targetAreaCells) return false;
+      owner[idx] = drop.id;
+      age[idx] = tick % 65535;
+      drop.claimedAreaCells++;
+      updateSectorStateForClaim(drop, idx);
+      return true;
+    }
+
+    function updateSectorStateForClaim(drop, idx) {
+      const x = cellX(idx);
+      const y = cellY(idx);
+      const sector = sectorForCell(drop, x, y);
+      const distance = distanceFromSeed(drop, x, y);
+      drop.sectorClaims[sector]++;
+      if (distance > drop.sectorMaxRadius[sector]) drop.sectorMaxRadius[sector] = distance;
+    }
+
+    function addFrontierNeighbors(drop, idx) {
+      const x = cellX(idx);
+      const y = cellY(idx);
+      for (const [dx, dy] of NEIGHBORS_8) {
+        const nx = x + dx;
+        const ny = y + dy;
+        if (!inGrid(nx, ny)) continue;
+        const ni = indexAt(nx, ny);
+        if (owner[ni] !== -1 || frontierMark[ni] === drop.id) continue;
+        frontierMark[ni] = drop.id;
+        drop.frontier.push(ni);
+      }
+    }
+
+    // ---- Growth (lifted from raster-ownership/index.html:410-635) -----------
+    function updateSimulation() {
+      let anyGrew = false;
+      const hasActiveDrop = drops.some((drop) => !drop.settled);
+      if (!hasActiveDrop) {
+        const nextSettled = !activePress;
+        if (settled !== nextSettled) dirty = true;
+        settled = nextSettled;
+        return false;
+      }
+      tick++;
+      let updated = 0;
+      for (const drop of drops) {
+        if (drop.settled) continue;
+        if (updated++ > MAX_ACTIVE_DROPS_UPDATED) break;
+        const before = drop.claimedAreaCells;
+        growDrop(drop, CLAIMS_PER_DROP_PER_FRAME);
+        if (drop.claimedAreaCells > before) anyGrew = true;
+      }
+      const hasUnsettledDrop = drops.some((drop) => !drop.settled);
+      const nextSettled = !hasUnsettledDrop && !activePress;
+      if (settled !== nextSettled) dirty = true;
+      settled = nextSettled;
+      if (anyGrew) dirty = true;
+      return anyGrew;
+    }
+
+    function growDrop(drop, maxClaims) {
+      let claims = 0;
+      while (claims < maxClaims && drop.claimedAreaCells < drop.targetAreaCells) {
+        compactFrontier(drop);
+        if (drop.frontier.length === 0) { drop.settled = true; return; }
+        updateDropObstacleState(drop);
+        const bestPos = chooseBestFrontierPosition(drop);
+        const idx = drop.frontier[bestPos];
+        const last = drop.frontier.pop();
+        if (bestPos < drop.frontier.length) drop.frontier[bestPos] = last;
+        frontierMark[idx] = -1;
+        if (owner[idx] !== -1) continue;
+        if (claimCell(drop, idx)) {
+          addFrontierNeighbors(drop, idx);
+          claims++;
+        }
+      }
+      if (drop.claimedAreaCells >= drop.targetAreaCells) drop.settled = true;
+    }
+
+    function compactFrontier(drop) {
+      if (drop.frontier.length < 32) return;
+      let write = 0;
+      for (let read = 0; read < drop.frontier.length; read++) {
+        const idx = drop.frontier[read];
+        if (owner[idx] === -1) {
+          drop.frontier[write++] = idx;
+        } else {
+          frontierMark[idx] = -1;
+        }
+      }
+      drop.frontier.length = write;
+    }
+
+    function chooseBestFrontierPosition(drop) {
+      let bestPos = 0; let bestCost = Infinity;
+      const count = Math.min(FRONTIER_SAMPLE_COUNT, drop.frontier.length);
+      const stride = Math.max(1, Math.floor(drop.frontier.length / count));
+      const offset = (tick + drop.id * 7) % Math.max(1, stride);
+      const evaluated = new Set();
+      for (let i = 0; i < count; i++) {
+        const pos = (offset + i * stride) % drop.frontier.length;
+        evaluated.add(pos);
+        const idx = drop.frontier[pos];
+        const cost = growthCost(drop, idx);
+        if (cost < bestCost) { bestCost = cost; bestPos = pos; }
+      }
+      const phaseRadius = phaseRadiusCells(drop);
+      const underfilledThreshold = Math.max(0.8, phaseRadius - 1.1);
+      const sectorStride = Math.max(1, Math.floor(drop.frontier.length / Math.max(1, UNDERFILLED_SECTOR_SAMPLE_COUNT * 3)));
+      const sectorOffset = (tick * 3 + drop.id * 11) % Math.max(1, sectorStride);
+      let sectorSamples = 0;
+      for (let i = 0; i < drop.frontier.length && sectorSamples < UNDERFILLED_SECTOR_SAMPLE_COUNT; i += sectorStride) {
+        const pos = (sectorOffset + i) % drop.frontier.length;
+        if (evaluated.has(pos)) continue;
+        const idx = drop.frontier[pos];
+        const x = cellX(idx); const y = cellY(idx);
+        const sector = sectorForCell(drop, x, y);
+        if (drop.sectorMaxRadius[sector] > underfilledThreshold && drop.sectorClaims[sector] > 0) continue;
+        sectorSamples++;
+        const cost = growthCost(drop, idx) - 0.24;
+        if (cost < bestCost) { bestCost = cost; bestPos = pos; }
+      }
+      return bestPos;
+    }
+
+    function growthCost(drop, idx) {
+      const x = cellX(idx); const y = cellY(idx);
+      const distance = distanceFromSeed(drop, x, y);
+      const phaseRadius = phaseRadiusCells(drop);
+      const matureT = constrain(drop.claimedAreaCells / Math.max(1, drop.targetAreaCells), 0, 1);
+      const radialErrorCost = Math.abs(distance - phaseRadius) * 1.24;
+      const outsideLead = Math.max(0, distance - (phaseRadius + RING_LEAD_CELLS));
+      const overshoot = Math.max(0, distance - drop.maxAllowedRadiusCells);
+      const ringBandCost = outsideLead * outsideLead * 1.9 + overshoot * overshoot * 5.2;
+      const sector = sectorForCell(drop, x, y);
+      const sectorTargetRadius = sectorBalanceTargetRadius(drop);
+      const sectorLag = Math.max(0, sectorTargetRadius - drop.sectorMaxRadius[sector]);
+      const sectorAreaLag = Math.max(0, averageOpenSectorClaims(drop) - drop.sectorClaims[sector]);
+      const angularBalanceCost = drop.sectorHasFrontier[sector]
+        ? -(sectorLag * 0.92 + Math.min(2.2, sectorAreaLag * 0.06))
+        : 0;
+      const support = neighborSupport(drop.id, x, y);
+      const orthogonalSupport = hasOrthogonalSupport(drop.id, x, y);
+      const compactnessCost = (8 - support) * 0.18 + (orthogonalSupport ? 0 : 1.05);
+      const innerFillBonus = distance < phaseRadius - INNER_FILL_SLACK_CELLS && support >= 2 ? -0.76 : 0;
+      const obstacleContactCost = obstacleContactScore(drop.id, x, y, matureT);
+      const organicNoise = (grainCost[idx] - 0.5) * (0.18 + matureT * 0.18) +
+        (noise(x * 0.21, y * 0.21, drop.seed) - 0.5) * (0.2 + matureT * 0.28);
+      const jitter = deterministicJitter(idx, drop.id) * 0.045;
+      return radialErrorCost + ringBandCost + angularBalanceCost + compactnessCost +
+        innerFillBonus + obstacleContactCost + organicNoise + jitter;
+    }
+
+    function distanceFromSeed(drop, x, y) {
+      const dx = x - drop.seedX; const dy = y - drop.seedY;
+      return Math.sqrt(dx * dx + dy * dy);
+    }
+    function sectorForCell(drop, x, y) {
+      const angle = Math.atan2(y - drop.seedY, x - drop.seedX) + Math.PI;
+      return Math.min(SECTOR_COUNT - 1, Math.floor(angle / (Math.PI * 2) * SECTOR_COUNT));
+    }
+    function phaseRadiusCells(drop) {
+      const lookahead = Math.min(CLAIMS_PER_DROP_PER_FRAME * 1.5, Math.max(0, drop.targetAreaCells - drop.claimedAreaCells));
+      return Math.sqrt((drop.claimedAreaCells + lookahead) / Math.PI);
+    }
+    function currentEquivalentRadiusCells(drop) {
+      return Math.sqrt(drop.claimedAreaCells / Math.PI);
+    }
+    function updateDropObstacleState(drop) {
+      drop.sectorHasFrontier.fill(0);
+      for (const idx of drop.frontier) {
+        if (owner[idx] !== -1) continue;
+        drop.sectorHasFrontier[sectorForCell(drop, cellX(idx), cellY(idx))] = 1;
+      }
+      let open = 0;
+      for (let i = 0; i < SECTOR_COUNT; i++) open += drop.sectorHasFrontier[i];
+      drop.openSectorCount = open;
+      drop.blockedSectorRatio = 1 - open / SECTOR_COUNT;
+    }
+    function sectorBalanceTargetRadius(drop) {
+      let total = 0; let count = 0;
+      const phase = phaseRadiusCells(drop);
+      for (let i = 0; i < SECTOR_COUNT; i++) {
+        if (!drop.sectorHasFrontier[i] && drop.sectorMaxRadius[i] < phase * 0.72) continue;
+        total += drop.sectorMaxRadius[i]; count++;
+      }
+      return count > 0 ? Math.min(phase, total / count + 0.85) : phase;
+    }
+    function averageOpenSectorClaims(drop) {
+      let total = 0; let count = 0;
+      for (let i = 0; i < SECTOR_COUNT; i++) {
+        if (!drop.sectorHasFrontier[i] && drop.sectorClaims[i] === 0) continue;
+        total += drop.sectorClaims[i]; count++;
+      }
+      return count > 0 ? total / count : 0;
+    }
+    function obstacleContactScore(dropId, x, y, matureT) {
+      let contacts = 0;
+      for (const [dx, dy] of NEIGHBORS_8) {
+        const nx = x + dx; const ny = y + dy;
+        if (!inGrid(nx, ny)) { contacts++; continue; }
+        const neighborOwner = owner[indexAt(nx, ny)];
+        if (neighborOwner !== -1 && neighborOwner !== dropId) contacts++;
+      }
+      if (contacts === 0) return 0;
+      return matureT > 0.22 ? -Math.min(0.58, contacts * 0.08 * matureT) : contacts * 0.11;
+    }
+    function deterministicJitter(idx, dropId) {
+      const n = (idx * 1103515245 + dropId * 12345 + 0x9e3779b9) >>> 0;
+      return (n & 255) / 255;
+    }
+    function neighborSupport(dropId, x, y) {
+      let count = 0;
+      for (const [dx, dy] of NEIGHBORS_8) {
+        const nx = x + dx; const ny = y + dy;
+        if (inGrid(nx, ny) && owner[indexAt(nx, ny)] === dropId) count++;
+      }
+      return count;
+    }
+    function hasOrthogonalSupport(dropId, x, y) {
+      return (inGrid(x - 1, y) && owner[indexAt(x - 1, y)] === dropId) ||
+        (inGrid(x + 1, y) && owner[indexAt(x + 1, y)] === dropId) ||
+        (inGrid(x, y - 1) && owner[indexAt(x, y - 1)] === dropId) ||
+        (inGrid(x, y + 1) && owner[indexAt(x, y + 1)] === dropId);
+    }
+
+    // ---- Bridge: pack ownership into RGBA8 image, upload to GPU --------------
+    // Y orientation: vUv.y in the shader is bottom-up (clip-space convention).
+    // p5 uploads p5.Image bytes with UNPACK_FLIP_Y_WEBGL=true, which flips a
+    // top-down pixel buffer to a bottom-up GL texture. Net effect: writing
+    // pixels in natural JS top-down order makes vUv.y=1 (canvas top) sample
+    // pixel row 0 (grid top row). We match drop center y in the geom uniform
+    // by packing 1-y, which puts both worlds in the same orientation.
+    function uploadOwnershipTexture() {
+      if (!ownerImage) return;
+      ownerImage.loadPixels();
+      const px = ownerImage.pixels;
+      for (let y = 0; y < gridH; y++) {
+        const row = y * gridW;
+        for (let x = 0; x < gridW; x++) {
+          const o = owner[row + x];
+          const byte = (o + 1) & 0xff;   // 0 = empty, 1..32 = drop id+1
+          const i4 = (row + x) * 4;
+          px[i4]     = byte;             // R: owner id+1
+          px[i4 + 1] = 0;
+          px[i4 + 2] = 0;
+          px[i4 + 3] = 255;
+        }
+      }
+      ownerImage.updatePixels();
+
+      // Force NEAREST filtering once: bilinear averages adjacent owner ids,
+      // which would corrupt id lookups. The shader also snaps to cell centers
+      // as a belt-and-braces measure, so this is just an optimisation.
+      if (!ownerTexInterpolationApplied && currentCanvas && currentCanvas._renderer) {
+        try {
+          const tex = currentCanvas._renderer.getTexture(ownerImage);
+          if (tex && tex.setInterpolation) {
+            tex.setInterpolation(NEAREST, NEAREST);
+            ownerTexInterpolationApplied = true;
+          }
+        } catch (_) { /* safe to ignore — cell-snap in shader still works */ }
+      }
+    }
+
+    function renderShader() {
+      uploadOwnershipTexture();
+
+      const palette = PALETTES[currentPaletteIndex];
+      shader(theShader);
+      theShader.setUniform('u_resolution', [width, height]);
+      theShader.setUniform('u_gridSize', [gridW, gridH]);
+      theShader.setUniform('u_dropCount', Math.min(drops.length, MAX_DROPS));
+      theShader.setUniform('u_surface', hexToRgb01(palette.surface));
+      theShader.setUniform('u_grain', hexToRgb01(palette.grain));
+      theShader.setUniform('u_accent', hexToRgb01(palette.accent));
+      theShader.setUniform('u_ownership', ownerImage);
+
+      const geom = []; const fill = []; const rim = [];
+      for (let i = 0; i < MAX_DROPS; i++) {
+        const drop = drops[i];
+        if (drop) {
+          // Drop center is already in cell coords; use seed cell as the
+          // visible center for stain bloom (stable through growth).
+          const cx01 = (drop.seedX + 0.5) * cellSize / width;
+          const cy01 = (drop.seedY + 0.5) * cellSize / height;
+          const radiusPx = currentEquivalentRadiusCells(drop) * cellSize;
+          const targetRadiusPx = drop.targetRadiusCells * cellSize;
+          geom.push(cx01, 1 - cy01, radiusPx, drop.seed);
+          fill.push(...hexToRgb01(drop.color), drop.ageLayer);
+          rim.push(...hexToRgb01(drop.rimColor), targetRadiusPx);
+        } else {
+          geom.push(0, 0, 0, 0);
+          fill.push(0, 0, 0, 0);
+          rim.push(0, 0, 0, 0);
+        }
+      }
+      theShader.setUniform('u_dropGeom', geom);
+      theShader.setUniform('u_dropColor', fill);
+      theShader.setUniform('u_dropRim', rim);
+
+      beginShape();
+      vertex(-1, -1, 0);
+      vertex( 1, -1, 0);
+      vertex( 1,  1, 0);
+      vertex(-1,  1, 0);
+      endShape(CLOSE);
+    }
+
+    // 2D fallback: cheap, functional, matches the SDF prototype's fallback so
+    // the page is interactive even when WebGL/shaders fail to compile.
+    function renderFallback2D() {
+      const palette = PALETTES[currentPaletteIndex];
+      resetMatrix && resetMatrix();
+      clear();
+      background(palette.surface);
+      noStroke();
+      // Render owned cells as solid rectangles. Crude but proves the sim half
+      // is alive even if the surface treatment can't run.
+      for (const drop of drops) {
+        const c = color(drop.color);
+        fill(red(c), green(c), blue(c), 220);
+        for (let i = 0; i < owner.length; i++) {
+          if (owner[i] !== drop.id) continue;
+          const x = cellX(i) * cellSize;
+          const y = cellY(i) * cellSize;
+          rect(x, y, cellSize + 1, cellSize + 1);
+        }
+      }
+    }
+
+    // ---- Input (matches shader-sdf's normalized pointer flow) ---------------
+    function attachPointerEvents(canvas) {
+      canvas.addEventListener('pointerdown', onPointerDown, { passive: false });
+      canvas.addEventListener('pointermove', onPointerMove, { passive: false });
+      if (controlsAttached) return;
+      controlsAttached = true;
+      window.addEventListener('pointerup', onPointerUp, { passive: false });
+      window.addEventListener('pointercancel', onPointerCancel, { passive: false });
+
+      document.getElementById('palette-zone').addEventListener('pointerdown', (event) => {
+        event.preventDefault();
+        cyclePalette();
+      }, { passive: false });
+      document.getElementById('reset-zone').addEventListener('pointerdown', (event) => {
+        event.preventDefault();
+        resetCanvas();
+      }, { passive: false });
+    }
+
+    function onPointerDown(event) {
+      if (event.target.classList && event.target.classList.contains('tap-zone')) return;
+      event.preventDefault();
+      const pointer = pointerToScreen(event);
+      if (!pointer) return;
+      activePress = {
+        pointerId: event.pointerId,
+        startedAtMs: millis(),
+        x: pointer.x,
+        y: pointer.y,
+        paletteIndex: currentPaletteIndex,
+        pigmentIndex: dropId
+      };
+      try { event.currentTarget.setPointerCapture(event.pointerId); } catch (_) {}
+      lastMs = millis();
+      settled = false;
+      dirty = true;
+      loop();
+    }
+
+    function onPointerMove(event) {
+      if (!activePress || event.pointerId !== activePress.pointerId) return;
+      event.preventDefault();
+      // Drop seed stays where the press began. Holding controls paint amount,
+      // not drag — same gesture model as shader-sdf prototype.
+    }
+
+    function onPointerUp(event) {
+      if (!activePress || event.pointerId !== activePress.pointerId) return;
+      event.preventDefault();
+      const holdMs = millis() - activePress.startedAtMs;
+      const radiusPx = radiusForHold(holdMs);
+      // Convert radius (px, capped to canvas edge) → area cells for raster sim.
+      const cappedPx = capRadiusToCanvas(activePress.x / width, activePress.y / height, radiusPx);
+      const targetAreaCells = Math.max(
+        MIN_TARGET_AREA_CELLS,
+        Math.round((Math.PI * cappedPx * cappedPx) / (cellSize * cellSize))
+      );
+      createDropAt(activePress.x, activePress.y, targetAreaCells, activePress.paletteIndex, activePress.pigmentIndex);
+      activePress = null;
+      settled = false;
+      dirty = true;
+      loop();
+      releasePointerCapture(event);
+    }
+
+    function onPointerCancel(event) {
+      if (!activePress || event.pointerId !== activePress.pointerId) return;
+      event.preventDefault();
+      activePress = null;
+      releasePointerCapture(event);
+      dirty = true;
+    }
+
+    function radiusForHold(durationMs) {
+      const holdT = constrain((durationMs - MIN_HOLD_MS) / (MAX_HOLD_MS - MIN_HOLD_MS), 0, 1);
+      const eased = 1 - Math.pow(1 - holdT, 3);
+      const area = lerp(MIN_DROP_AREA, MAX_DROP_AREA, eased);
+      return Math.sqrt(area / Math.PI);
+    }
+
+    function capRadiusToCanvas(x01, y01, radius) {
+      const nearestEdgePx = Math.min(x01 * width, (1 - x01) * width, y01 * height, (1 - y01) * height);
+      return Math.min(radius, Math.max(MIN_EDGE_LIMIT_RADIUS, nearestEdgePx - EDGE_MARGIN_PX));
+    }
+
+    function pointerToScreen(event) {
+      const rect = (event.currentTarget && event.currentTarget.getBoundingClientRect)
+        ? event.currentTarget.getBoundingClientRect()
+        : document.querySelector('canvas').getBoundingClientRect();
+      const x = constrain(event.clientX - rect.left, 0, width - 1);
+      const y = constrain(event.clientY - rect.top, 0, height - 1);
+      return { x, y };
+    }
+
+    function releasePointerCapture(event) {
+      const canvas = document.querySelector('canvas');
+      try { canvas.releasePointerCapture(event.pointerId); } catch (_) {}
+    }
+
+    function cyclePalette() {
+      currentPaletteIndex = (currentPaletteIndex + 1) % PALETTES.length;
+      updateHint();
+      dirty = true;
+      loop();
+    }
+
+    function resetCanvas() {
+      resetSimulation();
+      updateHint();
+      loop();
+    }
+
+    function keyPressed() {
+      if (key === 'p' || key === 'P') cyclePalette();
+      if (key === 'r' || key === 'R' || keyCode === ESCAPE) resetCanvas();
+    }
+
+    function windowResized() {
+      resizeCanvas(windowWidth, windowHeight);
+      // Resizing rebuilds the grid; previously-claimed cells are lost (this is
+      // also how raster-ownership behaves).
+      resetSimulation();
+      loop();
+    }
+
+    function updateHint() {
+      const modeLabel = rendererMode === 'fallback2d' ? '2D fallback' : 'shader';
+      hintEl.textContent = `hold to drop · P palette · R reset · ${PALETTES[currentPaletteIndex].name} · ${modeLabel}`;
+    }
+
+    function hexToRgb01(hex) {
+      const clean = hex.replace('#', '');
+      const n = parseInt(clean, 16);
+      return [((n >> 16) & 255) / 255, ((n >> 8) & 255) / 255, (n & 255) / 255];
+    }
+
+    loadP5AfterDiagnostics();
+  </script>
+</body>
+</html>
