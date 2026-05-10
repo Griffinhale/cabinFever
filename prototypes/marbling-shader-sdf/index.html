@@ -332,6 +332,13 @@
         float secondScore = 1.0e6;
         float bestSdf = 1.0e6;
         int owner = -1;
+        // GLSL ES 1.00 strict (ANGLE) rejects post-loop indexing of uniform
+        // arrays with a runtime int. Capture the matched owner data inside
+        // the loop where the index is the loop symbol i, then read the
+        // captured locals after the loop. Visual no-op.
+        vec4 bestGeom = vec4(0.0);
+        vec4 bestColor = vec4(0.0);
+        vec4 bestRim = vec4(0.0);
 
         for (int i = 0; i < MAX_DROPS; i++) {
           if (i >= u_dropCount) { break; }
@@ -343,6 +350,9 @@
             secondScore = bestScore;
             bestScore = score;
             bestSdf = sdf;
+            bestGeom = geom;
+            bestColor = u_dropColor[i];
+            bestRim = u_dropRim[i];
             owner = i;
           } else if (score < secondScore) {
             secondScore = score;
@@ -350,9 +360,9 @@
         }
 
         if (owner >= 0 && bestSdf < 5.5) {
-          vec4 geom = u_dropGeom[owner];
-          vec4 fillData = u_dropColor[owner];
-          vec4 rimData = u_dropRim[owner];
+          vec4 geom = bestGeom;
+          vec4 fillData = bestColor;
+          vec4 rimData = bestRim;
           vec3 fill = fillData.rgb;
           vec3 rim = rimData.rgb;
           float radius = max(geom.z, 1.0);
