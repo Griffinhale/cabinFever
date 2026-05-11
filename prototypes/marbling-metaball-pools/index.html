@@ -200,6 +200,7 @@
     let rakeCut = [];
     let rakePaintId = [];
     let rakePaintStrength = [];
+    let rakeStamp = [];
     let raking = false;
     let lastRakePoint = null;
     let lastRakeRawPoint = null;
@@ -335,38 +336,42 @@
         for (let gy = rect.y0; gy < rect.y1; gy++) {
           for (let gx = rect.x0; gx < rect.x1; gx++) {
             const idx = gx + gy * fieldCols;
-            const x = gx * cellSize + cellSize * 0.5 + (rakeDx[idx] || 0);
-            const y = gy * cellSize + cellSize * 0.5 + (rakeDy[idx] || 0);
-            let best = -1;
-            let bestField = 0;
-            let bestAge = -1;
-            let secondField = 0;
-            for (const i of candidates) {
-              const pool = renderPools[i];
-              if (!pool.containsPoint(x, y)) continue;
-              const f = pool.fieldAt(x, y);
-              if (f > secondField) secondField = f;
-              // Ownership/clipping strategy: each cell can have exactly one owner.
-              // Strongest normalized pool field wins above threshold; near-ties go
-              // to the newer pool, making fresh pigment read as sitting on top while
-              // preventing different pigment identities from summing into one blob.
-              const newerTie = Math.abs(f - bestField) < 0.045 && pool.createdAt > bestAge;
-              if (f > bestField || (f > FIELD_THRESHOLD && newerTie)) {
-                secondField = bestField;
-                bestField = f;
-                best = i;
-                bestAge = pool.createdAt;
+            const baseX = gx * cellSize + cellSize * 0.5;
+            const baseY = gy * cellSize + cellSize * 0.5;
+            const stamp = rakeStamp[idx] || 0;
+            const sampled = solveFieldAt(renderPools, candidates, baseX + (rakeDx[idx] || 0), baseY + (rakeDy[idx] || 0));
+            let best = sampled.best;
+            let bestField = sampled.bestField;
+            let bestAge = sampled.bestAge;
+            let secondField = sampled.secondField;
+
+            // Rake masks are edits to the material that existed when the rake was
+            // dragged. Fresh drops/previews should be able to sit on top of those
+            // edits, so if a newer pool owns this unwarped cell, bypass the old
+            // coordinate displacement / cut / paint override for this cell.
+            let rakeAffectsCell = stamp > 0;
+            if (rakeAffectsCell) {
+              const fresh = solveFreshFieldAt(renderPools, candidates, baseX, baseY, stamp);
+              if (fresh.best >= 0) {
+                best = fresh.best;
+                bestField = fresh.bestField;
+                bestAge = fresh.bestAge;
+                secondField = fresh.secondField;
+                rakeAffectsCell = false;
               }
             }
-            const cut = rakeCut[idx] || 0;
-            if (cut > 0) bestField *= 1 - constrain(cut, 0, 0.96);
-            const paintId = rakePaintId[idx] || 0;
-            const paintIndex = paintId ? poolIndexById.get(paintId) : -1;
-            if (paintIndex >= 0) {
-              const paintStrength = constrain(rakePaintStrength[idx] || 0, 0, 1);
-              best = paintIndex;
-              bestField = FIELD_THRESHOLD + FIELD_RIM_BAND * (0.38 + 0.7 * paintStrength);
-              secondField = 0;
+
+            if (rakeAffectsCell) {
+              const cut = rakeCut[idx] || 0;
+              if (cut > 0) bestField *= 1 - constrain(cut, 0, 0.96);
+              const paintId = rakePaintId[idx] || 0;
+              const paintIndex = paintId ? poolIndexById.get(paintId) : -1;
+              if (paintIndex >= 0) {
+                const paintStrength = constrain(rakePaintStrength[idx] || 0, 0, 1);
+                best = paintIndex;
+                bestField = FIELD_THRESHOLD + FIELD_RIM_BAND * (0.38 + 0.7 * paintStrength);
+                secondField = 0;
+              }
             }
             field[idx] = bestField >= FIELD_THRESHOLD
               ? { owner: best, strength: bestField, margin: bestField - secondField }
@@ -374,6 +379,53 @@
           }
         }
       }
+    }
+
+    function solveFieldAt(renderPools, candidates, x, y) {
+      let best = -1;
+      let bestField = 0;
+      let bestAge = -1;
+      let secondField = 0;
+      for (const i of candidates) {
+        const pool = renderPools[i];
+        if (!pool.containsPoint(x, y)) continue;
+        const f = pool.fieldAt(x, y);
+        if (f > secondField) secondField = f;
+        // Ownership/clipping strategy: each cell can have exactly one owner.
+        // Strongest normalized pool field wins above threshold; near-ties go
+        // to the newer pool, making fresh pigment read as sitting on top while
+        // preventing different pigment identities from summing into one blob.
+        const newerTie = Math.abs(f - bestField) < 0.045 && pool.createdAt > bestAge;
+        if (f > bestField || (f > FIELD_THRESHOLD && newerTie)) {
+          secondField = bestField;
+          bestField = f;
+          best = i;
+          bestAge = pool.createdAt;
+        }
+      }
+      return { best, bestField, bestAge, secondField };
+    }
+
+    function solveFreshFieldAt(renderPools, candidates, x, y, stamp) {
+      let best = -1;
+      let bestField = 0;
+      let bestAge = -1;
+      let secondField = 0;
+      for (const i of candidates) {
+        const pool = renderPools[i];
+        if (pool.createdAt < stamp || !pool.containsPoint(x, y)) continue;
+        const f = pool.fieldAt(x, y);
+        if (f < FIELD_THRESHOLD) continue;
+        if (f > secondField) secondField = f;
+        const newerTie = Math.abs(f - bestField) < 0.045 && pool.createdAt > bestAge;
+        if (f > bestField || newerTie) {
+          secondField = bestField;
+          bestField = f;
+          best = i;
+          bestAge = pool.createdAt;
+        }
+      }
+      return { best, bestField, bestAge, secondField };
     }
 
     function hasDifferentNeighbor(gx, gy, owner) {
@@ -468,7 +520,8 @@
         dy: rakeDy,
         cut: rakeCut,
         paintId: rakePaintId,
-        paintStrength: rakePaintStrength
+        paintStrength: rakePaintStrength,
+        stamp: rakeStamp
       };
     }
 
@@ -479,6 +532,7 @@
       rakeCut = new Array(len).fill(0);
       rakePaintId = new Array(len).fill(0);
       rakePaintStrength = new Array(len).fill(0);
+      rakeStamp = new Array(len).fill(0);
       if (!previous || !previous.cols || !previous.rows || !previous.dx) return;
 
       for (let gy = 0; gy < fieldRows; gy++) {
@@ -494,6 +548,7 @@
           rakeCut[idx] = previous.cut ? previous.cut[oldIdx] || 0 : 0;
           rakePaintId[idx] = previous.paintId ? previous.paintId[oldIdx] || 0 : 0;
           rakePaintStrength[idx] = previous.paintStrength ? previous.paintStrength[oldIdx] || 0 : 0;
+          rakeStamp[idx] = previous.stamp ? previous.stamp[oldIdx] || 0 : 0;
         }
       }
     }
@@ -505,6 +560,7 @@
       rakeCut = new Array(len).fill(0);
       rakePaintId = new Array(len).fill(0);
       rakePaintStrength = new Array(len).fill(0);
+      rakeStamp = new Array(len).fill(0);
       raking = false;
       lastRakePoint = null;
       lastRakeRawPoint = null;
@@ -887,6 +943,7 @@
 
     function applySingleRakeTooth(x0, y0, x1, y1, len, ux, uy) {
       const cellSize = quality.cellSize;
+      const stamp = millis();
       const editPad = RAKE_RADIUS + cellSize * 2;
       const dirtyPad = RAKE_RADIUS + RAKE_MAX_OFFSET + cellSize * 2;
       const rect = clampRect({
@@ -925,6 +982,7 @@
             if (!cell || cell.owner < 0) continue;
             rakeCut[idx] = max(rakeCut[idx] || 0, falloff * RAKE_CUT_STRENGTH);
           }
+          rakeStamp[idx] = stamp;
 
           if (!cell || cell.owner < 0) continue;
 
