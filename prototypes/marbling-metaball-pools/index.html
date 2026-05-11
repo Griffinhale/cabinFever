@@ -118,11 +118,13 @@
     const RESET_HOLD_MS = 750;
     const CORNER_ACTION_SIZE = 72;
     const SETTLE_EPSILON = 0.985;
-    const RAKE_RADIUS = 10;
+    const RAKE_RADIUS = 12;
     const RAKE_TOOTH_COUNT = 4;
-    const RAKE_TOOTH_SPACING = 18;
-    const RAKE_STRENGTH = 0.58;
-    const RAKE_MAX_OFFSET = 78;
+    const RAKE_TOOTH_SPACING = 16;
+    const RAKE_STEP = 5;
+    const RAKE_SMOOTHING = 0.42;
+    const RAKE_STRENGTH = 0.96;
+    const RAKE_MAX_OFFSET = 92;
     const RAKE_MIN_MOVE = 3;
 
     const PALETTES = [
@@ -196,6 +198,8 @@
     let rakeDy = [];
     let raking = false;
     let lastRakePoint = null;
+    let lastRakeRawPoint = null;
+    let rakeDirection = null;
     let dirtyRects = [];
     let fullFieldDirty = true;
     let paperLayer;
@@ -443,6 +447,8 @@
       rakeDy = new Array(len).fill(0);
       raking = false;
       lastRakePoint = null;
+      lastRakeRawPoint = null;
+      rakeDirection = null;
     }
 
     function markFullFieldDirty() {
@@ -715,36 +721,82 @@
       cancelResetHold();
       activePress = null;
       raking = true;
-      lastRakePoint = { x: constrain(x, 0, width), y: constrain(y, 0, height) };
+      const point = { x: constrain(x, 0, width), y: constrain(y, 0, height) };
+      lastRakePoint = point;
+      lastRakeRawPoint = point;
+      rakeDirection = null;
     }
 
     function finishRake() {
       if (!raking) return false;
       raking = false;
       lastRakePoint = null;
+      lastRakeRawPoint = null;
+      rakeDirection = null;
       dirty = true;
       return true;
     }
 
     function updateRake(x, y) {
       if (!raking || !lastRakePoint) return;
-      const next = { x: constrain(x, 0, width), y: constrain(y, 0, height) };
-      applyRasterRake(lastRakePoint.x, lastRakePoint.y, next.x, next.y);
-      lastRakePoint = next;
+      const raw = { x: constrain(x, 0, width), y: constrain(y, 0, height) };
+      const smooth = smoothRakePoint(raw);
+      const dx = smooth.x - lastRakePoint.x;
+      const dy = smooth.y - lastRakePoint.y;
+      const len = sqrt(dx * dx + dy * dy);
+      if (len < RAKE_MIN_MOVE) return;
+
+      updateRakeDirection(dx, dy, len);
+      const steps = max(1, ceil(len / RAKE_STEP));
+      let from = lastRakePoint;
+      for (let i = 1; i <= steps; i++) {
+        const t = i / steps;
+        const to = {
+          x: lerp(lastRakePoint.x, smooth.x, t),
+          y: lerp(lastRakePoint.y, smooth.y, t)
+        };
+        applyRasterRake(from.x, from.y, to.x, to.y, rakeDirection);
+        from = to;
+      }
+      lastRakePoint = smooth;
+      lastRakeRawPoint = raw;
+    }
+
+    function smoothRakePoint(raw) {
+      if (!lastRakeRawPoint || !lastRakePoint) return raw;
+      return {
+        x: lerp(lastRakePoint.x, raw.x, RAKE_SMOOTHING),
+        y: lerp(lastRakePoint.y, raw.y, RAKE_SMOOTHING)
+      };
+    }
+
+    function updateRakeDirection(dx, dy, len) {
+      const ux = dx / len;
+      const uy = dy / len;
+      if (!rakeDirection) {
+        rakeDirection = { x: ux, y: uy };
+        return;
+      }
+      const blendedX = lerp(rakeDirection.x, ux, 0.28);
+      const blendedY = lerp(rakeDirection.y, uy, 0.28);
+      const blendedLen = sqrt(blendedX * blendedX + blendedY * blendedY) || 1;
+      rakeDirection = { x: blendedX / blendedLen, y: blendedY / blendedLen };
     }
 
     // Raster-space rake prototype: instead of moving metaball lobes, a drag writes
     // persistent per-cell coordinate offsets. The next field solve samples the
     // same pools through those offsets, so settled pigment visually pulls apart
     // while the existing owner/rim renderer still controls the borders.
-    function applyRasterRake(x0, y0, x1, y1) {
+    function applyRasterRake(x0, y0, x1, y1, direction) {
       const dx = x1 - x0;
       const dy = y1 - y0;
       const len = sqrt(dx * dx + dy * dy);
-      if (len < RAKE_MIN_MOVE || fieldCols <= 0 || fieldRows <= 0) return;
+      if (len < 0.25 || fieldCols <= 0 || fieldRows <= 0) return;
 
-      const nx = -dy / len;
-      const ny = dx / len;
+      const ux = direction ? direction.x : dx / len;
+      const uy = direction ? direction.y : dy / len;
+      const nx = -uy;
+      const ny = ux;
       const start = -(RAKE_TOOTH_COUNT - 1) * 0.5;
       for (let i = 0; i < RAKE_TOOTH_COUNT; i++) {
         const offset = (start + i) * RAKE_TOOTH_SPACING;
@@ -753,21 +805,28 @@
           y0 + ny * offset,
           x1 + nx * offset,
           y1 + ny * offset,
-          len,
-          dx / len,
-          dy / len
+          max(len, RAKE_STEP),
+          ux,
+          uy
         );
       }
     }
 
     function applySingleRakeTooth(x0, y0, x1, y1, len, ux, uy) {
       const cellSize = quality.cellSize;
-      const pad = RAKE_RADIUS + RAKE_MAX_OFFSET + cellSize * 2;
+      const editPad = RAKE_RADIUS + cellSize * 2;
+      const dirtyPad = RAKE_RADIUS + RAKE_MAX_OFFSET + cellSize * 2;
       const rect = clampRect({
-        x0: floor((min(x0, x1) - pad) / cellSize),
-        y0: floor((min(y0, y1) - pad) / cellSize),
-        x1: ceil((max(x0, x1) + pad) / cellSize),
-        y1: ceil((max(y0, y1) + pad) / cellSize)
+        x0: floor((min(x0, x1) - editPad) / cellSize),
+        y0: floor((min(y0, y1) - editPad) / cellSize),
+        x1: ceil((max(x0, x1) + editPad) / cellSize),
+        y1: ceil((max(y0, y1) + editPad) / cellSize)
+      });
+      const dirtyRect = clampRect({
+        x0: floor((min(x0, x1) - dirtyPad) / cellSize),
+        y0: floor((min(y0, y1) - dirtyPad) / cellSize),
+        x1: ceil((max(x0, x1) + dirtyPad) / cellSize),
+        y1: ceil((max(y0, y1) + dirtyPad) / cellSize)
       });
       if (!rect) return;
 
@@ -797,7 +856,7 @@
         }
       }
 
-      markDirtyRect(rect);
+      if (dirtyRect) markDirtyRect(dirtyRect);
     }
 
     function smoothFalloff(t) {
