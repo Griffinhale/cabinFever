@@ -147,6 +147,9 @@
     const DENSITY_DAMPING = 0.995;
     const BORDER_VELOCITY_SCALE = 0.08;
     const BORDER_DENSITY_BLEND = 0.65;
+    const ACTIVE_RAKE_BORDER_PIN_SCALE = 0.28;
+    const BORDER_DRAG_CELL_STEPS = 3;
+    const BORDER_DRAG_DENSITY = 0.42;
     const MAX_DENSITY_VISUAL = 2.4;
     const MIN_VISIBLE_DENSITY = 0.05;
     const DENSITY_COMPRESSION = 0.20;
@@ -462,7 +465,7 @@
             const cell = field[idx];
             const pool = cell && cell.owner >= 0 ? renderPools[cell.owner] : null;
             if (!pool || pool.preview || pool.id < 0 || cell.strength < FIELD_THRESHOLD) {
-              if (!showPreview) clearFluidCell(idx);
+              if (!showPreview && !preserveRakedFluidCell(idx, renderPools)) clearFluidCell(idx);
               continue;
             }
 
@@ -489,6 +492,17 @@
           }
         }
       }
+    }
+
+    function preserveRakedFluidCell(idx, renderPools) {
+      if (!fluidEverRaked || fluidOwners[idx] < 0 || fluidMask[idx] <= 0 || fluidDensity[idx] < MIN_VISIBLE_DENSITY) return false;
+      const pool = poolById(fluidOwners[idx], renderPools);
+      if (!pool || pool.preview) return false;
+      fluidMask[idx] = min(1, fluidMask[idx]);
+      fluidBorderPin[idx] = max(fluidBorderPin[idx] || 0, 0.72);
+      fluidStrength[idx] = max(fluidStrength[idx] || 0, FIELD_THRESHOLD + 0.01);
+      fluidDensity[idx] *= 0.998;
+      return true;
     }
 
     function clearFluidCell(idx) {
@@ -1141,6 +1155,10 @@
       return activeRakeSourceId <= 0 || owner === activeRakeSourceId;
     }
 
+    function activeBorderPin(pin) {
+      return activeRakeSourceId > 0 ? pin * ACTIVE_RAKE_BORDER_PIN_SCALE : pin;
+    }
+
     function injectFluidTooth(x0, y0, x1, y1, len, ux, uy, nx, ny, toothIndex, profile) {
       const cellSize = quality.cellSize;
       const editPad = profile.radius + COMB_RIDGE_OFFSET + COMB_RIDGE_WIDTH + cellSize * 2;
@@ -1172,7 +1190,8 @@
           if (ownerId !== activeRakeSourceId) continue;
           const falloff = smoothFalloff(1 - dist / profile.radius);
           const pin = constrain(fluidBorderPin[idx], 0, 1);
-          const force = profile.strength * falloff * lerp(1, BORDER_VELOCITY_SCALE, pin);
+          const activePin = activeBorderPin(pin);
+          const force = profile.strength * falloff * lerp(1, BORDER_VELOCITY_SCALE, activePin);
           if (force <= 0.01) continue;
           const jitter = (stableNoise(gx + toothIndex * 19, gy - toothIndex * 23, 4219) - 0.5) * 0.42;
           fluidVx[idx] += ux * force + nx * force * jitter;
@@ -1183,7 +1202,7 @@
           const ridgeB = Math.exp(-((signed + COMB_RIDGE_OFFSET) * (signed + COMB_RIDGE_OFFSET)) / (2 * COMB_RIDGE_WIDTH * COMB_RIDGE_WIDTH));
           const ridge = max(ridgeA, ridgeB);
           const lane = centerLane;
-          const stamp = falloff * lerp(1, 0.18, pin) * profile.lineMultiplier;
+          const stamp = falloff * lerp(1, 0.18, activePin) * profile.lineMultiplier;
           fluidLine[idx] = constrain(fluidLine[idx] + ridge * COMB_LINE_STRENGTH * stamp - lane * COMB_LINE_STRENGTH * stamp, -1.4, 1.8);
           fluidRidge[idx] = constrain(fluidRidge[idx] + ridge * COMB_RIDGE_STRENGTH * stamp, 0, 2.0);
           fluidStretch[idx] = constrain(fluidStretch[idx] + lane * COMB_STRETCH_STRENGTH * stamp, 0, 2.0);
@@ -1193,10 +1212,46 @@
           const deposit = ridge * 0.08 * stamp;
           const thin = lane * 0.055 * stamp;
           fluidDensity[idx] = constrain(fluidDensity[idx] + deposit - thin, 0.03, MAX_DENSITY_VISUAL * 1.25);
+          if (pin > 0.35) seedBorderDragCells(gx, gy, idx, ux, uy, nx, ny, falloff, stamp);
           touched = true;
         }
       }
       return touched ? rect : null;
+    }
+
+    function seedBorderDragCells(gx, gy, sourceIdx, ux, uy, nx, ny, falloff, stamp) {
+      const owner = fluidOwners[sourceIdx];
+      if (owner < 0 || owner !== activeRakeSourceId) return;
+      const sourceDensity = fluidDensity[sourceIdx];
+      const sourceLine = fluidLine[sourceIdx];
+      const sourceAge = fluidLineAge[sourceIdx];
+      const sourceRidge = fluidRidge[sourceIdx];
+      const sourceStretch = fluidStretch[sourceIdx];
+      for (let step = 1; step <= BORDER_DRAG_CELL_STEPS; step++) {
+        const tx = constrain(floor(gx + ux * step), 0, fieldCols - 1);
+        const ty = constrain(floor(gy + uy * step), 0, fieldRows - 1);
+        const idx = tx + ty * fieldCols;
+        if (idx === sourceIdx) continue;
+        if (fluidOwners[idx] >= 0 && fluidOwners[idx] !== owner) continue;
+        const outward = smoothFalloff(1 - (step - 1) / BORDER_DRAG_CELL_STEPS) * falloff;
+        if (outward <= 0.04) continue;
+        fluidOwners[idx] = owner;
+        fluidMask[idx] = 1;
+        fluidBorderPin[idx] = max(fluidBorderPin[idx] || 0, 0.72);
+        fluidStrength[idx] = max(fluidStrength[idx] || 0, FIELD_THRESHOLD + 0.01);
+        fluidBaseDensity[idx] = max(fluidBaseDensity[idx] || 0, 0.36);
+        fluidDensity[idx] = max(fluidDensity[idx], sourceDensity * BORDER_DRAG_DENSITY * outward);
+        fluidVx[idx] = lerp(fluidVx[idx] || 0, ux * RAKE_STRENGTH * outward, 0.55);
+        fluidVy[idx] = lerp(fluidVy[idx] || 0, uy * RAKE_STRENGTH * outward, 0.55);
+        fluidMatU[idx] = fluidMatU[sourceIdx] + ux * step + nx * 0.15;
+        fluidMatV[idx] = fluidMatV[sourceIdx] + uy * step + ny * 0.15;
+        fluidLine[idx] = lerp(fluidLine[idx] || 0, sourceLine, 0.42 * stamp);
+        fluidLineAge[idx] = max(fluidLineAge[idx] || 0, sourceAge * 0.86);
+        fluidLineDirX[idx] = ux;
+        fluidLineDirY[idx] = uy;
+        fluidRidge[idx] = max(fluidRidge[idx] || 0, sourceRidge * 0.72 * outward);
+        fluidStretch[idx] = max(fluidStretch[idx] || 0, sourceStretch * 0.72 * outward);
+      }
     }
 
     function clampVelocityToMask() {
@@ -1221,7 +1276,7 @@
             fluidVx[idx] *= -0.18;
             fluidVy[idx] *= -0.18;
           }
-          const pinDamp = lerp(1, BORDER_VELOCITY_SCALE, fluidBorderPin[idx]);
+          const pinDamp = lerp(1, BORDER_VELOCITY_SCALE, activeBorderPin(fluidBorderPin[idx]));
           fluidVx[idx] *= pinDamp;
           fluidVy[idx] *= pinDamp;
         }
@@ -1313,7 +1368,7 @@
     function dampCombFields() {
       for (let i = 0; i < fluidOwners.length; i++) {
         if (fluidOwners[i] < 0 || fluidMask[i] <= 0 || !shouldStepFluidOwner(fluidOwners[i])) continue;
-        const pin = constrain(fluidBorderPin[i], 0, 1);
+        const pin = activeBorderPin(constrain(fluidBorderPin[i], 0, 1));
         fluidLine[i] *= COMB_LINE_DECAY;
         fluidLineAge[i] *= COMB_AGE_DECAY;
         fluidRidge[i] *= 0.992;
@@ -1364,7 +1419,7 @@
     function dampAndPinFluid() {
       for (let i = 0; i < fluidOwners.length; i++) {
         if (fluidOwners[i] < 0 || fluidMask[i] <= 0 || !shouldStepFluidOwner(fluidOwners[i])) continue;
-        const pin = constrain(fluidBorderPin[i], 0, 1);
+        const pin = activeBorderPin(constrain(fluidBorderPin[i], 0, 1));
         fluidVx[i] *= VELOCITY_DAMPING * lerp(1, BORDER_VELOCITY_SCALE, pin);
         fluidVy[i] *= VELOCITY_DAMPING * lerp(1, BORDER_VELOCITY_SCALE, pin);
         if (pin > 0.05) {
