@@ -25,9 +25,8 @@ You can also open `index.html` directly in a browser, but the static server path
 
 ## Controls
 
-- Press/tap: start adding pigment at the pointer.
-- Hold: increase paint amount and target footprint.
-- Release: finalize the pigment pool; it keeps growing slowly until settled.
+- Quick tap/click: splatter several small same-color metaball droplets within a small buffer around the pointer.
+- Hold: grow one larger pigment pool at the pointer; release finalizes it and it keeps growing slowly until settled.
 - Top toolbar:
   - `drop`: hold/tap to place pigment.
   - `rake`: drag directly to comb/rake the existing pigment field.
@@ -59,13 +58,13 @@ Child lobes grow from tiny radii toward target radii. Same-pool child lobes are 
 
 The sketch renders a low-resolution field into an offscreen pigment layer, then composites that over a stable cream paper-grain layer. Round two replaced the fixed 4 px field with adaptive tiers: high uses 4 px cells, medium uses 6 px cells, and low uses 8 px cells for mobile/crowded/slow frames.
 
-The raking spike adds two persistent raster-space displacement arrays, `rakeDx[]` and `rakeDy[]`, parallel to the field grid. The top toolbar's `rake` mode, Shift-drag, or two-finger drag writes offsets into interior cells near the stroke. The next field solve samples each metaball pool at the displaced coordinates, giving a first-pass "metaball turns into raster-deformable substrate" behavior without changing lobe geometry. Border cells and owner seams receive much weaker rake force so silhouettes remain more recognizable.
+The raking spike adds two persistent raster-space displacement arrays, `rakeDx[]` and `rakeDy[]`, parallel to the field grid. The top toolbar's `rake` mode, Shift-drag, or two-finger drag writes offsets into interior cells near the stroke. The stroke is applied as a 4-tooth comb, so one drag deforms the same metaball in several parallel channels at once. The next field solve samples each metaball pool at the displaced coordinates, giving a first-pass "metaball turns into raster-deformable substrate" behavior without changing lobe geometry. Border cells and owner seams receive much weaker rake force so silhouettes remain more recognizable.
 
 ## Hold mapping
 
 Hold duration is clamped from a quick-tap minimum to a capped long hold. Duration is eased, mapped to target area/mass, then split across a smaller 3-8 child lobe budget, with an optional 9th lobe only for low-complexity high-quality scenes:
 
-- quick tap: minimum visible small pool
+- quick tap: small randomized splatter cluster
 - medium hold: broader pool with more lobes
 - long hold: larger footprint with richer asymmetric edges
 
