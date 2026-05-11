@@ -1137,6 +1137,10 @@
         : { toothCount: RAKE_TOOTH_COUNT, toothSpacing: RAKE_TOOTH_SPACING, radius: RAKE_RADIUS, strength: RAKE_STRENGTH, lineMultiplier: 1 };
     }
 
+    function shouldStepFluidOwner(owner) {
+      return activeRakeSourceId <= 0 || owner === activeRakeSourceId;
+    }
+
     function injectFluidTooth(x0, y0, x1, y1, len, ux, uy, nx, ny, toothIndex, profile) {
       const cellSize = quality.cellSize;
       const editPad = profile.radius + COMB_RIDGE_OFFSET + COMB_RIDGE_WIDTH + cellSize * 2;
@@ -1205,6 +1209,11 @@
             continue;
           }
           const owner = fluidOwners[idx];
+          if (!shouldStepFluidOwner(owner)) {
+            fluidVx[idx] *= VELOCITY_DAMPING;
+            fluidVy[idx] *= VELOCITY_DAMPING;
+            continue;
+          }
           const nextX = constrain(gx + fluidVx[idx] * FLUID_DT, 0, fieldCols - 1);
           const nextY = constrain(gy + fluidVy[idx] * FLUID_DT, 0, fieldRows - 1);
           const nidx = floor(nextX) + floor(nextY) * fieldCols;
@@ -1229,6 +1238,11 @@
             fluidVyNext[idx] = 0;
             continue;
           }
+          if (!shouldStepFluidOwner(owner)) {
+            fluidVxNext[idx] = fluidVx[idx];
+            fluidVyNext[idx] = fluidVy[idx];
+            continue;
+          }
           const sx = gx - fluidVx[idx] * FLUID_DT;
           const sy = gy - fluidVy[idx] * FLUID_DT;
           fluidVxNext[idx] = sampleFluidScalar(fluidVx, owner, sx, sy, fluidVx[idx]);
@@ -1246,6 +1260,10 @@
           const owner = fluidOwners[idx];
           if (owner < 0 || fluidMask[idx] <= 0) {
             fluidDensityNext[idx] = 0;
+            continue;
+          }
+          if (!shouldStepFluidOwner(owner)) {
+            fluidDensityNext[idx] = fluidDensity[idx];
             continue;
           }
           const sx = gx - fluidVx[idx] * FLUID_DT;
@@ -1271,6 +1289,13 @@
             fluidStretchNext[idx] = 0;
             continue;
           }
+          if (!shouldStepFluidOwner(owner)) {
+            fluidLineNext[idx] = fluidLine[idx];
+            fluidLineAgeNext[idx] = fluidLineAge[idx];
+            fluidRidgeNext[idx] = fluidRidge[idx];
+            fluidStretchNext[idx] = fluidStretch[idx];
+            continue;
+          }
           const sx = gx - fluidVx[idx] * FLUID_DT;
           const sy = gy - fluidVy[idx] * FLUID_DT;
           fluidLineNext[idx] = sampleFluidScalar(fluidLine, owner, sx, sy, fluidLine[idx]);
@@ -1287,7 +1312,7 @@
 
     function dampCombFields() {
       for (let i = 0; i < fluidOwners.length; i++) {
-        if (fluidOwners[i] < 0 || fluidMask[i] <= 0) continue;
+        if (fluidOwners[i] < 0 || fluidMask[i] <= 0 || !shouldStepFluidOwner(fluidOwners[i])) continue;
         const pin = constrain(fluidBorderPin[i], 0, 1);
         fluidLine[i] *= COMB_LINE_DECAY;
         fluidLineAge[i] *= COMB_AGE_DECAY;
@@ -1338,7 +1363,7 @@
 
     function dampAndPinFluid() {
       for (let i = 0; i < fluidOwners.length; i++) {
-        if (fluidOwners[i] < 0 || fluidMask[i] <= 0) continue;
+        if (fluidOwners[i] < 0 || fluidMask[i] <= 0 || !shouldStepFluidOwner(fluidOwners[i])) continue;
         const pin = constrain(fluidBorderPin[i], 0, 1);
         fluidVx[i] *= VELOCITY_DAMPING * lerp(1, BORDER_VELOCITY_SCALE, pin);
         fluidVy[i] *= VELOCITY_DAMPING * lerp(1, BORDER_VELOCITY_SCALE, pin);
