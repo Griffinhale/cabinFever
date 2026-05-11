@@ -1,0 +1,826 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+  <title>Eulerian Finite-Density Marbling Prototype</title>
+  <script src="https://cdn.jsdelivr.net/npm/p5@1.11.3/lib/p5.min.js"></script>
+  <script>window.p5 && (p5.disableFriendlyErrors = true);</script>
+  <style>
+    html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #f4eddf; touch-action: none; overscroll-behavior: none; -webkit-user-select: none; user-select: none; }
+    canvas { display: block; touch-action: none; }
+    #hint { position: fixed; left: 10px; bottom: 8px; z-index: 10; color: rgba(45,35,25,0.58); font: 11px/1.35 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; letter-spacing: 0.02em; pointer-events: none; text-shadow: 0 1px 0 rgba(255,255,255,0.42); }
+    #cornerActions { position: fixed; right: 8px; bottom: 8px; z-index: 11; color: rgba(45,35,25,0.36); font: 10px/1.35 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; pointer-events: none; text-align: right; }
+    #topToolbar { position: fixed; left: 50%; top: 10px; z-index: 20; display: flex; gap: 6px; padding: 6px; border: 1px solid rgba(75,55,38,0.20); border-radius: 999px; background: rgba(246,236,215,0.78); box-shadow: 0 8px 28px rgba(48,35,22,0.12); backdrop-filter: blur(8px); transform: translateX(-50%); touch-action: manipulation; }
+    .toolButton { appearance: none; border: 1px solid rgba(65,46,31,0.18); border-radius: 999px; background: rgba(255,250,238,0.66); color: rgba(45,35,25,0.72); font: 11px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; letter-spacing: 0.03em; padding: 8px 10px; min-width: 54px; }
+    .toolButton.active { background: rgba(47,36,24,0.84); border-color: rgba(47,36,24,0.26); color: rgba(255,248,232,0.94); }
+    .toolButton:active { transform: translateY(1px); }
+  </style>
+</head>
+<body>
+  <div id="hint">Eulerian finite-density marbling · hold to drop · rake conserves pigment mass</div>
+  <div id="topToolbar" aria-label="marbling tools">
+    <button id="dropTool" class="toolButton active" type="button">drop</button>
+    <button id="rakeTool" class="toolButton" type="button">rake</button>
+    <button id="paletteTool" class="toolButton" type="button">palette</button>
+    <button id="resetTool" class="toolButton" type="button">reset</button>
+  </div>
+  <div id="cornerActions">tap top-left: palette<br>hold top-right: reset</div>
+  <script>
+    /*
+      Prototype A: Eulerian finite-density marbling.
+      Metaball pools are used only to stamp organic drop masks into persistent
+      density/owner/color grids. Raking subtracts finite pigment density at comb
+      teeth and conservatively deposits it downstream/sideways. Density controls
+      saturation and opacity, producing pale troughs and darker bunched ridges.
+    */
+
+    const DEBUG_MASS = false;
+    const QUALITY_TIERS = [
+      { name: 'high', cellSize: 4, slowMs: 18, fastMs: 10 },
+      { name: 'medium', cellSize: 6, slowMs: 15, fastMs: 8 },
+      { name: 'low', cellSize: 8, slowMs: 13, fastMs: 7 }
+    ];
+    const FIELD_THRESHOLD = 0.92;
+    const FIELD_RIM_BAND = 0.52;
+    const FIELD_INFLUENCE_FACTOR = 2.35;
+    const BASE_DENSITY = 1.0;
+    const MAX_CELL_DENSITY = 3.8;
+    const MIN_VISIBLE_DENSITY = 0.018;
+    const DENSITY_EPSILON = 0.0006;
+    const DIRTY_PADDING_CELLS = 3;
+    const FULL_REDRAW_COVERAGE = 0.58;
+    const MAX_HOLD_MS = 2100;
+    const MIN_HOLD_MS = 80;
+    const TAP_TO_HOLD_MS = 190;
+    const TAP_MOVE_TOLERANCE = 9;
+    const SPLATTER_MIN_DROPS = 3;
+    const SPLATTER_MAX_DROPS = 5;
+    const SPLATTER_RADIUS = 34;
+    const RESET_HOLD_MS = 750;
+    const CORNER_ACTION_SIZE = 72;
+    const RAKE_RADIUS = 12;
+    const RAKE_TOOTH_COUNT = 5;
+    const RAKE_TOOTH_SPACING = 15;
+    const RAKE_STEP = 4.5;
+    const RAKE_SMOOTHING = 0.42;
+    const RAKE_REMOVE_FRACTION = 0.62;
+    const RAKE_MIN_MOVE = 3;
+    const DEPOSIT_DOWNSTREAM_CELLS = 2.65;
+    const DEPOSIT_SIDE_CELLS = 1.15;
+
+    const PALETTES = [
+      { name: 'traditional marbling', surface: '#f3ead8', grain: '#d8c6a8', shadow: '#3a2a21', pigments: [
+        { base: '#173b62', rim: '#0b2138', wash: '#6f8fb0' }, { base: '#7d2630', rim: '#42121a', wash: '#b96f68' }, { base: '#c18a2f', rim: '#765119', wash: '#dfbd71' }, { base: '#53673a', rim: '#2c381f', wash: '#9aa574' }, { base: '#d9c8a4', rim: '#8f7650', wash: '#f2e6c9' }
+      ]},
+      { name: 'bright playful', surface: '#fbf2df', grain: '#e1cfaa', shadow: '#24212b', pigments: [
+        { base: '#f0645f', rim: '#9e2d32', wash: '#ffaaa0' }, { base: '#17a6a5', rim: '#08666d', wash: '#8bdad2' }, { base: '#f3cf38', rim: '#a77c0d', wash: '#ffe988' }, { base: '#8066c8', rim: '#46337d', wash: '#b9a6ed' }, { base: '#2351c6', rim: '#142a77', wash: '#7e9dea' }
+      ]},
+      { name: 'portfolio subdued', surface: '#f1eadc', grain: '#d0c2aa', shadow: '#2b2925', pigments: [
+        { base: '#29313a', rim: '#11161b', wash: '#737b83' }, { base: '#a85f47', rim: '#653225', wash: '#d7a18b' }, { base: '#4f827f', rim: '#294a49', wash: '#9abcb7' }, { base: '#d8c6a0', rim: '#856f49', wash: '#f0e4c4' }, { base: '#b8733b', rim: '#70401f', wash: '#d6a06b' }
+      ]},
+      { name: 'monochrome ink', surface: '#f5f1e8', grain: '#cbc2b1', shadow: '#171a20', pigments: [
+        { base: '#101b2a', rim: '#05090f', wash: '#657287' }, { base: '#3e4855', rim: '#1b2129', wash: '#8b95a1' }, { base: '#777a76', rim: '#3d403f', wash: '#babcb3' }, { base: '#b6b7aa', rim: '#74786d', wash: '#deded2' }
+      ]}
+    ];
+
+    let pools = [];
+    let activePress = null;
+    let activeTool = 'drop';
+    let paletteIndex = 0;
+    let pigmentIndex = 0;
+    let poolId = 1;
+    let qualityIndex = 0;
+    let quality = QUALITY_TIERS[qualityIndex];
+    let fieldCols = 0;
+    let fieldRows = 0;
+    let densityGrid = new Float32Array(0);
+    let maskGrid = new Float32Array(0);
+    let borderPinGrid = new Float32Array(0);
+    let ownerGrid = new Int32Array(0);
+    let baseR = new Float32Array(0);
+    let baseG = new Float32Array(0);
+    let baseB = new Float32Array(0);
+    let rimR = new Float32Array(0);
+    let rimG = new Float32Array(0);
+    let rimB = new Float32Array(0);
+    let washR = new Float32Array(0);
+    let washG = new Float32Array(0);
+    let washB = new Float32Array(0);
+    let dirty = true;
+    let fullFieldDirty = true;
+    let dirtyRects = [];
+    let paperLayer;
+    let pigmentLayer;
+    let raking = false;
+    let lastRakePoint = null;
+    let lastRakeRawPoint = null;
+    let rakeDirection = null;
+    let pendingReset = null;
+    let lastPreviewRect = null;
+    let lastRenderMs = 0;
+    let slowFrameStreak = 0;
+    let fastFrameStreak = 0;
+
+    function setup() {
+      pixelDensity(1);
+      createCanvas(windowWidth, windowHeight);
+      chooseInitialQuality();
+      rebuildSurfaces(null);
+      bindToolbar();
+      updateHint();
+    }
+
+    function draw() {
+      if (activePress) markActivePreviewDirty();
+      adaptQuality(!!activePress || raking);
+      if (dirty || activePress) {
+        renderScene();
+        dirty = false;
+      } else {
+        image(paperLayer, 0, 0);
+        image(pigmentLayer, 0, 0);
+      }
+    }
+
+    function rebuildSurfaces(previous) {
+      fieldCols = Math.ceil(width / quality.cellSize);
+      fieldRows = Math.ceil(height / quality.cellSize);
+      allocateDensityGrids(fieldCols * fieldRows);
+      if (previous) resampleDensityGrid(previous);
+      paperLayer = createGraphics(width, height);
+      pigmentLayer = createGraphics(width, height);
+      paperLayer.pixelDensity(1);
+      pigmentLayer.pixelDensity(1);
+      renderPaper();
+      for (const pool of pools) pool.updateGeometry();
+      lastPreviewRect = null;
+      markFullFieldDirty();
+    }
+
+    function allocateDensityGrids(len) {
+      densityGrid = new Float32Array(len);
+      maskGrid = new Float32Array(len);
+      borderPinGrid = new Float32Array(len);
+      ownerGrid = new Int32Array(len);
+      baseR = new Float32Array(len); baseG = new Float32Array(len); baseB = new Float32Array(len);
+      rimR = new Float32Array(len); rimG = new Float32Array(len); rimB = new Float32Array(len);
+      washR = new Float32Array(len); washG = new Float32Array(len); washB = new Float32Array(len);
+      ownerGrid.fill(-1);
+    }
+
+    function captureDensityGrid() {
+      return { cols: fieldCols, rows: fieldRows, cellSize: quality.cellSize, density: densityGrid, mask: maskGrid, pin: borderPinGrid, owner: ownerGrid, baseR, baseG, baseB, rimR, rimG, rimB, washR, washG, washB };
+    }
+
+    function resampleDensityGrid(previous) {
+      if (!previous || !previous.cols || !previous.rows) return;
+      for (let gy = 0; gy < fieldRows; gy++) {
+        const py = gy * quality.cellSize + quality.cellSize * 0.5;
+        const oldGy = constrain(floor(py / previous.cellSize), 0, previous.rows - 1);
+        for (let gx = 0; gx < fieldCols; gx++) {
+          const px = gx * quality.cellSize + quality.cellSize * 0.5;
+          const oldGx = constrain(floor(px / previous.cellSize), 0, previous.cols - 1);
+          const oldIdx = oldGx + oldGy * previous.cols;
+          const idx = gx + gy * fieldCols;
+          densityGrid[idx] = previous.density[oldIdx] || 0;
+          maskGrid[idx] = previous.mask[oldIdx] || 0;
+          borderPinGrid[idx] = previous.pin[oldIdx] || 0;
+          ownerGrid[idx] = previous.owner[oldIdx] ?? -1;
+          baseR[idx] = previous.baseR[oldIdx] || 0; baseG[idx] = previous.baseG[oldIdx] || 0; baseB[idx] = previous.baseB[oldIdx] || 0;
+          rimR[idx] = previous.rimR[oldIdx] || 0; rimG[idx] = previous.rimG[oldIdx] || 0; rimB[idx] = previous.rimB[oldIdx] || 0;
+          washR[idx] = previous.washR[oldIdx] || 0; washG[idx] = previous.washG[oldIdx] || 0; washB[idx] = previous.washB[oldIdx] || 0;
+        }
+      }
+    }
+
+    function renderPaper() {
+      const palette = PALETTES[paletteIndex];
+      paperLayer.background(palette.surface);
+      paperLayer.noStroke();
+      paperLayer.randomSeed(4887);
+      const grainColor = parseHexRgb(palette.grain);
+      for (let i = 0; i < (width * height) / 46; i++) {
+        paperLayer.fill(grainColor.r, grainColor.g, grainColor.b, paperLayer.random(5, 18));
+        paperLayer.circle(paperLayer.random(width), paperLayer.random(height), paperLayer.random(0.35, 1.6));
+      }
+      for (let y = 0; y < height; y += 3) {
+        paperLayer.stroke(255, 248, 232, 4 + 3 * noise(y * 0.008, 17.3));
+        paperLayer.line(0, y, width, y);
+      }
+    }
+
+    function renderScene() {
+      const startedAt = performance.now();
+      image(paperLayer, 0, 0);
+      renderDensityField();
+      image(pigmentLayer, 0, 0);
+      renderPressPreview();
+      renderResetPreview();
+      lastRenderMs = performance.now() - startedAt;
+    }
+
+    function renderDensityField() {
+      const rects = consumeDirtyRects();
+      clearPigmentRects(rects);
+      pigmentLayer.noStroke();
+      for (const rect of rects) {
+        for (let gy = rect.y0; gy < rect.y1; gy++) {
+          for (let gx = rect.x0; gx < rect.x1; gx++) {
+            const idx = gx + gy * fieldCols;
+            if (densityGrid[idx] <= MIN_VISIBLE_DENSITY || ownerGrid[idx] < 0) continue;
+            drawDensityCell(gx, gy, idx);
+          }
+        }
+      }
+    }
+
+    function drawDensityCell(gx, gy, idx) {
+      const cellSize = quality.cellSize;
+      const d = densityGrid[idx];
+      const normalized = constrain(d / BASE_DENSITY, 0, 3.0);
+      const bunch = smoothstep(1.0, 2.35, normalized);
+      const spread = 1 - smoothstep(0.22, 0.92, normalized);
+      const paperBreak = stableNoise(gx, gy, ownerGrid[idx] * 17 + 91);
+      const grain = (stableNoise(gx * 0.7, gy * 0.7, ownerGrid[idx] * 31 + 3) - 0.5) * 15;
+      const washT = constrain(0.72 * spread + 0.12 * (1 - normalized), 0, 0.86);
+      const base = { r: baseR[idx], g: baseG[idx], b: baseB[idx] };
+      const wash = { r: washR[idx], g: washG[idx], b: washB[idx] };
+      const rim = { r: rimR[idx], g: rimG[idx], b: rimB[idx] };
+      let c = mixRgb(wash, base, constrain(normalized * 0.9, 0, 1));
+      c = mixRgb(c, rim, bunch * 0.42);
+      const border = borderPinGrid[idx] > 0.5 || hasDifferentOwnerNeighbor(gx, gy, ownerGrid[idx]) || hasPaperNeighbor(gx, gy);
+      const borderDark = border ? 0.34 + borderPinGrid[idx] * 0.36 : 0;
+      c = mixRgb(c, rim, borderDark);
+      let alpha = 18 + 152 * smoothstep(0, 1.35, normalized) + 52 * bunch - 28 * spread;
+      alpha *= 0.88 + 0.22 * paperBreak;
+      pigmentLayer.fill(constrain(c.r + grain, 0, 255), constrain(c.g + grain, 0, 255), constrain(c.b + grain, 0, 255), constrain(alpha, 8, 228));
+      pigmentLayer.rect(gx * cellSize, gy * cellSize, cellSize + 0.8, cellSize + 0.8);
+      if (border && (gx + gy) % 2 === 0) {
+        pigmentLayer.fill(rim.r, rim.g, rim.b, 40 + 70 * borderPinGrid[idx] + 28 * bunch);
+        pigmentLayer.rect(gx * cellSize, gy * cellSize, cellSize + 0.8, cellSize + 0.8);
+      }
+      if (bunch > 0.18 && paperBreak > 0.52) {
+        pigmentLayer.fill(255, 248, 232, 10 * (1 - bunch));
+        pigmentLayer.rect(gx * cellSize, gy * cellSize, cellSize + 0.8, cellSize + 0.8);
+      }
+    }
+
+    function bakePoolToDensity(pool) {
+      const rect = pool.fieldRect;
+      if (!rect) return;
+      const rgb = pool.rgb;
+      for (let gy = rect.y0; gy < rect.y1; gy++) {
+        const y = gy * quality.cellSize + quality.cellSize * 0.5;
+        for (let gx = rect.x0; gx < rect.x1; gx++) {
+          const x = gx * quality.cellSize + quality.cellSize * 0.5;
+          const field = pool.fieldAt(x, y);
+          if (field < FIELD_THRESHOLD) continue;
+          const idx = gx + gy * fieldCols;
+          const edgeT = constrain((field - FIELD_THRESHOLD) / FIELD_RIM_BAND, 0, 1);
+          const organic = 0.87 + 0.26 * stableNoise(gx, gy, pool.seed);
+          const addedDensity = (0.62 + 0.58 * smoothstep(0, 1.35, edgeT)) * organic;
+          const existing = densityGrid[idx];
+          const newMass = min(MAX_CELL_DENSITY, existing + addedDensity);
+          if (existing <= DENSITY_EPSILON || addedDensity > existing * 0.44 || pool.createdAt >= (ownerGrid[idx] || 0)) {
+            setCellColor(idx, pool.id, rgb);
+          }
+          densityGrid[idx] = newMass;
+          maskGrid[idx] = max(maskGrid[idx], smoothstep(0, 1, edgeT));
+          borderPinGrid[idx] = max(borderPinGrid[idx], constrain(1 - edgeT, 0, 1) * 0.9);
+        }
+      }
+      refreshBorderPins(rect);
+      markDirtyRect(rect);
+    }
+
+    function refreshBorderPins(rect) {
+      const expanded = clampRect(expandRect(rect, 1));
+      if (!expanded) return;
+      for (let gy = expanded.y0; gy < expanded.y1; gy++) {
+        for (let gx = expanded.x0; gx < expanded.x1; gx++) {
+          const idx = gx + gy * fieldCols;
+          if (densityGrid[idx] <= MIN_VISIBLE_DENSITY) continue;
+          const seam = hasDifferentOwnerNeighbor(gx, gy, ownerGrid[idx]) ? 0.82 : 0;
+          const paperEdge = hasPaperNeighbor(gx, gy) ? 0.9 : 0;
+          borderPinGrid[idx] = max(borderPinGrid[idx] * 0.88, seam, paperEdge);
+          maskGrid[idx] = max(maskGrid[idx], 0.42);
+        }
+      }
+    }
+
+    function setCellColor(idx, owner, rgb) {
+      ownerGrid[idx] = owner;
+      baseR[idx] = rgb.base.r; baseG[idx] = rgb.base.g; baseB[idx] = rgb.base.b;
+      rimR[idx] = rgb.rim.r; rimG[idx] = rgb.rim.g; rimB[idx] = rgb.rim.b;
+      washR[idx] = rgb.wash.r; washG[idx] = rgb.wash.g; washB[idx] = rgb.wash.b;
+    }
+
+    function beginRake(x, y) {
+      cancelResetHold();
+      activePress = null;
+      if (dirty || fullFieldDirty || dirtyRects.length) renderScene();
+      raking = true;
+      const point = { x: constrain(x, 0, width), y: constrain(y, 0, height) };
+      lastRakePoint = point;
+      lastRakeRawPoint = point;
+      rakeDirection = null;
+    }
+
+    function finishRake() {
+      if (!raking) return false;
+      raking = false;
+      lastRakePoint = null;
+      lastRakeRawPoint = null;
+      rakeDirection = null;
+      dirty = true;
+      return true;
+    }
+
+    function updateRake(x, y) {
+      if (!raking || !lastRakePoint) return;
+      const raw = { x: constrain(x, 0, width), y: constrain(y, 0, height) };
+      const smooth = smoothRakePoint(raw);
+      const dx = smooth.x - lastRakePoint.x;
+      const dy = smooth.y - lastRakePoint.y;
+      const len = sqrt(dx * dx + dy * dy);
+      if (len < RAKE_MIN_MOVE) return;
+      updateRakeDirection(dx, dy, len);
+      const steps = max(1, ceil(len / RAKE_STEP));
+      let from = lastRakePoint;
+      const before = DEBUG_MASS ? totalDensity() : 0;
+      for (let i = 1; i <= steps; i++) {
+        const t = i / steps;
+        const to = { x: lerp(lastRakePoint.x, smooth.x, t), y: lerp(lastRakePoint.y, smooth.y, t) };
+        applyEulerianRake(from.x, from.y, to.x, to.y, rakeDirection);
+        from = to;
+      }
+      if (DEBUG_MASS) console.log(`[density-rake] mass ${before.toFixed(2)} -> ${totalDensity().toFixed(2)} max ${maxDensity().toFixed(2)}`);
+      lastRakePoint = smooth;
+      lastRakeRawPoint = raw;
+      dirty = true;
+    }
+
+    function smoothRakePoint(raw) {
+      if (!lastRakeRawPoint || !lastRakePoint) return raw;
+      return { x: lerp(lastRakePoint.x, raw.x, RAKE_SMOOTHING), y: lerp(lastRakePoint.y, raw.y, RAKE_SMOOTHING) };
+    }
+
+    function updateRakeDirection(dx, dy, len) {
+      const ux = dx / len;
+      const uy = dy / len;
+      if (!rakeDirection) {
+        rakeDirection = { x: ux, y: uy };
+        return;
+      }
+      const blendedX = lerp(rakeDirection.x, ux, 0.28);
+      const blendedY = lerp(rakeDirection.y, uy, 0.28);
+      const blendedLen = sqrt(blendedX * blendedX + blendedY * blendedY) || 1;
+      rakeDirection = { x: blendedX / blendedLen, y: blendedY / blendedLen };
+    }
+
+    function applyEulerianRake(x0, y0, x1, y1, direction) {
+      const dx = x1 - x0;
+      const dy = y1 - y0;
+      const len = sqrt(dx * dx + dy * dy);
+      if (len < 0.25 || fieldCols <= 0 || fieldRows <= 0) return;
+      const ux = direction ? direction.x : dx / len;
+      const uy = direction ? direction.y : dy / len;
+      const nx = -uy;
+      const ny = ux;
+      const start = -(RAKE_TOOTH_COUNT - 1) * 0.5;
+      for (let i = 0; i < RAKE_TOOTH_COUNT; i++) {
+        const offset = (start + i) * RAKE_TOOTH_SPACING;
+        applySingleDensityTooth(x0 + nx * offset, y0 + ny * offset, x1 + nx * offset, y1 + ny * offset, ux, uy, nx, ny);
+      }
+    }
+
+    function applySingleDensityTooth(x0, y0, x1, y1, ux, uy, nx, ny) {
+      const cellSize = quality.cellSize;
+      const editPad = RAKE_RADIUS + cellSize * 2;
+      const depositPad = RAKE_RADIUS + cellSize * (DEPOSIT_DOWNSTREAM_CELLS + DEPOSIT_SIDE_CELLS + 3);
+      const rect = clampRect({ x0: floor((min(x0, x1) - editPad) / cellSize), y0: floor((min(y0, y1) - editPad) / cellSize), x1: ceil((max(x0, x1) + editPad) / cellSize), y1: ceil((max(y0, y1) + editPad) / cellSize) });
+      const dirtyRect = clampRect({ x0: floor((min(x0, x1) - depositPad) / cellSize), y0: floor((min(y0, y1) - depositPad) / cellSize), x1: ceil((max(x0, x1) + depositPad) / cellSize), y1: ceil((max(y0, y1) + depositPad) / cellSize) });
+      if (!rect) return;
+      const transfers = [];
+      for (let gy = rect.y0; gy < rect.y1; gy++) {
+        const cy = gy * cellSize + cellSize * 0.5;
+        for (let gx = rect.x0; gx < rect.x1; gx++) {
+          const cx = gx * cellSize + cellSize * 0.5;
+          const nearest = closestPointOnSegment(cx, cy, x0, y0, x1, y1);
+          const ddx = cx - nearest.x;
+          const ddy = cy - nearest.y;
+          const dist = sqrt(ddx * ddx + ddy * ddy);
+          if (dist > RAKE_RADIUS) continue;
+          const idx = gx + gy * fieldCols;
+          const available = densityGrid[idx];
+          if (available <= DENSITY_EPSILON || ownerGrid[idx] < 0) continue;
+          const pin = constrain(borderPinGrid[idx] || 0, 0, 0.92);
+          const falloff = smoothFalloff(1 - dist / RAKE_RADIUS) * (1 - pin);
+          const remove = min(available, available * falloff * RAKE_REMOVE_FRACTION);
+          if (remove <= DENSITY_EPSILON) continue;
+          transfers.push({ idx, gx, gy, remove, owner: ownerGrid[idx], colors: readCellColors(idx), jitter: stableNoise(gx, gy, ownerGrid[idx]) - 0.5 });
+        }
+      }
+      for (const tr of transfers) {
+        densityGrid[tr.idx] = max(0, densityGrid[tr.idx] - tr.remove);
+      }
+      for (const tr of transfers) {
+        const jitter = tr.jitter * 0.42;
+        const targets = [
+          { x: tr.gx + ux * DEPOSIT_DOWNSTREAM_CELLS + nx * jitter, y: tr.gy + uy * DEPOSIT_DOWNSTREAM_CELLS + ny * jitter, w: 0.56 },
+          { x: tr.gx + ux * 1.42 + nx * DEPOSIT_SIDE_CELLS, y: tr.gy + uy * 1.42 + ny * DEPOSIT_SIDE_CELLS, w: 0.22 },
+          { x: tr.gx + ux * 1.42 - nx * DEPOSIT_SIDE_CELLS, y: tr.gy + uy * 1.42 - ny * DEPOSIT_SIDE_CELLS, w: 0.22 }
+        ];
+        depositConservedMass(tr, targets);
+      }
+      for (const tr of transfers) {
+        if (densityGrid[tr.idx] <= MIN_VISIBLE_DENSITY) {
+          densityGrid[tr.idx] = 0;
+          maskGrid[tr.idx] = max(0, maskGrid[tr.idx] * 0.55);
+        }
+      }
+      if (dirtyRect) {
+        refreshBorderPins(dirtyRect);
+        markDirtyRect(dirtyRect);
+      }
+    }
+
+    function depositConservedMass(tr, targets) {
+      let totalW = 0;
+      const weighted = [];
+      for (const t of targets) {
+        const gx = constrain(round(t.x), 0, fieldCols - 1);
+        const gy = constrain(round(t.y), 0, fieldRows - 1);
+        const idx = gx + gy * fieldCols;
+        const editable = max(maskGrid[idx], densityGrid[idx] > DENSITY_EPSILON ? 0.72 : 0.08);
+        const resistance = 1 - constrain(borderPinGrid[idx] || 0, 0, 0.88);
+        const w = t.w * editable * resistance;
+        if (w > 0.0001) {
+          weighted.push({ idx, w });
+          totalW += w;
+        }
+      }
+      if (totalW <= 0.0001) {
+        densityGrid[tr.idx] += tr.remove;
+        return;
+      }
+      for (const target of weighted) {
+        const amount = tr.remove * target.w / totalW;
+        const old = densityGrid[target.idx];
+        const accepted = min(amount, max(0, MAX_CELL_DENSITY - old));
+        const overflow = amount - accepted;
+        densityGrid[target.idx] = old + accepted;
+        maskGrid[target.idx] = max(maskGrid[target.idx], 0.5);
+        if (accepted > old * 0.28 || ownerGrid[target.idx] < 0) writeCellColors(target.idx, tr.owner, tr.colors);
+        if (overflow > 0) densityGrid[tr.idx] += overflow;
+      }
+    }
+
+    function readCellColors(idx) {
+      return { base: { r: baseR[idx], g: baseG[idx], b: baseB[idx] }, rim: { r: rimR[idx], g: rimG[idx], b: rimB[idx] }, wash: { r: washR[idx], g: washG[idx], b: washB[idx] } };
+    }
+
+    function writeCellColors(idx, owner, colors) {
+      ownerGrid[idx] = owner;
+      baseR[idx] = colors.base.r; baseG[idx] = colors.base.g; baseB[idx] = colors.base.b;
+      rimR[idx] = colors.rim.r; rimG[idx] = colors.rim.g; rimB[idx] = colors.rim.b;
+      washR[idx] = colors.wash.r; washG[idx] = colors.wash.g; washB[idx] = colors.wash.b;
+    }
+
+    function renderPressPreview() {
+      if (!activePress || !shouldRenderHoldPreview(activePress)) return;
+      const held = millis() - activePress.startedAt;
+      const t = holdToUnit(held);
+      const pigment = activePress.colorRgb;
+      noFill();
+      stroke(pigment.rim.r, pigment.rim.g, pigment.rim.b, 42 + 52 * t);
+      strokeWeight(1);
+      const r = sqrt(holdToMass(held) / PI) * 1.15;
+      circle(activePress.x, activePress.y, r * 2);
+      stroke(255, 250, 238, 60);
+      circle(activePress.x, activePress.y, max(8, r * 0.6));
+    }
+
+    function renderResetPreview() {
+      if (!pendingReset || pendingReset.completed) return;
+      const elapsed = millis() - pendingReset.startedAt;
+      const t = constrain(elapsed / RESET_HOLD_MS, 0, 1);
+      noFill();
+      stroke(45, 35, 25, 44);
+      strokeWeight(2);
+      arc(pendingReset.x, pendingReset.y, 34, 34, -HALF_PI, -HALF_PI + TWO_PI * t);
+    }
+
+    function shouldRenderHoldPreview(press) {
+      return press && millis() - press.startedAt >= TAP_TO_HOLD_MS;
+    }
+
+    function startPress(x, y) {
+      const corner = handleCornerActionStart(x, y);
+      if (corner) return;
+      const pigment = choosePigment();
+      activePress = { x: constrain(x, 0, width), y: constrain(y, 0, height), startX: constrain(x, 0, width), startY: constrain(y, 0, height), moved: false, startedAt: millis(), color: pigment, colorRgb: pigmentToRgb(pigment), seed: random(1000000) };
+      lastPreviewRect = null;
+      markActivePreviewDirty();
+    }
+
+    function endPress() {
+      if (!activePress) return;
+      const press = activePress;
+      const held = millis() - press.startedAt;
+      if (lastPreviewRect) markDirtyRect(lastPreviewRect);
+      lastPreviewRect = null;
+      activePress = null;
+      if (held < TAP_TO_HOLD_MS && !press.moved) {
+        addSplatter(press.x, press.y, press.color, press.seed);
+        return;
+      }
+      const pool = createPool(press.x, press.y, held, press.color, press.seed, false);
+      pools.push(pool);
+      bakePoolToDensity(pool);
+    }
+
+    function addSplatter(x, y, pigment, seed) {
+      randomSeed(floor(seed));
+      const count = floor(random(SPLATTER_MIN_DROPS, SPLATTER_MAX_DROPS + 0.99));
+      for (let i = 0; i < count; i++) {
+        const angle = random(TWO_PI);
+        const radius = sqrt(random()) * SPLATTER_RADIUS;
+        const sx = constrain(x + cos(angle) * radius, 0, width);
+        const sy = constrain(y + sin(angle) * radius, 0, height);
+        const mass = random(180, 620) * (i === 0 ? 1.15 : 1);
+        const lobes = floor(random(1, 3.99));
+        const pool = createPoolFromMass(sx, sy, mass, lobes, pigment, seed + 97 * (i + 1), false);
+        pools.push(pool);
+        bakePoolToDensity(pool);
+      }
+    }
+
+    function markActivePreviewDirty() {
+      if (!activePress || !shouldRenderHoldPreview(activePress)) {
+        if (lastPreviewRect) markDirtyRect(lastPreviewRect);
+        lastPreviewRect = null;
+        return;
+      }
+      const preview = previewPoolFromPress(activePress);
+      if (lastPreviewRect) markDirtyRect(lastPreviewRect);
+      markDirtyRect(preview.fieldRect);
+      lastPreviewRect = preview.fieldRect;
+    }
+
+    function chooseInitialQuality() {
+      const viewportCellsAtHigh = Math.ceil(width / QUALITY_TIERS[0].cellSize) * Math.ceil(height / QUALITY_TIERS[0].cellSize);
+      const mobileHint = window.matchMedia && window.matchMedia('(pointer: coarse)').matches;
+      qualityIndex = mobileHint || viewportCellsAtHigh > 90000 ? 1 : 0;
+      quality = QUALITY_TIERS[qualityIndex];
+    }
+
+    function adaptQuality(interacting) {
+      if (fullFieldDirty && dirtyRects.length === 0) return;
+      const occupied = occupiedCellCount();
+      const crowded = pools.length > 18 || occupied > fieldCols * fieldRows * 0.34;
+      const slow = lastRenderMs > quality.slowMs || (interacting && crowded && qualityIndex === 0);
+      const fast = lastRenderMs > 0 && lastRenderMs < quality.fastMs && pools.length < 12 && occupied < fieldCols * fieldRows * 0.18;
+      slowFrameStreak = slow ? slowFrameStreak + 1 : 0;
+      fastFrameStreak = fast ? fastFrameStreak + 1 : 0;
+      if (slowFrameStreak >= 3 && qualityIndex < QUALITY_TIERS.length - 1) {
+        setQuality(qualityIndex + 1);
+        slowFrameStreak = 0;
+        fastFrameStreak = 0;
+      } else if (fastFrameStreak >= 90 && qualityIndex > 0) {
+        setQuality(qualityIndex - 1);
+        slowFrameStreak = 0;
+        fastFrameStreak = 0;
+      }
+    }
+
+    function setQuality(nextIndex) {
+      if (nextIndex === qualityIndex) return;
+      const previous = captureDensityGrid();
+      qualityIndex = nextIndex;
+      quality = QUALITY_TIERS[qualityIndex];
+      finishRake();
+      rebuildSurfaces(previous);
+    }
+
+    function markFullFieldDirty() {
+      fullFieldDirty = true;
+      dirtyRects = [];
+      dirty = true;
+    }
+
+    function markDirtyRect(rect) {
+      if (!rect || fullFieldDirty) {
+        dirty = true;
+        return;
+      }
+      const clamped = clampRect(expandRect(rect, DIRTY_PADDING_CELLS));
+      if (!clamped) return;
+      dirtyRects.push(clamped);
+      dirty = true;
+    }
+
+    function consumeDirtyRects() {
+      if (fullFieldDirty || dirtyRects.length === 0) {
+        fullFieldDirty = false;
+        dirtyRects = [];
+        return [{ x0: 0, y0: 0, x1: fieldCols, y1: fieldRows }];
+      }
+      const rect = dirtyRects.reduce((merged, next) => unionRects(merged, next));
+      dirtyRects = [];
+      const coverage = rectArea(rect) / Math.max(1, fieldCols * fieldRows);
+      if (coverage > FULL_REDRAW_COVERAGE) return [{ x0: 0, y0: 0, x1: fieldCols, y1: fieldRows }];
+      return [rect];
+    }
+
+    function clearPigmentRects(rects) {
+      const cellSize = quality.cellSize;
+      for (const rect of rects) {
+        pigmentLayer.drawingContext.clearRect(rect.x0 * cellSize, rect.y0 * cellSize, (rect.x1 - rect.x0) * cellSize + cellSize, (rect.y1 - rect.y0) * cellSize + cellSize);
+      }
+    }
+
+    function unionRects(a, b) { return { x0: Math.min(a.x0, b.x0), y0: Math.min(a.y0, b.y0), x1: Math.max(a.x1, b.x1), y1: Math.max(a.y1, b.y1) }; }
+    function expandRect(rect, cells) { return { x0: rect.x0 - cells, y0: rect.y0 - cells, x1: rect.x1 + cells, y1: rect.y1 + cells }; }
+    function clampRect(rect) {
+      const clamped = { x0: constrain(floor(rect.x0), 0, fieldCols), y0: constrain(floor(rect.y0), 0, fieldRows), x1: constrain(ceil(rect.x1), 0, fieldCols), y1: constrain(ceil(rect.y1), 0, fieldRows) };
+      if (clamped.x1 <= clamped.x0 || clamped.y1 <= clamped.y0) return null;
+      return clamped;
+    }
+    function rectArea(rect) { return Math.max(0, rect.x1 - rect.x0) * Math.max(0, rect.y1 - rect.y0); }
+
+    function hasPaperNeighbor(gx, gy) {
+      const checks = [[1,0],[-1,0],[0,1],[0,-1]];
+      for (const c of checks) {
+        const nx = gx + c[0];
+        const ny = gy + c[1];
+        if (nx < 0 || ny < 0 || nx >= fieldCols || ny >= fieldRows) return true;
+        if (densityGrid[nx + ny * fieldCols] <= MIN_VISIBLE_DENSITY) return true;
+      }
+      return false;
+    }
+
+    function hasDifferentOwnerNeighbor(gx, gy, owner) {
+      const checks = [[1,0],[-1,0],[0,1],[0,-1]];
+      for (const c of checks) {
+        const nx = gx + c[0];
+        const ny = gy + c[1];
+        if (nx < 0 || ny < 0 || nx >= fieldCols || ny >= fieldRows) return true;
+        const idx = nx + ny * fieldCols;
+        if (densityGrid[idx] > MIN_VISIBLE_DENSITY && ownerGrid[idx] !== owner) return true;
+      }
+      return false;
+    }
+
+    function parseHexRgb(hex) {
+      const raw = hex.replace('#', '');
+      return { r: parseInt(raw.slice(0, 2), 16), g: parseInt(raw.slice(2, 4), 16), b: parseInt(raw.slice(4, 6), 16) };
+    }
+    function pigmentToRgb(pigment) { return { base: parseHexRgb(pigment.base), rim: parseHexRgb(pigment.rim), wash: parseHexRgb(pigment.wash) }; }
+    function mixRgb(a, b, t) { return { r: a.r + (b.r - a.r) * t, g: a.g + (b.g - a.g) * t, b: a.b + (b.b - a.b) * t }; }
+    function smoothstep(edge0, edge1, x) { const t = constrain((x - edge0) / (edge1 - edge0 || 1), 0, 1); return t * t * (3 - 2 * t); }
+    function smoothFalloff(t) { const clamped = constrain(t, 0, 1); return clamped * clamped * (3 - 2 * clamped); }
+    function stableNoise(x, y, seed) { return noise(x * 0.13 + seed * 0.0007, y * 0.13 - seed * 0.0003); }
+    function closestPointOnSegment(px, py, x0, y0, x1, y1) {
+      const sx = x1 - x0;
+      const sy = y1 - y0;
+      const l2 = sx * sx + sy * sy;
+      if (l2 <= 0.0001) return { x: x0, y: y0 };
+      const t = constrain(((px - x0) * sx + (py - y0) * sy) / l2, 0, 1);
+      return { x: x0 + sx * t, y: y0 + sy * t };
+    }
+
+    function holdToUnit(ms) {
+      const clamped = constrain(ms, MIN_HOLD_MS, MAX_HOLD_MS);
+      const t = (clamped - MIN_HOLD_MS) / (MAX_HOLD_MS - MIN_HOLD_MS);
+      return t * t * (3 - 2 * t);
+    }
+    function holdToMass(ms) { return lerp(1600, min(width * height * 0.105, 36000), holdToUnit(ms)); }
+    function choosePigment() { const palette = PALETTES[paletteIndex]; const pigment = palette.pigments[pigmentIndex % palette.pigments.length]; pigmentIndex++; return pigment; }
+    function createPool(x, y, holdMs, pigment, seed, preview) { return createPoolFromMass(x, y, holdToMass(holdMs), floor(lerp(3, pools.length < 8 && qualityIndex === 0 ? 9.99 : 8.99, holdToUnit(holdMs))), pigment, seed, preview); }
+    function createPoolFromMass(x, y, mass, lobeCount, pigment, seed, preview) { return new PigmentPool(preview ? -1 : poolId++, x, y, mass, lobeCount, pigment, seed, preview); }
+    function previewPoolFromPress(press) { return createPool(press.x, press.y, millis() - press.startedAt, press.color, press.seed, true); }
+
+    class PigmentPool {
+      constructor(id, x, y, mass, lobeCount, colorValue, seed, preview) {
+        this.id = id;
+        this.center = { x, y };
+        this.createdAt = preview ? millis() + 999999 : millis();
+        this.color = colorValue;
+        this.rgb = pigmentToRgb(colorValue);
+        this.targetMass = mass;
+        this.seed = seed;
+        this.preview = preview;
+        this.lobes = [];
+        this.sampleLobes = [];
+        this.pixelBounds = null;
+        this.fieldRect = null;
+        this.makeLobes(lobeCount);
+        this.updateGeometry();
+      }
+      makeLobes(count) {
+        randomSeed(floor(this.seed));
+        const baseRadius = sqrt(this.targetMass / PI);
+        let weights = [];
+        let total = 0;
+        for (let i = 0; i < count; i++) { const w = random(0.55, 1.45); weights.push(w); total += w; }
+        for (let i = 0; i < count; i++) {
+          const angle = TWO_PI * i / count + random(-0.55, 0.55);
+          const offsetTarget = i === 0 ? 0 : random(baseRadius * 0.12, baseRadius * 0.64);
+          const lobeMass = this.targetMass * weights[i] / total * random(0.88, 1.22);
+          const targetRadius = sqrt(lobeMass / PI) * random(1.55, 2.12);
+          this.lobes.push({ angle, offsetNow: offsetTarget, radius: targetRadius, phase: random(1000) });
+        }
+      }
+      updateGeometry() {
+        const cellSize = quality.cellSize;
+        this.sampleLobes = [];
+        let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+        for (const lobe of this.lobes) {
+          const lx = this.center.x + cos(lobe.angle) * lobe.offsetNow;
+          const ly = this.center.y + sin(lobe.angle) * lobe.offsetNow;
+          const influenceRadius = Math.max(8, lobe.radius * FIELD_INFLUENCE_FACTOR + 10);
+          const warpRadius = lobe.radius * 0.18;
+          this.sampleLobes.push({ x: lx, y: ly, radius: lobe.radius, radius2: lobe.radius * lobe.radius, influence2: (influenceRadius + warpRadius) * (influenceRadius + warpRadius), phase: lobe.phase, phaseCos: cos(lobe.phase), phaseSin: sin(lobe.phase) });
+          x0 = Math.min(x0, lx - influenceRadius - warpRadius);
+          y0 = Math.min(y0, ly - influenceRadius - warpRadius);
+          x1 = Math.max(x1, lx + influenceRadius + warpRadius);
+          y1 = Math.max(y1, ly + influenceRadius + warpRadius);
+        }
+        this.pixelBounds = { x0, y0, x1, y1 };
+        this.fieldRect = clampRect({ x0: floor(x0 / cellSize) - 1, y0: floor(y0 / cellSize) - 1, x1: ceil(x1 / cellSize) + 1, y1: ceil(y1 / cellSize) + 1 });
+      }
+      fieldAt(x, y) {
+        let sum = 0;
+        for (const lobe of this.sampleLobes) {
+          const roughDx = x - lobe.x;
+          const roughDy = y - lobe.y;
+          if (roughDx * roughDx + roughDy * roughDy > lobe.influence2) continue;
+          const warp = (stableNoise(floor(x * 0.025), floor(y * 0.025), this.seed + lobe.phase) - 0.5) * lobe.radius * 0.18;
+          const dx = roughDx + lobe.phaseCos * warp;
+          const dy = roughDy + lobe.phaseSin * warp;
+          sum += lobe.radius2 / (dx * dx + dy * dy + 18);
+        }
+        return sum;
+      }
+    }
+
+    function totalDensity() { let sum = 0; for (let i = 0; i < densityGrid.length; i++) sum += densityGrid[i]; return sum; }
+    function maxDensity() { let m = 0; for (let i = 0; i < densityGrid.length; i++) m = Math.max(m, densityGrid[i]); return m; }
+    function occupiedCellCount() { let c = 0; for (let i = 0; i < densityGrid.length; i++) if (densityGrid[i] > MIN_VISIBLE_DENSITY) c++; return c; }
+
+    function handleCornerActionStart(x, y) {
+      if (isTopLeftAction(x, y)) { nextPalette(); return true; }
+      if (isTopRightAction(x, y)) { startResetHold(x, y); return true; }
+      return false;
+    }
+    function isTopLeftAction(x, y) { return x < CORNER_ACTION_SIZE && y < CORNER_ACTION_SIZE; }
+    function isTopRightAction(x, y) { return x > width - CORNER_ACTION_SIZE && y < CORNER_ACTION_SIZE; }
+    function startResetHold(x, y) {
+      cancelResetHold();
+      pendingReset = { x, y, startedAt: millis(), completed: false, timer: window.setTimeout(() => { if (!pendingReset) return; pendingReset.completed = true; resetAll(); }, RESET_HOLD_MS) };
+      dirty = true;
+    }
+    function cancelResetHold() { if (!pendingReset) return; window.clearTimeout(pendingReset.timer); pendingReset = null; dirty = true; }
+    function updateCornerActionHold(x, y) { if (pendingReset && !pendingReset.completed && !isTopRightAction(x, y)) cancelResetHold(); }
+    function finishCornerActionHold() { if (pendingReset && !pendingReset.completed) { cancelResetHold(); return true; } if (pendingReset && pendingReset.completed) { pendingReset = null; return true; } return false; }
+    function handlePointerMove(x, y) { updateCornerActionHold(x, y); if (!activePress) return; const dx = x - activePress.startX; const dy = y - activePress.startY; if (sqrt(dx * dx + dy * dy) > TAP_MOVE_TOLERANCE) activePress.moved = true; }
+    function touchCentroid() { if (!touches || touches.length === 0) return { x: mouseX, y: mouseY }; let x = 0, y = 0; for (const t of touches) { x += t.x; y += t.y; } return { x: x / touches.length, y: y / touches.length }; }
+    function nextPalette() { paletteIndex = (paletteIndex + 1) % PALETTES.length; pigmentIndex = 0; renderPaper(); updateHint(); markFullFieldDirty(); }
+    function resetAll() { if (pendingReset) { window.clearTimeout(pendingReset.timer); pendingReset = null; } pools = []; activePress = null; allocateDensityGrids(fieldCols * fieldRows); lastPreviewRect = null; pigmentLayer.clear(); renderPaper(); markFullFieldDirty(); }
+    function updateHint() {
+      const el = document.getElementById('hint');
+      const mode = activeTool === 'rake' ? 'rake mode: density teeth leave pale troughs + dark deposits' : 'drop mode: finite pigment density stamps';
+      el.textContent = `Eulerian finite-density marbling · ${mode} · Shift/two-finger rake · P palette · R reset · ${PALETTES[paletteIndex].name}`;
+      updateToolbarState();
+    }
+    function bindToolbar() {
+      const toolbar = document.getElementById('topToolbar');
+      if (!toolbar || toolbar.dataset.bound === 'true') return;
+      toolbar.dataset.bound = 'true';
+      toolbar.addEventListener('pointerdown', event => event.stopPropagation());
+      toolbar.addEventListener('touchstart', event => event.stopPropagation(), { passive: false });
+      document.getElementById('dropTool').addEventListener('click', event => { event.preventDefault(); setActiveTool('drop'); });
+      document.getElementById('rakeTool').addEventListener('click', event => { event.preventDefault(); setActiveTool('rake'); });
+      document.getElementById('paletteTool').addEventListener('click', event => { event.preventDefault(); nextPalette(); });
+      document.getElementById('resetTool').addEventListener('click', event => { event.preventDefault(); resetAll(); });
+      updateToolbarState();
+    }
+    function setActiveTool(tool) { activeTool = tool; finishRake(); activePress = null; updateHint(); }
+    function updateToolbarState() { const drop = document.getElementById('dropTool'); const rake = document.getElementById('rakeTool'); if (!drop || !rake) return; drop.classList.toggle('active', activeTool === 'drop'); rake.classList.toggle('active', activeTool === 'rake'); }
+
+    function keyPressed() { if (key === 'p' || key === 'P') nextPalette(); if (key === 'r' || key === 'R' || keyCode === ESCAPE) resetAll(); }
+    function mousePressed() { if (touches && touches.length) return false; if (activeTool === 'rake' || keyIsDown(SHIFT)) { beginRake(mouseX, mouseY); return false; } startPress(mouseX, mouseY); return false; }
+    function mouseReleased() { if (touches && touches.length) return false; if (finishRake()) return false; if (finishCornerActionHold()) return false; endPress(); return false; }
+    function mouseDragged() { if (touches && touches.length) return false; if (raking) { updateRake(mouseX, mouseY); return false; } handlePointerMove(mouseX, mouseY); return false; }
+    function touchStarted() { if (touches && touches.length >= 2) { const p = touchCentroid(); beginRake(p.x, p.y); return false; } if (activeTool === 'rake') { beginRake(mouseX, mouseY); return false; } const t = touches && touches.length ? touches[0] : { x: mouseX, y: mouseY }; startPress(t.x, t.y); return false; }
+    function touchMoved() { if (raking) { const p = touches && touches.length ? touchCentroid() : { x: mouseX, y: mouseY }; updateRake(p.x, p.y); return false; } const t = touches && touches.length ? touches[0] : { x: mouseX, y: mouseY }; handlePointerMove(t.x, t.y); return false; }
+    function touchEnded() { if (raking) { finishRake(); return false; } if (finishCornerActionHold()) return false; endPress(); return false; }
+    function windowResized() { const previous = captureDensityGrid(); resizeCanvas(windowWidth, windowHeight); chooseInitialQuality(); rebuildSurfaces(previous); }
+
+    document.addEventListener('gesturestart', event => event.preventDefault());
+    document.addEventListener('touchmove', event => event.preventDefault(), { passive: false });
+  </script>
+</body>
+</html>
