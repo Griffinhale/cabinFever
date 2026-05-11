@@ -125,6 +125,7 @@
     const RAKE_SMOOTHING = 0.42;
     const RAKE_STRENGTH = 0.96;
     const RAKE_MAX_OFFSET = 92;
+    const RAKE_CUT_STRENGTH = 1.0;
     const RAKE_MIN_MOVE = 3;
 
     const PALETTES = [
@@ -196,6 +197,7 @@
     let field = [];
     let rakeDx = [];
     let rakeDy = [];
+    let rakeCut = [];
     let raking = false;
     let lastRakePoint = null;
     let lastRakeRawPoint = null;
@@ -352,6 +354,8 @@
                 bestAge = pool.createdAt;
               }
             }
+            const cut = rakeCut[idx] || 0;
+            if (cut > 0) bestField *= 1 - constrain(cut, 0, 0.96);
             field[idx] = bestField >= FIELD_THRESHOLD
               ? { owner: best, strength: bestField, margin: bestField - secondField }
               : { owner: -1, strength: bestField, margin: 0 };
@@ -445,6 +449,7 @@
       const len = Math.max(0, fieldCols * fieldRows);
       rakeDx = new Array(len).fill(0);
       rakeDy = new Array(len).fill(0);
+      rakeCut = new Array(len).fill(0);
       raking = false;
       lastRakePoint = null;
       lastRakeRawPoint = null;
@@ -844,9 +849,11 @@
           const cell = field[idx];
           if (!cell || cell.owner < 0) continue;
 
+          const falloff = smoothFalloff(1 - dist / RAKE_RADIUS);
+          rakeCut[idx] = max(rakeCut[idx] || 0, falloff * RAKE_CUT_STRENGTH);
+
           const edgeT = constrain((cell.strength - FIELD_THRESHOLD) / FIELD_RIM_BAND, 0, 1);
           const borderPin = hasDifferentNeighbor(gx, gy, cell.owner) ? 0.82 : (1 - edgeT) * 0.58;
-          const falloff = smoothFalloff(1 - dist / RAKE_RADIUS);
           const force = falloff * (1 - constrain(borderPin, 0, 0.9));
           if (force <= 0.02) continue;
 
