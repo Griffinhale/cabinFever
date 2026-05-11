@@ -41,10 +41,51 @@
       pointer-events: none;
       text-align: right;
     }
+    #topToolbar {
+      position: fixed;
+      left: 50%;
+      top: 10px;
+      z-index: 20;
+      display: flex;
+      gap: 6px;
+      padding: 6px;
+      border: 1px solid rgba(75, 55, 38, 0.20);
+      border-radius: 999px;
+      background: rgba(246, 236, 215, 0.76);
+      box-shadow: 0 8px 28px rgba(48, 35, 22, 0.12);
+      backdrop-filter: blur(8px);
+      transform: translateX(-50%);
+      touch-action: manipulation;
+    }
+    .toolButton {
+      appearance: none;
+      border: 1px solid rgba(65, 46, 31, 0.18);
+      border-radius: 999px;
+      background: rgba(255, 250, 238, 0.66);
+      color: rgba(45, 35, 25, 0.72);
+      font: 11px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      letter-spacing: 0.03em;
+      padding: 8px 10px;
+      min-width: 54px;
+    }
+    .toolButton.active {
+      background: rgba(47, 36, 24, 0.82);
+      border-color: rgba(47, 36, 24, 0.26);
+      color: rgba(255, 248, 232, 0.94);
+    }
+    .toolButton:active {
+      transform: translateY(1px);
+    }
   </style>
 </head>
 <body>
-  <div id="hint">hold to drop · Shift-drag rake · P palette · R reset</div>
+  <div id="hint">hold to drop · toolbar rake · P palette · R reset</div>
+  <div id="topToolbar" aria-label="marbling tools">
+    <button id="dropTool" class="toolButton active" type="button">drop</button>
+    <button id="rakeTool" class="toolButton" type="button">rake</button>
+    <button id="paletteTool" class="toolButton" type="button">palette</button>
+    <button id="resetTool" class="toolButton" type="button">reset</button>
+  </div>
   <div id="cornerActions">tap top-left: palette<br>hold top-right: reset</div>
   <script>
     /*
@@ -133,6 +174,7 @@
 
     let pools = [];
     let activePress = null;
+    let activeTool = 'drop';
     let paletteIndex = 0;
     let pigmentIndex = 0;
     let poolId = 1;
@@ -163,6 +205,7 @@
       createCanvas(windowWidth, windowHeight);
       chooseInitialQuality();
       rebuildSurfaces();
+      bindToolbar();
       updateHint();
     }
 
@@ -926,7 +969,49 @@
 
     function updateHint() {
       const el = document.getElementById('hint');
-      el.textContent = `hold to drop · Shift-drag/two-finger rake · P palette · R reset · ${PALETTES[paletteIndex].name}`;
+      const toolLabel = activeTool === 'rake' ? 'rake mode: drag to comb' : 'drop mode: hold to drop';
+      el.textContent = `${toolLabel} · Shift-drag/two-finger rake · P palette · R reset · ${PALETTES[paletteIndex].name}`;
+      updateToolbarState();
+    }
+
+    function bindToolbar() {
+      const toolbar = document.getElementById('topToolbar');
+      if (!toolbar || toolbar.dataset.bound === 'true') return;
+      toolbar.dataset.bound = 'true';
+      toolbar.addEventListener('pointerdown', event => event.stopPropagation());
+      toolbar.addEventListener('touchstart', event => event.stopPropagation(), { passive: false });
+      document.getElementById('dropTool').addEventListener('click', event => {
+        event.preventDefault();
+        setActiveTool('drop');
+      });
+      document.getElementById('rakeTool').addEventListener('click', event => {
+        event.preventDefault();
+        setActiveTool('rake');
+      });
+      document.getElementById('paletteTool').addEventListener('click', event => {
+        event.preventDefault();
+        nextPalette();
+      });
+      document.getElementById('resetTool').addEventListener('click', event => {
+        event.preventDefault();
+        resetAll();
+      });
+      updateToolbarState();
+    }
+
+    function setActiveTool(tool) {
+      activeTool = tool;
+      finishRake();
+      activePress = null;
+      updateHint();
+    }
+
+    function updateToolbarState() {
+      const drop = document.getElementById('dropTool');
+      const rake = document.getElementById('rakeTool');
+      if (!drop || !rake) return;
+      drop.classList.toggle('active', activeTool === 'drop');
+      rake.classList.toggle('active', activeTool === 'rake');
     }
 
     function keyPressed() {
@@ -936,7 +1021,7 @@
 
     function mousePressed() {
       if (touches && touches.length) return false;
-      if (keyIsDown(SHIFT)) {
+      if (activeTool === 'rake' || keyIsDown(SHIFT)) {
         beginRake(mouseX, mouseY);
         return false;
       }
@@ -964,7 +1049,12 @@
 
     function touchStarted() {
       if (touches && touches.length >= 2) {
-        beginRake(touchCentroid().x, touchCentroid().y);
+        const p = touchCentroid();
+        beginRake(p.x, p.y);
+        return false;
+      }
+      if (activeTool === 'rake') {
+        beginRake(mouseX, mouseY);
         return false;
       }
       const t = touches && touches.length ? touches[0] : { x: mouseX, y: mouseY };
@@ -973,8 +1063,8 @@
     }
 
     function touchMoved() {
-      if (raking && touches && touches.length >= 2) {
-        const p = touchCentroid();
+      if (raking) {
+        const p = touches && touches.length ? touchCentroid() : { x: mouseX, y: mouseY };
         updateRake(p.x, p.y);
         return false;
       }
