@@ -97,6 +97,130 @@
       All static HTML; nothing under <code>src/</code> is involved.
     </p>
 
+    <h2>Marker variants (P2 children &mdash; closest path)</h2>
+    <ul>
+      <li>
+        <a class="row" href="./marbling-metaball-markers-crosspool/">
+          <span class="name">Markers &middot; cross-pool color carry (M1)</span>
+          <span class="tag spike">spike M1</span>
+        </a>
+        <div class="desc">
+          A marker pushed into another pool&rsquo;s territory contributes
+          its color to the rendered output, not just its home pool&rsquo;s
+          field. Green marker dragged into red region renders as visible
+          green tint on red base. CROSS_POOL_STRENGTH = 1.5.
+        </div>
+      </li>
+      <li>
+        <a class="row" href="./marbling-metaball-markers-streak/">
+          <span class="name">Markers &middot; anisotropic streaks (M2)</span>
+          <span class="tag spike">spike M2</span>
+        </a>
+        <div class="desc">
+          Each marker carries orientation + aspect. Field contribution is
+          an elongated Gaussian. Rake/comb sets orientation along stroke,
+          increases aspect; aspect decays slowly back to circular. Combed
+          pigment reads as flowing streaks, not displaced dots.
+        </div>
+      </li>
+      <li>
+        <a class="row" href="./marbling-metaball-markers-trails/">
+          <span class="name">Markers &middot; per-pool trail painting (M3)</span>
+          <span class="tag spike">spike M3</span>
+        </a>
+        <div class="desc">
+          Each pool owns a 128&times;128 scar canvas. As markers move,
+          they paint additive Gaussian splats along their path. Scar
+          decays at ~2.3s half-life. Field eval samples scar for extra
+          density contribution &mdash; streaks persist for ~5s after
+          stroke ends. Agent verified via playwright.
+        </div>
+      </li>
+    </ul>
+
+    <h2>Metaball rake variants (preserve look, fix tool-carve)</h2>
+    <ul>
+      <li>
+        <a class="row" href="./marbling-metaball-fission/">
+          <span class="name">Metaball · lobe fission on rake (P1)</span>
+          <span class="tag spike">spike P1</span>
+        </a>
+        <div class="desc">
+          On first rake/comb contact a pool replaces its sparse lobes
+          with K=12 sub-lobes per parent (~10 px radius). Existing
+          per-lobe scar-follow then works because lobe pitch drops below
+          tine pitch. Stays fissioned for the rest of the session.
+        </div>
+      </li>
+      <li>
+        <a class="row" href="./marbling-metaball-markers/">
+          <span class="name">Metaball · inner markers (P2)</span>
+          <span class="tag spike">spike P2</span>
+        </a>
+        <div class="desc">
+          Each pool seeds 120 internal marker particles that contribute
+          small extra field bumps (sigma 7 px, weight 0.28). Rake/comb
+          pushes markers, leaves lobes alone &mdash; pool boundary stays
+          coherent, ripples come from marker streaks.
+        </div>
+      </li>
+      <li>
+        <a class="row" href="./marbling-metaball-scarfield/">
+          <span class="name">Metaball · per-pool scar field (P3)</span>
+          <span class="tag spike">spike P3</span>
+        </a>
+        <div class="desc">
+          Each pool owns a 128&times;128 vector displacement texture in
+          pool-local UV. Rake paints into it; field eval samples the
+          scar for sample-point warp. Pool-scoped so warp can&rsquo;t
+          wander outside the lobe support (the failure mode of the
+          original global field-warp attempt).
+        </div>
+      </li>
+    </ul>
+
+    <h2>Architecture spikes (non-pareil bake-off)</h2>
+    <ul>
+      <li>
+        <a class="row" href="./marbling-advection-webgl/">
+          <span class="name">Advection · WebGL2 stable-fluids (path G)</span>
+          <span class="tag spike">spike G</span>
+        </a>
+        <div class="desc">
+          Stam-style semi-Lagrangian advection on ping-pong RGBA16F
+          textures (512&times;512 sim grid). Velocity + dye fields, no
+          pressure projection. Comb = N tine velocity splats in one
+          frame; non-pareil emerges from the advection step rather than
+          being authored. Recommended path per the comparative analysis.
+        </div>
+      </li>
+      <li>
+        <a class="row" href="./marbling-math-operators/">
+          <span class="name">Math operators · Lu et al. 2012 (path H)</span>
+          <span class="tag spike">spike H</span>
+        </a>
+        <div class="desc">
+          Pigment as a flat array of ~20k color points. Every tool is a
+          deterministic closed-form transform: drop = area-preserving
+          radial push, comb = summed-Gaussian shear across N tines.
+          Direct ImageData stamping; no field, no simulation.
+        </div>
+      </li>
+      <li>
+        <a class="row" href="./marbling-tracer-particles/">
+          <span class="name">Tracer particles · dense impulse tracers (path D)</span>
+          <span class="tag spike">spike D</span>
+        </a>
+        <div class="desc">
+          Scale-up of the particle-displacement baseline. Up to 120k
+          typed-array tracers, spatial hash for broad-phase, same
+          summed-Gaussian comb operator as path H. Honest underdog &mdash;
+          the open question is whether the JS+Canvas2D budget supports
+          enough particle density for ripples to read as continuous.
+        </div>
+      </li>
+    </ul>
+
     <h2>Synthesis</h2>
     <ul>
       <li>

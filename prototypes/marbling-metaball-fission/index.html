@@ -242,6 +242,14 @@
     const RAKE_PERP_FRACTION = 0.30;   // less sideways wobble than before
     const MAX_RAKE_DISPLACEMENT = 95;
     const RAKE_MAX_DT = 0.1;           // clamp first-frame and stutter bursts
+    // P1 — rake is now a 4-tine kernel (versus comb's 36-tine kernel),
+    // matching the success criterion of "4 grooves for rake." Wider tine
+    // pitch makes the carved grooves chunky and obvious. The geometry math
+    // is shared with the comb's tine logic in applyCombImpulse; the rake
+    // delegates to a parameterized helper.
+    const RAKE_TINE_COUNT = 4;
+    const RAKE_TINE_SPACING = 32;      // px between tines
+    const RAKE_TINE_RADIUS = 8;        // each tine's push kernel radius
     // Comb tool — pixel-smudge post-process for non-pareil patterns.
     //
     // The metaball-pool / lobe-follow approach physically cannot produce
@@ -301,6 +309,26 @@
     // the center disk.
     const DRAG_GRAB_LOBE_FACTOR = 1.45;
     const DRAG_GRAB_BUFFER_PX = 16;
+
+    // P1 — Lobe Fission. The trunk's rake/comb tools couldn't carve pools
+    // because pools have N=3..9 large lobes (radius 25–35 px) and the tine
+    // pitch is 6–18 px. Half the lobes get yanked, half don't, and the pool
+    // visibly fragments. Solution: on first rake/comb contact this gesture,
+    // immediately replace each parent lobe with K sub-lobes sampled inside
+    // its disk, with radius = R/sqrt(K) * FISSION_RADIUS_BIAS. Lobe pitch
+    // collapses below tine pitch → per-lobe scar-follow produces clean
+    // tine-aligned columns. Once fissioned, stays fissioned (no recoalesce).
+    const FISSION_K = 12;                  // sub-lobes per parent lobe
+    const FISSION_RADIUS_BIAS = 1.22;      // keep field strong (>1.0/sqrt(K))
+    const FISSION_JITTER_FACTOR = 0.05;    // small jitter inside the disk
+    // Per-lobe scar-follow strength. Dense lobes don't need as much shove
+    // per lobe — the *count* does the carving. Bring rake pushes down a hair
+    // so a fissioned pool doesn't collectively skid forward.
+    const FISSION_RAKE_PUSH_SCALE = 0.55;
+    // Pin cell size when any pool is fissioned. The auto-adapt's "I see
+    // slow frames, drop a tier" would defeat the fine carving by widening
+    // cells, smearing the sub-lobe distinctions back together.
+    const FISSION_PIN_CELL_SIZE = true;
 
     const PALETTES = [
       {
@@ -405,7 +433,7 @@
       // Diagnostic handle: paste `__marble.constants` or `__marble.toolMode`
       // in the DevTools console to confirm which build is loaded.
       window.__marble = {
-        version: 'comb-pixel-smudge-v6-layered',
+        version: 'metaball-fission-v1',
         get toolMode() { return toolMode; },
         get dragSession() { return dragSession; },
         get rakeSession() { return rakeSession; },
@@ -421,6 +449,17 @@
           }
           return { nonzeroCells: nonzero, totalCells: scarDispl.length / 2, maxMagnitude: maxMag };
         },
+        get fissionStats() {
+          let fissionedPools = 0;
+          let totalLobesFissioned = 0;
+          for (const p of pools) {
+            if (p.fissioned) {
+              fissionedPools++;
+              totalLobesFissioned += p.lobes.length;
+            }
+          }
+          return { fissionedPools, totalLobesFissioned, totalPools: pools.length };
+        },
         get constants() {
           return {
             RAKE_PUSH_PER_SECOND, RAKE_RADIUS, MAX_RAKE_DISPLACEMENT,
@@ -428,7 +467,8 @@
             DRAG_GRAB_LOBE_FACTOR, DRAG_GRAB_BUFFER_PX,
             COMB_TINE_COUNT, COMB_TINE_SPACING, COMB_TINE_RADIUS,
             COMB_SMUDGE_ALPHA, COMB_SMUDGE_MAX_STEP, COMB_PAPER_BLEED_ALPHA,
-            MAX_SCAR_PER_CELL, SCAR_CELL_SIZE
+            MAX_SCAR_PER_CELL, SCAR_CELL_SIZE,
+            FISSION_K, FISSION_RADIUS_BIAS, FISSION_RAKE_PUSH_SCALE
           };
         }
       };
@@ -764,6 +804,22 @@
         fastFrameStreak = 0;
         return;
       }
+      // P1 — Lobe Fission quality pin. Once any pool has been fissioned,
+      // its sub-lobes are sized at ~radius/sqrt(K). With FISSION_K=12 a
+      // 30 px parent becomes ~10 px sub-lobes; the field gradient at the
+      // boundary is now ~3 px wide. A cell size of 6–8 px would alias
+      // that gradient and smear the carving back together. Hard-pin to
+      // the current (high) tier so adapting downward can't sabotage
+      // fission's whole reason for existing.
+      if (FISSION_PIN_CELL_SIZE) {
+        for (const p of pools) {
+          if (p.fissioned) {
+            slowFrameStreak = 0;
+            fastFrameStreak = 0;
+            return;
+          }
+        }
+      }
       const totalLobes = totalLobeCount(pools);
       const crowded = pools.length > 14 || totalLobes > 92;
       const slow = lastRenderMs > quality.slowMs || (interacting && crowded && qualityIndex === 0);
@@ -1084,6 +1140,10 @@
       rakeSession = {
         x: constrain(x, 0, width),
         y: constrain(y, 0, height),
+        // Default bar orientation until the user moves: horizontal bar,
+        // tines arranged along x, held perpendicular to upward motion.
+        dirX: 1,
+        dirY: 0,
         startedAt: now,
         // For time-on-contact integration. Updated each applyRakeImpulse
         // call so the first impulse after a pause doesn't accumulate the
@@ -1105,68 +1165,232 @@
         rakeSession.y = cy;
         return;
       }
+      const mag = Math.sqrt(dx * dx + dy * dy);
+      rakeSession.dirX = dx / mag;
+      rakeSession.dirY = dy / mag;
       applyRakeImpulse(cx, cy, dx, dy);
       rakeSession.x = cx;
       rakeSession.y = cy;
     }
 
+    // P1 — Lobe Fission. Replace each of the pool's parent lobes with K
+    // sub-lobes sampled uniformly inside the parent lobe's disk, with a
+    // smaller per-sub-lobe radius chosen so the field strength is roughly
+    // preserved. Sub-lobes inherit the parent's screen-space *current*
+    // position (offsetNow + displaceX/Y) so the fissioned pool looks
+    // identical to the pre-fission pool the instant the operation runs —
+    // no visual pop. After fission the per-lobe scar-follow logic in
+    // applyRakeImpulse/applyCombImpulse operates on the much denser lobe
+    // set, producing tine-aligned ripples.
+    function fissionPool(pool) {
+      if (!pool || pool.preview || pool.fissioned) return;
+      if (!pool.lobes || pool.lobes.length === 0) return;
+      const newLobes = [];
+      const K = FISSION_K;
+      const radiusFactor = (1 / Math.sqrt(K)) * FISSION_RADIUS_BIAS;
+      const TWO_PI_LOCAL = Math.PI * 2;
+      for (const lobe of pool.lobes) {
+        // Compute the parent lobe's *current screen position* relative to
+        // the pool center. We then convert each sub-lobe's screen position
+        // back into an (angle, offset) pair around pool.center so the
+        // existing offsetNow/angle update machinery keeps working.
+        const parentScreenDX = Math.cos(lobe.angle) * lobe.offsetNow + lobe.displaceX;
+        const parentScreenDY = Math.sin(lobe.angle) * lobe.offsetNow + lobe.displaceY;
+        const parentRadius = lobe.radius > 0 ? lobe.radius : (lobe.targetRadius || 8);
+        const subRadius = Math.max(2, parentRadius * radiusFactor);
+        // Stratify K positions inside the parent disk: a small grid of
+        // (angle, normalized-radius) samples plus light jitter. Stratified
+        // beats pure rejection sampling for "even coverage at small K."
+        for (let i = 0; i < K; i++) {
+          // Uniform-in-area sampling: r = R*sqrt(u). Add slight jitter so
+          // we don't get a visible spoke pattern at low K.
+          const u = (i + 0.5 + (Math.random() - 0.5) * FISSION_JITTER_FACTOR) / K;
+          const r = parentRadius * Math.sqrt(Math.min(1, Math.max(0, u)));
+          // Use a phi-incremented angle (golden angle ≈ 2.39996) to
+          // distribute samples without obvious banding.
+          const theta = i * 2.39996 + (lobe.phase || 0);
+          const localDX = Math.cos(theta) * r;
+          const localDY = Math.sin(theta) * r;
+          const screenDX = parentScreenDX + localDX;
+          const screenDY = parentScreenDY + localDY;
+          const subAngle = Math.atan2(screenDY, screenDX);
+          const subOffset = Math.sqrt(screenDX * screenDX + screenDY * screenDY);
+          newLobes.push({
+            angle: subAngle,
+            // Disable the roundness envelope for sub-lobes — at this density
+            // the boundary shape comes from the lobe cloud as a whole, not
+            // from each individual lobe's offset target lerping in/out.
+            baseOffsetTarget: subOffset,
+            contactT: 1,
+            offsetTarget: subOffset,
+            offsetNow: subOffset,            // sit exactly where placed
+            radius: subRadius,
+            targetRadius: subRadius,
+            growthVariation: 1.6,             // fast settle if anything bumps it
+            phase: Math.random() * 1000,
+            displaceX: 0,
+            displaceY: 0,
+            displaceTargetX: 0,
+            displaceTargetY: 0,
+            previewPushX: 0,
+            previewPushY: 0,
+            // isSatellite=true makes refreshContactPressure skip these,
+            // which is exactly what we want — sub-lobes shouldn't deform
+            // toward neighbors; they're already in their final positions
+            // relative to the parent lobe's footprint.
+            isSatellite: true,
+            isFissionLobe: true
+          });
+        }
+      }
+      pool.lobes = newLobes;
+      pool.fissioned = true;
+      pool.settled = false;
+      pool.updateGeometry();
+      markDirtyRect(pool.fieldRect);
+      dirty = true;
+    }
+
+    // Convenience: identify which pool a screen-space point belongs to via
+    // its pixelBounds + lobe disks. Used by rake/comb to decide which pools
+    // need fissioning on first contact. Returns array of pools that may be
+    // touched by a kernel of given radius around (x, y).
+    function poolsNearPoint(x, y, kernelRadius) {
+      const out = [];
+      const kr2 = kernelRadius * kernelRadius;
+      for (const pool of pools) {
+        if (pool.preview) continue;
+        const pb = pool.pixelBounds;
+        if (!pb) continue;
+        // Bounding box quick reject expanded by kernelRadius.
+        if (x < pb.x0 - kernelRadius || x > pb.x1 + kernelRadius ||
+            y < pb.y0 - kernelRadius || y > pb.y1 + kernelRadius) continue;
+        // Cheaper full check: any sampleLobe whose disk + kernel overlaps point.
+        let hit = false;
+        for (const sl of pool.sampleLobes) {
+          const dx = sl.x - x;
+          const dy = sl.y - y;
+          const reach = sl.radius + kernelRadius;
+          if (dx * dx + dy * dy <= reach * reach) { hit = true; break; }
+        }
+        if (hit) out.push(pool);
+      }
+      return out;
+    }
+
+    // P1 — Rake is now a multi-tine kernel (4 chunky tines at 32 px pitch).
+    // The previous single-disk rake didn't carve through fissioned pools any
+    // better than it carved through the original lobes — a wide radial kernel
+    // pushes every nearby lobe uniformly, so the result is "whole region
+    // shifts forward" rather than "tine-aligned columns shift forward". With
+    // 4 narrow tines, each tine captures the lobes directly under it and
+    // leaves the gaps between tines undisturbed, producing the parallel
+    // grooves the success criterion calls for.
     function applyRakeImpulse(x, y, vx, vy) {
       if (!rakeSession) return;
-      const radius = RAKE_RADIUS;
-      const radius2 = radius * radius;
-      const maxOffset2 = MAX_RAKE_DISPLACEMENT * MAX_RAKE_DISPLACEMENT;
-      // Normalize the per-frame motion to a unit stroke direction. The
-      // magnitude of (vx, vy) no longer participates in the impulse — it
-      // only tells us *which way* the user is dragging. Net displacement
-      // comes from how long a lobe stays inside the kernel, not how fast
-      // the cursor crossed it.
       const speed = Math.hypot(vx, vy);
       if (speed < 0.01) return;
       const dirX = vx / speed;
       const dirY = vy / speed;
-      // Perpendicular shear axis (90° CCW from stroke direction).
-      const perpX = -dirY;
-      const perpY = dirX;
-      // Time on contact — clamp dt so a paused-then-resumed stroke (or
-      // a frame skipped by the browser) doesn't dump a huge accumulated
-      // delta on the first frame back.
       const now = millis();
       const dt = Math.min(RAKE_MAX_DT, (now - rakeSession.lastImpulseAt) / 1000);
       rakeSession.lastImpulseAt = now;
-      const pushBase = RAKE_PUSH_PER_SECOND * dt;
-      const perpBase = pushBase * RAKE_PERP_FRACTION;
+      applyTineImpulse({
+        x, y, dirX, dirY, dt,
+        tineCount: RAKE_TINE_COUNT,
+        tineSpacing: RAKE_TINE_SPACING,
+        tineRadius: RAKE_TINE_RADIUS,
+        pushPerSec: RAKE_PUSH_PER_SECOND,
+        perpFraction: RAKE_PERP_FRACTION,
+        falloffPower: RAKE_FALLOFF_POWER,
+        maxOffset: MAX_RAKE_DISPLACEMENT
+      });
+    }
+
+    // Shared multi-tine impulse kernel used by both rake (few wide tines)
+    // and comb (many narrow tines). Fissions every pool the comb bar
+    // overlaps, then per-lobe pushes for each tine in the bar.
+    function applyTineImpulse(opts) {
+      const { x, y, dirX, dirY, dt,
+              tineCount, tineSpacing, tineRadius,
+              pushPerSec, perpFraction, falloffPower, maxOffset } = opts;
+      const perpX = -dirY;
+      const perpY = dirX;
+      const half = (tineCount - 1) / 2;
+      const barHalf = half * tineSpacing + tineRadius;
+      // Fission every pool the bar overlaps. fissionPool is idempotent.
+      const touchedPools = poolsNearPoint(x, y, barHalf);
+      for (const p of touchedPools) {
+        if (!p.fissioned) fissionPool(p);
+      }
+      const pushBase = pushPerSec * dt;
+      const perpBase = perpFraction ? pushBase * perpFraction : 0;
+      const maxOffset2 = maxOffset * maxOffset;
+      // Tine center positions on screen.
+      const tineCx = new Float32Array(tineCount);
+      const tineCy = new Float32Array(tineCount);
+      let barX0 = Infinity, barY0 = Infinity, barX1 = -Infinity, barY1 = -Infinity;
+      for (let i = 0; i < tineCount; i++) {
+        const offset = (i - half) * tineSpacing;
+        const tx = x + perpX * offset;
+        const ty = y + perpY * offset;
+        tineCx[i] = tx;
+        tineCy[i] = ty;
+        if (tx < barX0) barX0 = tx;
+        if (ty < barY0) barY0 = ty;
+        if (tx > barX1) barX1 = tx;
+        if (ty > barY1) barY1 = ty;
+      }
+      barX0 -= tineRadius; barY0 -= tineRadius;
+      barX1 += tineRadius; barY1 += tineRadius;
+      // Capture radius — slightly wider than visual tineRadius so lobes
+      // mid-stride between tines still feel the rake. 3x for narrow comb
+      // tines, ~1.4x for wider rake tines.
+      const captureMul = tineRadius < 4 ? 3 : 1.4;
+      const capR = tineRadius * captureMul;
+      const capR2 = capR * capR;
       let touchedAny = false;
       for (const pool of pools) {
         if (pool.preview) continue;
+        const pb = pool.pixelBounds;
+        if (!pb) continue;
+        if (pb.x1 < barX0 || pb.x0 > barX1 || pb.y1 < barY0 || pb.y0 > barY1) continue;
+        const pushScale = pool.fissioned ? FISSION_RAKE_PUSH_SCALE : 1;
         let touched = false;
         for (const lobe of pool.lobes) {
           const lx = pool.center.x + Math.cos(lobe.angle) * lobe.offsetNow + lobe.displaceX;
           const ly = pool.center.y + Math.sin(lobe.angle) * lobe.offsetNow + lobe.displaceY;
-          const rx = lx - x;
-          const ry = ly - y;
+          // Project the lobe onto the bar's perpendicular axis to find the
+          // nearest tine. This avoids an O(lobes * tines) inner loop.
+          const dxL = lx - x;
+          const dyL = ly - y;
+          const projPerp = dxL * perpX + dyL * perpY;
+          const idx = Math.round(projPerp / tineSpacing) + half;
+          if (idx < 0 || idx >= tineCount) continue;
+          const tx = tineCx[idx];
+          const ty = tineCy[idx];
+          const rx = lx - tx;
+          const ry = ly - ty;
           const r2 = rx * rx + ry * ry;
-          if (r2 > radius2) continue;
+          if (r2 > capR2) continue;
           const r = Math.sqrt(r2);
-          // Smooth power falloff: 1 at the cursor, 0 at the edge of radius.
-          const f = Math.pow(1 - r / radius, RAKE_FALLOFF_POWER);
-          const push = pushBase * f;
+          const f = Math.pow(Math.max(0, 1 - r / capR), falloffPower);
+          const push = pushBase * f * pushScale;
           lobe.displaceTargetX += dirX * push;
           lobe.displaceTargetY += dirY * push;
-          // Perpendicular shear: signed by which side of the stroke axis
-          // the lobe sits on. `side` is the projection of (rx, ry) onto
-          // the perp axis, normalized by the kernel radius so it lives
-          // in [-1, 1] regardless of cursor speed. Lobes near the
-          // stroke center get ~0 perp; off-axis lobes get a tangential
-          // nudge — this is what produces the slight swirl at stroke
-          // ends rather than a pure straight tug.
-          const side = (rx * perpX + ry * perpY) / radius;
-          const sk = perpBase * f * side;
-          lobe.displaceTargetX += perpX * sk;
-          lobe.displaceTargetY += perpY * sk;
+          if (perpBase > 0) {
+            // Perpendicular shear within the *tine* (off-tine-center lobes
+            // get a slight tangential nudge). Side is signed by the projection
+            // onto perp, normalized by the local capture radius.
+            const side = (rx * perpX + ry * perpY) / capR;
+            const sk = perpBase * f * side * pushScale;
+            lobe.displaceTargetX += perpX * sk;
+            lobe.displaceTargetY += perpY * sk;
+          }
           const dist2 = lobe.displaceTargetX * lobe.displaceTargetX +
                         lobe.displaceTargetY * lobe.displaceTargetY;
           if (dist2 > maxOffset2) {
-            const scale = MAX_RAKE_DISPLACEMENT / Math.sqrt(dist2);
+            const scale = maxOffset / Math.sqrt(dist2);
             lobe.displaceTargetX *= scale;
             lobe.displaceTargetY *= scale;
           }
@@ -1189,6 +1413,7 @@
     // produce peacock, nonpareil, and get-gel patterns work exactly this way
     // — many tines pulled through a layer of pigment in a single direction.
     function startCombSession(x, y) {
+      const now = millis();
       combSession = {
         x: constrain(x, 0, width),
         y: constrain(y, 0, height),
@@ -1196,7 +1421,8 @@
         // the (invisible) comb bar runs horizontally and is held vertically.
         dirX: 1,
         dirY: 0,
-        startedAt: millis()
+        startedAt: now,
+        lastImpulseAt: now
       };
       dirty = true;
     }
@@ -1235,61 +1461,32 @@
     //      stroke build up a continuous trail rather than disconnected
     //      stamps.
     // Path subdivision keeps fast strokes from leaving gaps.
+    // P1 — Comb impulse rewritten on top of Lobe Fission. The previous
+    // pixel-smudge implementation has been retired (combLayer left allocated
+    // but never written to). Each tine is now a small per-lobe push kernel
+    // (see applyTineImpulse). With dense sub-lobes (FISSION_K × parent count,
+    // typically 60–100 lobes per pool), each tine captures 1–3 lobes and
+    // pushes them forward; lobes between tines stay put; the metaball
+    // isosurface forms parallel ripples (non-pareil).
     function applyCombImpulse(x, y, vx, vy, dirX, dirY) {
-      if (!combLayer || !pigmentLayer) return;
-      const perpX = -dirY;
-      const perpY = dirX;
-      const half = (COMB_TINE_COUNT - 1) / 2;
-      const tineR = COMB_TINE_RADIUS;
-      const motionLen = Math.sqrt(vx * vx + vy * vy);
-      const stepCount = Math.max(1, Math.ceil(motionLen / Math.max(0.5, COMB_SMUDGE_MAX_STEP)));
-      const stepVx = vx / stepCount;
-      const stepVy = vy / stepCount;
-      const startX = x - vx;
-      const startY = y - vy;
-      const ctx = combLayer.drawingContext;
-      const TWO_PI_LOCAL = Math.PI * 2;
-      const paper = PALETTES[paletteIndex].surface;
-      ctx.save();
-      for (let step = 1; step <= stepCount; step++) {
-        const sx = startX + stepVx * step;
-        const sy = startY + stepVy * step;
-        for (let i = 0; i < COMB_TINE_COUNT; i++) {
-          const offset = (i - half) * COMB_TINE_SPACING;
-          const tx = sx + perpX * offset;
-          const ty = sy + perpY * offset;
-          if (tx < -tineR || tx > width + tineR || ty < -tineR || ty > height + tineR) continue;
-          ctx.save();
-          ctx.beginPath();
-          ctx.arc(tx, ty, tineR, 0, TWO_PI_LOCAL);
-          ctx.clip();
-          // Stamp 1 — pick up pigment from pigmentLayer at the tine's
-          // previous position and deposit at the current position.
-          // drawImage(src, stepVx, stepVy) places src[0,0] at dest[stepVx,
-          // stepVy], which is equivalent to dest[x, y] := src[x-stepVx,
-          // y-stepVy]. Inside our clip at (tx, ty) that reads
-          // pigmentLayer at (tx-stepVx, ty-stepVy) = previous tine pos.
-          ctx.globalAlpha = COMB_SMUDGE_ALPHA;
-          ctx.drawImage(pigmentLayer.canvas, stepVx, stepVy);
-          // Stamp 2 — propagate any accumulated combLayer pigment
-          // forward. On the first frame of a stroke combLayer is empty
-          // here, so this is a no-op; on subsequent frames it carries
-          // the trail of the prior frames forward by one step.
-          ctx.globalAlpha = COMB_SMUDGE_ALPHA * 0.7;
-          ctx.drawImage(combLayer.canvas, stepVx, stepVy);
-          // Optional paper-color bleed — makes the tine path readable
-          // even when combing through a single-color region. Drawn
-          // last so it sits on top of the smudge in this tine disk.
-          if (COMB_PAPER_BLEED_ALPHA > 0) {
-            ctx.globalAlpha = COMB_PAPER_BLEED_ALPHA;
-            ctx.fillStyle = paper;
-            ctx.fillRect(tx - tineR, ty - tineR, tineR * 2, tineR * 2);
-          }
-          ctx.restore();
-        }
-      }
-      ctx.restore();
-      dirty = true;
+      const now = millis();
+      const dt = Math.min(RAKE_MAX_DT,
+        (now - (combSession.lastImpulseAt || now)) / 1000);
+      combSession.lastImpulseAt = now;
+      applyTineImpulse({
+        x, y, dirX, dirY, dt,
+        tineCount: COMB_TINE_COUNT,
+        tineSpacing: COMB_TINE_SPACING,
+        tineRadius: COMB_TINE_RADIUS,
+        // Comb pushes need to be lighter than rake — many tines feeding into
+        // the same field means a small per-tine impulse adds up to visible
+        // ripples without making the pool slide.
+        pushPerSec: RAKE_PUSH_PER_SECOND * 0.55,
+        // Tangential shear off — comb tines should pull straight forward.
+        perpFraction: 0,
+        falloffPower: RAKE_FALLOFF_POWER,
+        maxOffset: MAX_RAKE_DISPLACEMENT
+      });
     }
 
     // Legacy scar-impulse writer — retained as a no-op so nothing
@@ -1307,12 +1504,29 @@
     // orientation of the comb relative to their stroke direction.
     function renderDragCursor() {
       if (rakeSession) {
-        noFill();
+        // P1 — rake cursor now shows the 4-tine bar (matching the underlying
+        // push kernel). Orientation comes from the recent stroke direction;
+        // until the user moves, default to a horizontal bar held vertically.
+        let dirX = rakeSession.dirX || 1;
+        let dirY = rakeSession.dirY || 0;
+        const perpX = -dirY;
+        const perpY = dirX;
+        const half = (RAKE_TINE_COUNT - 1) / 2;
+        const halfBar = half * RAKE_TINE_SPACING;
         stroke(35, 25, 18, 110);
         strokeWeight(1);
-        circle(rakeSession.x, rakeSession.y, RAKE_RADIUS * 2);
-        stroke(255, 250, 238, 80);
-        circle(rakeSession.x, rakeSession.y, RAKE_RADIUS * 0.6);
+        line(
+          rakeSession.x - perpX * halfBar, rakeSession.y - perpY * halfBar,
+          rakeSession.x + perpX * halfBar, rakeSession.y + perpY * halfBar
+        );
+        noFill();
+        stroke(35, 25, 18, 170);
+        for (let i = 0; i < RAKE_TINE_COUNT; i++) {
+          const offset = (i - half) * RAKE_TINE_SPACING;
+          const tx = rakeSession.x + perpX * offset;
+          const ty = rakeSession.y + perpY * offset;
+          circle(tx, ty, RAKE_TINE_RADIUS * 2);
+        }
       }
       if (combSession) {
         const perpX = -combSession.dirY;
@@ -1381,7 +1595,10 @@
           MAX_SATELLITES_PER_POOL - existingSatelliteCount);
 
         for (const lobe of pool.lobes) {
-          if (lobe.isSatellite) continue; // don't push satellites recursively
+          // Skip D4 ejected fleck satellites, but fission sub-lobes
+          // (isFissionLobe) must still receive the push — they ARE the
+          // pool's body now.
+          if (lobe.isSatellite && !lobe.isFissionLobe) continue;
           const lx = pool.center.x + Math.cos(lobe.angle) * lobe.offsetNow + lobe.displaceX;
           const ly = pool.center.y + Math.sin(lobe.angle) * lobe.offsetNow + lobe.displaceY;
           const dx = lx - cx;
@@ -1400,8 +1617,10 @@
           touched = true;
 
           // D4 — satellite eject for lobes near or inside the new pool.
-          // Stop adding once we've hit per-event or per-pool caps.
-          if (satellitesSpawnedThisEvent < SATELLITES_PER_EVENT &&
+          // Skip for fission lobes — they're already the dense body and
+          // don't need ejected flecks of themselves.
+          if (!lobe.isFissionLobe &&
+              satellitesSpawnedThisEvent < SATELLITES_PER_EVENT &&
               satellitesSpawnedThisEvent < satelliteRoom &&
               d < Rnew * SATELLITE_PROXIMITY_FACTOR) {
             const ejectDist = Rnew + lobe.radius * 0.55 + random(8, 26);
@@ -1465,7 +1684,7 @@
         if (pool.preview) continue;
         let touched = false;
         for (const lobe of pool.lobes) {
-          if (lobe.isSatellite) continue;
+          if (lobe.isSatellite && !lobe.isFissionLobe) continue;
           // Compute against the committed-target screen position so the
           // preview math is stable while the lerp is mid-flight.
           const lx = pool.center.x + Math.cos(lobe.angle) * lobe.offsetNow + lobe.displaceTargetX;
@@ -1645,6 +1864,10 @@
         this.seed = seed;
         this.settled = false;
         this.preview = preview;
+        // P1 — Lobe Fission. Set true once a rake/comb stroke has split this
+        // pool's lobes into a dense sub-lobe distribution. Stays true for the
+        // rest of the session (no recoalesce).
+        this.fissioned = false;
         this.lobes = [];
         this.innerLobes = []; // D2 — sub-metaballs for interior color modulation
         this.sampleLobes = [];

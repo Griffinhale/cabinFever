@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
-  <title>Marbling Metaball Pools — Refined</title>
+  <title>Marbling Metaball Pools — Scar Field (P3)</title>
   <script src="https://cdn.jsdelivr.net/npm/p5@1.11.3/lib/p5.min.js"></script>
   <script>window.p5 && (p5.disableFriendlyErrors = true);</script>
   <style>
@@ -242,57 +242,54 @@
     const RAKE_PERP_FRACTION = 0.30;   // less sideways wobble than before
     const MAX_RAKE_DISPLACEMENT = 95;
     const RAKE_MAX_DT = 0.1;           // clamp first-frame and stutter bursts
-    // Comb tool — pixel-smudge post-process for non-pareil patterns.
-    //
-    // The metaball-pool / lobe-follow approach physically cannot produce
-    // non-pareil: there are ~9 lobes per pool, and non-pareil needs
-    // dozens of fine parallel ripples — strictly sub-lobe resolution.
-    // We move the comb out of the field abstraction entirely. Each
-    // tine is now a small clipped region on pigmentLayer; per frame,
-    // pigmentLayer is drawn onto itself with the cursor's (vx, vy)
-    // offset, clipped to that disk, with partial alpha. Within the
-    // disk every pixel adopts the value that was at (px - vx, py - vy)
-    // a frame earlier, blended against what's already there. Over a
-    // stroke that disk "drags" pigment forward along the tine path.
-    //
-    // For multi-color pools this produces the classic non-pareil
-    // banded effect — color stripes pulled laterally into hundreds
-    // of fine ripples. For a single-color pool the smudge is
-    // effectively invisible (same color in, same color out), which
-    // matches the physical reality: real non-pareil combs over a
-    // single-color slab also produce no visible pattern.
-    //
-    // Tine geometry tuned tight: 36 fine tines at 6 px pitch, 2 px
-    // radius. Total bar ≈ 216 px wide. Disk diameter (4 px) plus 2 px
-    // gap between tines gives a clean alternating-band pattern.
-    const COMB_TINE_COUNT = 36;
-    const COMB_TINE_SPACING = 6;
-    const COMB_TINE_RADIUS = 2;
-    // Per-frame smudge blend factor. Each tine's disk on pigmentLayer
-    // becomes (alpha × source-shifted + (1-alpha) × destination), so
-    // ~0.6 gives a strong forward drag while still letting some of
-    // the original pigment under the tine show through. Lower values
-    // produce a more delicate smudge; higher values approach a hard
-    // "stamp" of the previous frame's pigment.
-    const COMB_SMUDGE_ALPHA = 0.6;
-    // Max length of (vx, vy) per smudge "step." If the cursor moves
-    // faster than this per frame, the path is subdivided so the disk
-    // overlaps from one step to the next — otherwise fast strokes
-    // would leave visible gaps between non-overlapping smudge stamps.
-    const COMB_SMUDGE_MAX_STEP = 2;
-    // Optional subtle paper-color bleed at the tine path — fakes the
-    // "pigment pushed aside leaves a visible channel" effect that
-    // real combs produce even on single-color slabs. 0 disables.
-    const COMB_PAPER_BLEED_ALPHA = 0.06;
-    // --- Legacy infrastructure retained but dormant ---
-    // The scar/field-warp + lobe-follow approach is no longer wired
-    // into the comb. scarDispl is still allocated and resetAll still
-    // clears it, but applyCombImpulse no longer writes it and fieldAt
-    // / applyScarFollow ignore it. Constants kept so the diagnostic
-    // handle continues to expose them; can be removed once the new
-    // pixel-smudge approach is locked in.
-    const SCAR_CELL_SIZE = 5;
-    const MAX_SCAR_PER_CELL = 55;
+    // ----------------------------------------------------------------
+    // P3 — Per-Pool Scar Field (rake + comb)
+    // ----------------------------------------------------------------
+    // Each pool owns a Float32Array(SCAR_RES * SCAR_RES * 2) of (dx, dy)
+    // displacement vectors expressed in *screen pixels*, addressed by
+    // pool-local UV in [0,1]^2 that maps to the pool's bbox. Rake/comb
+    // strokes splat Gaussians of (vx*dt, vy*dt) into the texture at the
+    // tine's pool-local UV; pool.fieldAt samples the texture and shifts
+    // the lobe-evaluation sample point, deforming the pool's *interior*
+    // without changing its outline. Replaces both the failed global
+    // sample-point scar warp (#1: out-of-support sample returns 0) and
+    // the comb pixel-smudge (fragile drawImage chain).
+    const SCAR_RES = 128;
+    // Stride along U-axis in floats (vec2 per texel).
+    const SCAR_STRIDE = SCAR_RES * 2;
+    // Bbox is the pool-local UV frame. Initial bbox = circle of
+    // baseRadius * SCAR_BBOX_EXPAND, centered on pool.center. Conservative
+    // expansion gives the scar room to displace into without sample
+    // points wandering outside the texture footprint.
+    const SCAR_BBOX_EXPAND = 1.7;
+    // Max accumulated |dx|, |dy| per texel — clamps wild strokes so a
+    // long drag can't punch through the pool. Tuned to ~30% of typical
+    // pool radius (sqrt(typicalMass/PI) ≈ 75 → ~22 px).
+    const SCAR_MAX_DISPL_PX = 24;
+    // Optional per-frame decay (0 = scars persist forever). Slight decay
+    // keeps a stroke's groove crisp but lets old marks fade so the canvas
+    // can be reused. Set to 0 to disable for the success-criterion test.
+    const SCAR_DECAY_PER_FRAME = 0.0;
+    // Rake tool — splat-per-tine config.
+    // RAKE behaves like a wide brush with a small number of broad tines so
+    // it carves a few fat grooves. Tine pitch + sigma chosen so neighboring
+    // tine splats remain visibly distinct on a typical bbox.
+    const RAKE_SCAR_TINE_COUNT = 4;
+    const RAKE_SCAR_TINE_SPACING_PX = 18; // screen-px between tines
+    const RAKE_SCAR_TINE_SIGMA_PX = 6;    // gaussian sigma in screen-px
+    // RAKE_PUSH_PER_SECOND_LOCAL is the rate at which a tine accumulates
+    // displacement into the scar texture during a stroke. Multiplied by dt
+    // and the gaussian falloff. Per-frame accumulation in the texture
+    // turns this into a deep groove over a few frames of drag.
+    const RAKE_SCAR_PUSH_PER_SECOND = 200;
+    // Comb tool — many fine tines, narrower sigma. 20+ tines for the
+    // non-pareil pattern. Pitch + sigma must keep adjacent tines just
+    // separable when projected into scar-texel space.
+    const COMB_SCAR_TINE_COUNT = 22;
+    const COMB_SCAR_TINE_SPACING_PX = 8;
+    const COMB_SCAR_TINE_SIGMA_PX = 2.6;
+    const COMB_SCAR_PUSH_PER_SECOND = 240;
+    const SCAR_TIME_MAX_DT = 0.1;
     // Drag tool — picks up a single pool by its footprint and translates its
     // center as the cursor moves. Whole-pool motion (not per-lobe), so the
     // bubble is rearranged without distorting it. Grab zone uses the union
@@ -374,19 +371,11 @@
     let field = [];
     let dirtyRects = [];
     let fullFieldDirty = true;
-    // Comb scar field — Float32Array of (dx, dy) pairs over a 2D grid.
-    // Persistent: scars accumulate as the comb is dragged and stay after
-    // release. fieldAt reads this grid to shift its sample point.
-    let scarDispl = null;
-    let scarCols = 0;
-    let scarRows = 0;
+    // P3 — per-pool scar fields. Each Pool owns its own scar (see
+    // PigmentPool); these globals are no longer used. Kept removed
+    // to make sure stale code paths break loudly.
     let paperLayer;
     let pigmentLayer;
-    // Separate compositing layer for the comb's pixel smudges. Kept
-    // independent of pigmentLayer so that field re-evaluations (pool
-    // growth, drift, displacement) don't wipe combings under their
-    // dirty rect. Rendered ON TOP of pigmentLayer in renderScene.
-    let combLayer;
     let lastDrawHadMotion = false;
     let pendingReset = null;
     let lastRenderMs = 0;
@@ -405,30 +394,40 @@
       // Diagnostic handle: paste `__marble.constants` or `__marble.toolMode`
       // in the DevTools console to confirm which build is loaded.
       window.__marble = {
-        version: 'comb-pixel-smudge-v6-layered',
+        version: 'metaball-scarfield-v1',
         get toolMode() { return toolMode; },
         get dragSession() { return dragSession; },
         get rakeSession() { return rakeSession; },
         get combSession() { return combSession; },
         get pools() { return pools; },
         get scarStats() {
-          if (!scarDispl) return null;
-          let nonzero = 0, maxMag = 0;
-          for (let i = 0; i < scarDispl.length; i += 2) {
-            const m2 = scarDispl[i] * scarDispl[i] + scarDispl[i + 1] * scarDispl[i + 1];
-            if (m2 > 0.0001) nonzero++;
-            if (m2 > maxMag * maxMag) maxMag = Math.sqrt(m2);
+          // Per-pool scar field stats. Aggregated across pools so the
+          // diagnostic console handle gives a quick "is anything getting
+          // splatted in there" pulse.
+          let nonzero = 0, totalCells = 0, maxMag = 0;
+          for (const pool of pools) {
+            if (!pool.scar) continue;
+            for (let i = 0; i < pool.scar.length; i += 2) {
+              const dx = pool.scar[i];
+              const dy = pool.scar[i + 1];
+              if (dx * dx + dy * dy > 0.0001) nonzero++;
+              const m = Math.sqrt(dx * dx + dy * dy);
+              if (m > maxMag) maxMag = m;
+            }
+            totalCells += pool.scar.length / 2;
           }
-          return { nonzeroCells: nonzero, totalCells: scarDispl.length / 2, maxMagnitude: maxMag };
+          return { pools: pools.length, nonzeroCells: nonzero, totalCells, maxMagnitude: maxMag };
         },
         get constants() {
           return {
             RAKE_PUSH_PER_SECOND, RAKE_RADIUS, MAX_RAKE_DISPLACEMENT,
             RAKE_PERP_FRACTION, RAKE_FALLOFF_POWER, RAKE_MAX_DT,
             DRAG_GRAB_LOBE_FACTOR, DRAG_GRAB_BUFFER_PX,
-            COMB_TINE_COUNT, COMB_TINE_SPACING, COMB_TINE_RADIUS,
-            COMB_SMUDGE_ALPHA, COMB_SMUDGE_MAX_STEP, COMB_PAPER_BLEED_ALPHA,
-            MAX_SCAR_PER_CELL, SCAR_CELL_SIZE
+            SCAR_RES, SCAR_BBOX_EXPAND, SCAR_MAX_DISPL_PX, SCAR_DECAY_PER_FRAME,
+            RAKE_SCAR_TINE_COUNT, RAKE_SCAR_TINE_SPACING_PX,
+            RAKE_SCAR_TINE_SIGMA_PX, RAKE_SCAR_PUSH_PER_SECOND,
+            COMB_SCAR_TINE_COUNT, COMB_SCAR_TINE_SPACING_PX,
+            COMB_SCAR_TINE_SIGMA_PX, COMB_SCAR_PUSH_PER_SECOND
           };
         }
       };
@@ -458,8 +457,10 @@
       } else {
         image(paperLayer, 0, 0);
         image(pigmentLayer, 0, 0);
-        if (combLayer) image(combLayer, 0, 0);
       }
+      // Optional global scar decay. Cheap (per-pool * SCAR_RES^2 once a
+      // frame, so 128*128 = 16k ops/pool). Disabled by default.
+      if (SCAR_DECAY_PER_FRAME > 0) decayAllScars();
       lastDrawHadMotion = moving;
     }
 
@@ -467,64 +468,193 @@
       fieldCols = Math.ceil(width / quality.cellSize);
       fieldRows = Math.ceil(height / quality.cellSize);
       field = new Array(fieldCols * fieldRows);
-      rebuildScarField();
       paperLayer = createGraphics(width, height);
       pigmentLayer = createGraphics(width, height);
-      combLayer = createGraphics(width, height);
       pigmentLayer.pixelDensity(1);
       paperLayer.pixelDensity(1);
-      combLayer.pixelDensity(1);
       renderPaper();
       for (const pool of pools) pool.updateGeometry();
       lastPreviewRect = null;
       markFullFieldDirty();
     }
 
-    function rebuildScarField() {
-      scarCols = Math.ceil(width / SCAR_CELL_SIZE) + 2;
-      scarRows = Math.ceil(height / SCAR_CELL_SIZE) + 2;
-      scarDispl = new Float32Array(scarCols * scarRows * 2);
-    }
-
-    function clearScarField() {
-      if (scarDispl) scarDispl.fill(0);
-    }
-
-    // Reusable two-element buffer for scarLookupAt's output. Allocating
-    // once here keeps the hot paths (fieldAt per-cell, applyScarFollow
-    // per-lobe) from generating GC pressure.
+    // ---- P3 per-pool scar field helpers --------------------------------
+    // Reusable scratch for sampleScar return. fieldAt is the hot caller
+    // (per cell per pool), so we avoid GC churn here.
     const __scarOut = new Float32Array(2);
 
-    // Bilinear sample of the persistent scar displacement grid at screen
-    // coords (x, y). Writes the result into __scarOut and returns it; out-
-    // of-bounds samples return (0, 0). Both fieldAt (sample-point warp)
-    // and PigmentPool.applyScarFollow (per-lobe target nudge) share this.
-    function scarLookupAt(x, y) {
+    // paintScar(pool, px, py, dispX, dispY, sigmaPx)
+    //   Splat a Gaussian of (dispX, dispY) screen-px displacement into
+    //   pool.scar at the pool-local UV corresponding to screen point
+    //   (px, py). sigmaPx is the splat radius *in screen px*; converted
+    //   into scar-texel coords using pool.bbox so the same sigma always
+    //   maps to the same visible size regardless of bbox extent.
+    function paintScar(pool, px, py, dispX, dispY, sigmaPx) {
+      if (!pool.scar || !pool.bbox) return;
+      const bbox = pool.bbox;
+      const u = (px - bbox.x) / bbox.w;
+      const v = (py - bbox.y) / bbox.h;
+      if (u < 0 || u > 1 || v < 0 || v > 1) return;
+      // Center in texel coords (continuous).
+      const cu = u * (SCAR_RES - 1);
+      const cv = v * (SCAR_RES - 1);
+      // Sigma in texel coords. bbox.w may differ from bbox.h slightly if
+      // the pool got stretched; pick the smaller so splats stay isotropic
+      // in the smaller dimension and don't bleed too far in the larger.
+      const sigU = sigmaPx / (bbox.w / SCAR_RES);
+      const sigV = sigmaPx / (bbox.h / SCAR_RES);
+      const sigEff = Math.min(sigU, sigV);
+      // Truncation radius — 3 sigma is the de-facto Gaussian cutoff.
+      const rad = Math.max(1, Math.ceil(sigEff * 3));
+      const u0 = Math.max(0, Math.floor(cu - rad));
+      const u1 = Math.min(SCAR_RES - 1, Math.ceil(cu + rad));
+      const v0 = Math.max(0, Math.floor(cv - rad));
+      const v1 = Math.min(SCAR_RES - 1, Math.ceil(cv + rad));
+      const inv2s2 = 1 / (2 * sigEff * sigEff);
+      const scar = pool.scar;
+      const maxD = SCAR_MAX_DISPL_PX;
+      for (let vy = v0; vy <= v1; vy++) {
+        const dvY = vy - cv;
+        const rowOff = vy * SCAR_STRIDE;
+        for (let vx = u0; vx <= u1; vx++) {
+          const dvX = vx - cu;
+          const w = Math.exp(-(dvX * dvX + dvY * dvY) * inv2s2);
+          if (w < 0.01) continue;
+          const off = rowOff + vx * 2;
+          let nx = scar[off]     + dispX * w;
+          let ny = scar[off + 1] + dispY * w;
+          if (nx >  maxD) nx =  maxD; else if (nx < -maxD) nx = -maxD;
+          if (ny >  maxD) ny =  maxD; else if (ny < -maxD) ny = -maxD;
+          scar[off]     = nx;
+          scar[off + 1] = ny;
+        }
+      }
+    }
+
+    // sampleScar(pool, sx, sy) — bilinear sample of pool.scar at the
+    // pool-local UV. Out-of-bbox samples return (0, 0). Writes into
+    // __scarOut to avoid allocation.
+    function sampleScar(pool, sx, sy) {
       __scarOut[0] = 0;
       __scarOut[1] = 0;
-      if (!scarDispl) return __scarOut;
-      const sfx = x / SCAR_CELL_SIZE;
-      const sfy = y / SCAR_CELL_SIZE;
-      const sgx0 = sfx | 0;
-      const sgy0 = sfy | 0;
-      if (sgx0 < 0 || sgy0 < 0 || sgx0 + 1 >= scarCols || sgy0 + 1 >= scarRows) {
-        return __scarOut;
-      }
-      const stx = sfx - sgx0;
-      const sty = sfy - sgy0;
-      const si00 = (sgx0 + sgy0 * scarCols) * 2;
-      const si10 = si00 + 2;
-      const si01 = si00 + scarCols * 2;
-      const si11 = si01 + 2;
-      const a00 = (1 - stx) * (1 - sty);
-      const a10 = stx * (1 - sty);
-      const a01 = (1 - stx) * sty;
-      const a11 = stx * sty;
-      __scarOut[0] = scarDispl[si00]     * a00 + scarDispl[si10]     * a10 +
-                     scarDispl[si01]     * a01 + scarDispl[si11]     * a11;
-      __scarOut[1] = scarDispl[si00 + 1] * a00 + scarDispl[si10 + 1] * a10 +
-                     scarDispl[si01 + 1] * a01 + scarDispl[si11 + 1] * a11;
+      if (!pool.scar || !pool.bbox) return __scarOut;
+      const bbox = pool.bbox;
+      const u = (sx - bbox.x) / bbox.w;
+      const v = (sy - bbox.y) / bbox.h;
+      if (u < 0 || u > 1 || v < 0 || v > 1) return __scarOut;
+      const fu = u * (SCAR_RES - 1);
+      const fv = v * (SCAR_RES - 1);
+      const u0 = fu | 0;
+      const v0 = fv | 0;
+      const u1 = u0 + 1 < SCAR_RES ? u0 + 1 : u0;
+      const v1 = v0 + 1 < SCAR_RES ? v0 + 1 : v0;
+      const tu = fu - u0;
+      const tv = fv - v0;
+      const scar = pool.scar;
+      const off00 = (v0 * SCAR_RES + u0) * 2;
+      const off10 = (v0 * SCAR_RES + u1) * 2;
+      const off01 = (v1 * SCAR_RES + u0) * 2;
+      const off11 = (v1 * SCAR_RES + u1) * 2;
+      const a00 = (1 - tu) * (1 - tv);
+      const a10 = tu * (1 - tv);
+      const a01 = (1 - tu) * tv;
+      const a11 = tu * tv;
+      __scarOut[0] = scar[off00]     * a00 + scar[off10]     * a10 +
+                     scar[off01]     * a01 + scar[off11]     * a11;
+      __scarOut[1] = scar[off00 + 1] * a00 + scar[off10 + 1] * a10 +
+                     scar[off01 + 1] * a01 + scar[off11 + 1] * a11;
       return __scarOut;
+    }
+
+    // Decay every pool's scar in-place. Only called when
+    // SCAR_DECAY_PER_FRAME > 0.
+    function decayAllScars() {
+      const k = 1 - SCAR_DECAY_PER_FRAME;
+      for (const pool of pools) {
+        if (!pool.scar) continue;
+        const scar = pool.scar;
+        for (let i = 0; i < scar.length; i++) scar[i] *= k;
+      }
+    }
+
+    // Pool helper — recompute the pool's screen-space bbox from its
+    // sampleLobes union, expanded by SCAR_BBOX_EXPAND so the texture
+    // covers a buffer beyond the lobe support. Called when a pool is
+    // created and any time the pool's natural footprint grows beyond
+    // its current bbox (drop displacement, satellite spawn, etc.).
+    function rebuildPoolBboxIfNeeded(pool, force) {
+      if (!pool) return;
+      // Initial footprint estimate: targetRadius + lobe.offsetTarget plus
+      // any displaceTarget. We accept the pool's own targetMass-derived
+      // radius as the lower bound so freshly-created pools (whose lobes
+      // haven't grown yet) still get a reasonable bbox.
+      const baseR = Math.sqrt(pool.targetMass / Math.PI);
+      let maxR = baseR;
+      for (const lobe of pool.lobes) {
+        const r = Math.abs(lobe.offsetTarget) + lobe.targetRadius +
+                  Math.hypot(lobe.displaceTargetX, lobe.displaceTargetY);
+        if (r > maxR) maxR = r;
+      }
+      const halfExt = maxR * SCAR_BBOX_EXPAND;
+      const x = pool.center.x - halfExt;
+      const y = pool.center.y - halfExt;
+      const w = halfExt * 2;
+      const h = halfExt * 2;
+      if (force || !pool.bbox) {
+        pool.bbox = { x, y, w, h };
+        return;
+      }
+      // Grow only — if the natural footprint has expanded past the bbox,
+      // we need a bigger texture frame. The scar data is in pool-local
+      // UV so we can resample it into the new frame to preserve marks.
+      // Cheap (128² source × bilinear lookup) and only happens on growth.
+      const bb = pool.bbox;
+      const grew = x < bb.x - 0.5 || y < bb.y - 0.5 ||
+                   x + w > bb.x + bb.w + 0.5 || y + h > bb.y + bb.h + 0.5;
+      if (!grew) return;
+      const newBbox = { x, y, w, h };
+      pool.scar = resampleScarToNewBbox(pool.scar, pool.bbox, newBbox);
+      pool.bbox = newBbox;
+    }
+
+    // Resample a scar texture from one bbox frame to another. Used when
+    // the pool's footprint grows. Cost: SCAR_RES² bilinear lookups (~16k).
+    function resampleScarToNewBbox(oldScar, oldBbox, newBbox) {
+      const next = new Float32Array(SCAR_RES * SCAR_RES * 2);
+      for (let vy = 0; vy < SCAR_RES; vy++) {
+        const v = vy / (SCAR_RES - 1);
+        const py = newBbox.y + v * newBbox.h;
+        const ov = (py - oldBbox.y) / oldBbox.h;
+        if (ov < 0 || ov > 1) continue;
+        const fv = ov * (SCAR_RES - 1);
+        const v0 = fv | 0;
+        const v1 = v0 + 1 < SCAR_RES ? v0 + 1 : v0;
+        const tv = fv - v0;
+        for (let vx = 0; vx < SCAR_RES; vx++) {
+          const u = vx / (SCAR_RES - 1);
+          const px = newBbox.x + u * newBbox.w;
+          const ou = (px - oldBbox.x) / oldBbox.w;
+          if (ou < 0 || ou > 1) continue;
+          const fu = ou * (SCAR_RES - 1);
+          const u0 = fu | 0;
+          const u1 = u0 + 1 < SCAR_RES ? u0 + 1 : u0;
+          const tu = fu - u0;
+          const off00 = (v0 * SCAR_RES + u0) * 2;
+          const off10 = (v0 * SCAR_RES + u1) * 2;
+          const off01 = (v1 * SCAR_RES + u0) * 2;
+          const off11 = (v1 * SCAR_RES + u1) * 2;
+          const a00 = (1 - tu) * (1 - tv);
+          const a10 = tu * (1 - tv);
+          const a01 = (1 - tu) * tv;
+          const a11 = tu * tv;
+          const dstOff = (vy * SCAR_RES + vx) * 2;
+          next[dstOff]     = oldScar[off00]     * a00 + oldScar[off10]     * a10 +
+                             oldScar[off01]     * a01 + oldScar[off11]     * a11;
+          next[dstOff + 1] = oldScar[off00 + 1] * a00 + oldScar[off10 + 1] * a10 +
+                             oldScar[off01 + 1] * a01 + oldScar[off11 + 1] * a11;
+        }
+      }
+      return next;
     }
 
     function renderPaper() {
@@ -552,20 +682,15 @@
       image(paperLayer, 0, 0);
       renderPigmentField();
       image(pigmentLayer, 0, 0);
-      if (combLayer) image(combLayer, 0, 0);
       renderPressPreview();
       renderDragCursor();
     }
 
     function renderPigmentField() {
       // Early-out — when nothing has actually dirtied the field, skip
-      // the whole pipeline. Without this guard, consumeDirtyRects's
-      // empty-list fallback returns the FULL FIELD as a single rect,
-      // which then clears and re-evaluates all of pigmentLayer. That
-      // path runs every frame the comb sets dirty=true (since the
-      // comb deliberately doesn't markDirtyRect — its smudges live on
-      // combLayer). Skipping this preserves pigmentLayer when only
-      // the comb has signaled "please blit."
+      // the whole pipeline. P3: rake/comb both call markDirtyRect on
+      // every pool they splat into, so the field re-evaluates and the
+      // scar warp shows up live.
       if (!fullFieldDirty && dirtyRects.length === 0) return;
       const startedAt = performance.now();
       const renderPools = activePress ? pools.concat([previewPoolFromPress(activePress)]) : pools;
@@ -1062,6 +1187,14 @@
       const prevRect = pool.fieldRect;
       pool.center.x = constrain(pool.center.x + dx, 0, width);
       pool.center.y = constrain(pool.center.y + dy, 0, height);
+      // P3 — translate the bbox alongside the pool center. Scar data
+      // stays unchanged because it's stored in pool-local UV: moving
+      // the bbox by (dx, dy) shifts the whole pool *and* its scars
+      // together. No resample, no allocation.
+      if (pool.bbox) {
+        pool.bbox.x += dx;
+        pool.bbox.y += dy;
+      }
       pool.settled = false;
       pool.updateGeometry();
       if (prevRect) markDirtyRect(prevRect);
@@ -1105,76 +1238,74 @@
         rakeSession.y = cy;
         return;
       }
+      const mag = Math.sqrt(dx * dx + dy * dy);
+      rakeSession.lastDirX = dx / mag;
+      rakeSession.lastDirY = dy / mag;
       applyRakeImpulse(cx, cy, dx, dy);
       rakeSession.x = cx;
       rakeSession.y = cy;
     }
 
+    // P3 — rake writes Gaussian splats into each touched pool's scar
+    // texture, in pool-local UV. The scar shifts where fieldAt samples
+    // the pool's lobes, so a horizontal stroke carves parallel grooves
+    // *inside* the pool support without changing the pool outline. The
+    // number of grooves equals RAKE_SCAR_TINE_COUNT, broadcast across
+    // every pool the rake passes over.
     function applyRakeImpulse(x, y, vx, vy) {
       if (!rakeSession) return;
-      const radius = RAKE_RADIUS;
-      const radius2 = radius * radius;
-      const maxOffset2 = MAX_RAKE_DISPLACEMENT * MAX_RAKE_DISPLACEMENT;
-      // Normalize the per-frame motion to a unit stroke direction. The
-      // magnitude of (vx, vy) no longer participates in the impulse — it
-      // only tells us *which way* the user is dragging. Net displacement
-      // comes from how long a lobe stays inside the kernel, not how fast
-      // the cursor crossed it.
       const speed = Math.hypot(vx, vy);
       if (speed < 0.01) return;
       const dirX = vx / speed;
       const dirY = vy / speed;
-      // Perpendicular shear axis (90° CCW from stroke direction).
+      // Perp axis along which tines are arrayed (so the comb-bar lies
+      // perpendicular to stroke direction, matching renderDragCursor).
       const perpX = -dirY;
       const perpY = dirX;
-      // Time on contact — clamp dt so a paused-then-resumed stroke (or
-      // a frame skipped by the browser) doesn't dump a huge accumulated
-      // delta on the first frame back.
       const now = millis();
-      const dt = Math.min(RAKE_MAX_DT, (now - rakeSession.lastImpulseAt) / 1000);
+      const dt = Math.min(SCAR_TIME_MAX_DT, (now - rakeSession.lastImpulseAt) / 1000);
       rakeSession.lastImpulseAt = now;
-      const pushBase = RAKE_PUSH_PER_SECOND * dt;
-      const perpBase = pushBase * RAKE_PERP_FRACTION;
+      // Per-tine push: dt × push-rate. dirX/dirY chosen so the scar's
+      // *displacement vector* moves the sample point *backward* along
+      // stroke direction — meaning the lobe that gets read at (sx,sy)
+      // actually lives behind the cursor in stroke-space. Result: pigment
+      // appears to drag forward with the rake.
+      const pushMag = RAKE_SCAR_PUSH_PER_SECOND * dt;
+      if (pushMag < 0.001) return;
+      const half = (RAKE_SCAR_TINE_COUNT - 1) / 2;
+      paintScarTines(
+        x, y, perpX, perpY,
+        RAKE_SCAR_TINE_COUNT, RAKE_SCAR_TINE_SPACING_PX,
+        dirX * pushMag, dirY * pushMag, RAKE_SCAR_TINE_SIGMA_PX,
+        half
+      );
+    }
+
+    // Common scar-painting helper used by both rake and comb. Iterates
+    // tines along the perp axis, finds every pool whose bbox the tine
+    // is inside, and splats a Gaussian of (pushX, pushY) into that
+    // pool's scar texture. Caller passes (dirX, dirY) baked into
+    // (pushX, pushY) and the splat sigma.
+    function paintScarTines(cx, cy, perpX, perpY, tineCount, tineSpacingPx,
+                            pushX, pushY, sigmaPx, half) {
       let touchedAny = false;
-      for (const pool of pools) {
-        if (pool.preview) continue;
-        let touched = false;
-        for (const lobe of pool.lobes) {
-          const lx = pool.center.x + Math.cos(lobe.angle) * lobe.offsetNow + lobe.displaceX;
-          const ly = pool.center.y + Math.sin(lobe.angle) * lobe.offsetNow + lobe.displaceY;
-          const rx = lx - x;
-          const ry = ly - y;
-          const r2 = rx * rx + ry * ry;
-          if (r2 > radius2) continue;
-          const r = Math.sqrt(r2);
-          // Smooth power falloff: 1 at the cursor, 0 at the edge of radius.
-          const f = Math.pow(1 - r / radius, RAKE_FALLOFF_POWER);
-          const push = pushBase * f;
-          lobe.displaceTargetX += dirX * push;
-          lobe.displaceTargetY += dirY * push;
-          // Perpendicular shear: signed by which side of the stroke axis
-          // the lobe sits on. `side` is the projection of (rx, ry) onto
-          // the perp axis, normalized by the kernel radius so it lives
-          // in [-1, 1] regardless of cursor speed. Lobes near the
-          // stroke center get ~0 perp; off-axis lobes get a tangential
-          // nudge — this is what produces the slight swirl at stroke
-          // ends rather than a pure straight tug.
-          const side = (rx * perpX + ry * perpY) / radius;
-          const sk = perpBase * f * side;
-          lobe.displaceTargetX += perpX * sk;
-          lobe.displaceTargetY += perpY * sk;
-          const dist2 = lobe.displaceTargetX * lobe.displaceTargetX +
-                        lobe.displaceTargetY * lobe.displaceTargetY;
-          if (dist2 > maxOffset2) {
-            const scale = MAX_RAKE_DISPLACEMENT / Math.sqrt(dist2);
-            lobe.displaceTargetX *= scale;
-            lobe.displaceTargetY *= scale;
-          }
-          touched = true;
-        }
-        if (touched) {
-          pool.settled = false;
-          pool.updateGeometry();
+      for (let i = 0; i < tineCount; i++) {
+        const offset = (i - half) * tineSpacingPx;
+        const tx = cx + perpX * offset;
+        const ty = cy + perpY * offset;
+        for (const pool of pools) {
+          if (pool.preview) continue;
+          // Quick bbox reject. paintScar internally rejects out-of-UV
+          // anyway, so this is purely an early-out.
+          const bb = pool.bbox;
+          if (!bb) continue;
+          if (tx < bb.x || tx > bb.x + bb.w || ty < bb.y || ty > bb.y + bb.h) continue;
+          paintScar(pool, tx, ty, pushX, pushY, sigmaPx);
+          // The scar changed where this pool's lobes sample. Mark the
+          // pool's fieldRect dirty so the field gets re-evaluated. The
+          // pool itself doesn't need to leave settled — its lobes stay
+          // put; only the *sample point* moves. But we still need a
+          // re-render, so flip the dirty bit explicitly.
           markDirtyRect(pool.fieldRect);
           touchedAny = true;
         }
@@ -1189,6 +1320,7 @@
     // produce peacock, nonpareil, and get-gel patterns work exactly this way
     // — many tines pulled through a layer of pigment in a single direction.
     function startCombSession(x, y) {
+      const now = millis();
       combSession = {
         x: constrain(x, 0, width),
         y: constrain(y, 0, height),
@@ -1196,7 +1328,11 @@
         // the (invisible) comb bar runs horizontally and is held vertically.
         dirX: 1,
         dirY: 0,
-        startedAt: millis()
+        startedAt: now,
+        // P3 — comb integrates per-tine displacement over dt the same
+        // way rake does. lastImpulseAt tracks the most recent splat so a
+        // paused-then-resumed stroke doesn't dump an accumulated delta.
+        lastImpulseAt: now
       };
       dirty = true;
     }
@@ -1220,84 +1356,29 @@
       combSession.y = cy;
     }
 
-    // Comb impulse — pixel-smudge along each tine path. Writes to
-    // combLayer (a separate compositing layer) rather than pigmentLayer
-    // so the field re-eval can't wipe the marks. Two stamps per tine
-    // per step:
-    //   1. Pick-up — sample pigmentLayer at the tine's previous
-    //      position and deposit at the current position. This is what
-    //      makes color information get carried forward at all (combLayer
-    //      starts empty; without this pass, drawing combLayer onto
-    //      itself would have nothing to drag).
-    //   2. Propagate — draw combLayer onto itself, shifted by the
-    //      per-step motion. This drags whatever color has accumulated
-    //      in combLayer forward, so successive frames of the same
-    //      stroke build up a continuous trail rather than disconnected
-    //      stamps.
-    // Path subdivision keeps fast strokes from leaving gaps.
+    // P3 comb impulse — same machinery as rake, but with many fine
+    // tines tightly spaced so each pool ends up with a non-pareil
+    // pattern of parallel grooves. Tine spacing + sigma chosen so
+    // adjacent splats stay separable in scar-texel space for typical
+    // bbox sizes (200–300 px → ~5–8 texels per tine pitch).
     function applyCombImpulse(x, y, vx, vy, dirX, dirY) {
-      if (!combLayer || !pigmentLayer) return;
+      const speed = Math.hypot(vx, vy);
+      if (speed < 0.01) return;
       const perpX = -dirY;
       const perpY = dirX;
-      const half = (COMB_TINE_COUNT - 1) / 2;
-      const tineR = COMB_TINE_RADIUS;
-      const motionLen = Math.sqrt(vx * vx + vy * vy);
-      const stepCount = Math.max(1, Math.ceil(motionLen / Math.max(0.5, COMB_SMUDGE_MAX_STEP)));
-      const stepVx = vx / stepCount;
-      const stepVy = vy / stepCount;
-      const startX = x - vx;
-      const startY = y - vy;
-      const ctx = combLayer.drawingContext;
-      const TWO_PI_LOCAL = Math.PI * 2;
-      const paper = PALETTES[paletteIndex].surface;
-      ctx.save();
-      for (let step = 1; step <= stepCount; step++) {
-        const sx = startX + stepVx * step;
-        const sy = startY + stepVy * step;
-        for (let i = 0; i < COMB_TINE_COUNT; i++) {
-          const offset = (i - half) * COMB_TINE_SPACING;
-          const tx = sx + perpX * offset;
-          const ty = sy + perpY * offset;
-          if (tx < -tineR || tx > width + tineR || ty < -tineR || ty > height + tineR) continue;
-          ctx.save();
-          ctx.beginPath();
-          ctx.arc(tx, ty, tineR, 0, TWO_PI_LOCAL);
-          ctx.clip();
-          // Stamp 1 — pick up pigment from pigmentLayer at the tine's
-          // previous position and deposit at the current position.
-          // drawImage(src, stepVx, stepVy) places src[0,0] at dest[stepVx,
-          // stepVy], which is equivalent to dest[x, y] := src[x-stepVx,
-          // y-stepVy]. Inside our clip at (tx, ty) that reads
-          // pigmentLayer at (tx-stepVx, ty-stepVy) = previous tine pos.
-          ctx.globalAlpha = COMB_SMUDGE_ALPHA;
-          ctx.drawImage(pigmentLayer.canvas, stepVx, stepVy);
-          // Stamp 2 — propagate any accumulated combLayer pigment
-          // forward. On the first frame of a stroke combLayer is empty
-          // here, so this is a no-op; on subsequent frames it carries
-          // the trail of the prior frames forward by one step.
-          ctx.globalAlpha = COMB_SMUDGE_ALPHA * 0.7;
-          ctx.drawImage(combLayer.canvas, stepVx, stepVy);
-          // Optional paper-color bleed — makes the tine path readable
-          // even when combing through a single-color region. Drawn
-          // last so it sits on top of the smudge in this tine disk.
-          if (COMB_PAPER_BLEED_ALPHA > 0) {
-            ctx.globalAlpha = COMB_PAPER_BLEED_ALPHA;
-            ctx.fillStyle = paper;
-            ctx.fillRect(tx - tineR, ty - tineR, tineR * 2, tineR * 2);
-          }
-          ctx.restore();
-        }
-      }
-      ctx.restore();
-      dirty = true;
-    }
-
-    // Legacy scar-impulse writer — retained as a no-op so nothing
-    // breaks if some other tool/test still calls it. The smudge-based
-    // comb (applyCombImpulse above) no longer needs scarDispl. Safe
-    // to delete entirely once the smudge approach is locked in.
-    function writeScarImpulse(_tx, _ty, _vx, _vy) {
-      return;
+      const now = millis();
+      const last = combSession.lastImpulseAt || (combSession.startedAt || now);
+      const dt = Math.min(SCAR_TIME_MAX_DT, (now - last) / 1000);
+      combSession.lastImpulseAt = now;
+      const pushMag = COMB_SCAR_PUSH_PER_SECOND * dt;
+      if (pushMag < 0.001) return;
+      const half = (COMB_SCAR_TINE_COUNT - 1) / 2;
+      paintScarTines(
+        x, y, perpX, perpY,
+        COMB_SCAR_TINE_COUNT, COMB_SCAR_TINE_SPACING_PX,
+        dirX * pushMag, dirY * pushMag, COMB_SCAR_TINE_SIGMA_PX,
+        half
+      );
     }
 
     // Cursor affordances. Rake shows its influence radius (since that's the
@@ -1317,8 +1398,8 @@
       if (combSession) {
         const perpX = -combSession.dirY;
         const perpY = combSession.dirX;
-        const half = (COMB_TINE_COUNT - 1) / 2;
-        const halfBar = half * COMB_TINE_SPACING;
+        const half = (COMB_SCAR_TINE_COUNT - 1) / 2;
+        const halfBar = half * COMB_SCAR_TINE_SPACING_PX;
         stroke(35, 25, 18, 90);
         strokeWeight(1);
         line(
@@ -1327,11 +1408,34 @@
         );
         noFill();
         stroke(35, 25, 18, 150);
-        for (let i = 0; i < COMB_TINE_COUNT; i++) {
-          const offset = (i - half) * COMB_TINE_SPACING;
+        for (let i = 0; i < COMB_SCAR_TINE_COUNT; i++) {
+          const offset = (i - half) * COMB_SCAR_TINE_SPACING_PX;
           const tx = combSession.x + perpX * offset;
           const ty = combSession.y + perpY * offset;
-          circle(tx, ty, COMB_TINE_RADIUS * 2);
+          circle(tx, ty, 1.6);
+        }
+      }
+      if (rakeSession) {
+        // P3 — also draw a rake-bar affordance so the user sees the four
+        // tines. Drawn under the existing radius affordance.
+        const dx = rakeSession.lastDirX || 1;
+        const dy = rakeSession.lastDirY || 0;
+        const perpX = -dy;
+        const perpY = dx;
+        const half = (RAKE_SCAR_TINE_COUNT - 1) / 2;
+        const halfBar = half * RAKE_SCAR_TINE_SPACING_PX;
+        stroke(35, 25, 18, 100);
+        strokeWeight(1);
+        line(
+          rakeSession.x - perpX * halfBar, rakeSession.y - perpY * halfBar,
+          rakeSession.x + perpX * halfBar, rakeSession.y + perpY * halfBar
+        );
+        noFill();
+        for (let i = 0; i < RAKE_SCAR_TINE_COUNT; i++) {
+          const offset = (i - half) * RAKE_SCAR_TINE_SPACING_PX;
+          const tx = rakeSession.x + perpX * offset;
+          const ty = rakeSession.y + perpY * offset;
+          circle(tx, ty, 3);
         }
       }
       if (dragSession && dragSession.pool) {
@@ -1650,9 +1754,18 @@
         this.sampleLobes = [];
         this.pixelBounds = null;
         this.fieldRect = null;
+        // P3 — per-pool scar field. Only allocated for committed pools;
+        // preview pools never receive tool input so the texture would be
+        // dead weight (a per-frame 128² alloc during hold).
+        this.scar = null;
+        this.bbox = null;
         this.makeLobes(lobeCount);
         this.makeInnerLobes();
         this.updateGeometry();
+        if (!preview) {
+          this.scar = new Float32Array(SCAR_RES * SCAR_RES * 2);
+          rebuildPoolBboxIfNeeded(this, true);
+        }
       }
 
       makeLobes(count) {
@@ -1779,18 +1892,13 @@
         this.deformScalar = maxContact;
       }
 
-      // (removed) Comb's per-lobe scar follow. The comb is now a pixel
-      // smudge that operates on pigmentLayer; lobes are no longer
-      // touched by combing. See applyCombImpulse for the new flow.
+      // P3 — rake/comb no longer touch lobes. Both write into the per-pool
+      // scar texture, which fieldAt samples to shift its evaluation point.
+      // The pool's lobes (and therefore its outline) are unchanged by
+      // rake/comb; only its *interior* deforms along the scar field.
 
       update() {
         if (this.preview) return false;
-        // Comb tool — formerly applied per-lobe scar follow here. The
-        // comb has been re-architected as a pixel smudge that writes
-        // directly to pigmentLayer (see applyCombImpulse). It no longer
-        // touches lobes, so this site is intentionally a no-op.
-        // applyScarFollow is still defined for diagnostic poking but
-        // is never called by the main loop.
         // Pools that are otherwise settled but still have un-played
         // displacement (a new drop pushed them) need to keep updating until
         // the lerp catches up. Compute once whether any lobe still owes a
@@ -1885,7 +1993,11 @@
           // + comb scar budget. Bounds must include all three so the culling
           // rect can never reject a sample that would have been displaced
           // into the lobe's footprint by any of the warp sources.
-          const totalWarp = warpRadius + DOMAIN_WARP_PX + MAX_SCAR_PER_CELL;
+          // P3 — bounds must account for the per-pool scar warp budget
+          // alongside the existing domain-warp budget. The scar can
+          // shift a sample point by at most SCAR_MAX_DISPL_PX, so the
+          // influence rect grows by that amount in every direction.
+          const totalWarp = warpRadius + DOMAIN_WARP_PX + SCAR_MAX_DISPL_PX;
           this.sampleLobes.push({
             x: lx,
             y: ly,
@@ -1908,6 +2020,12 @@
           x1: ceil(x1 / cellSize) + 1,
           y1: ceil(y1 / cellSize) + 1
         });
+        // P3 — if the pool's natural footprint has outgrown its scar
+        // bbox (drop displacement pushed a lobe out, satellite spawn,
+        // growth from currentMass < targetMass), grow the bbox and
+        // resample the scar so existing marks stay anchored in screen
+        // space. rebuildPoolBboxIfNeeded is a no-op when nothing grew.
+        if (this.scar && !this.preview) rebuildPoolBboxIfNeeded(this, false);
       }
 
       containsPoint(x, y) {
@@ -1949,12 +2067,15 @@
         const tendX = noise(x * 0.0042 + this.seed * 0.0007, y * 0.0042 + 7.7) - 0.5;
         const tendY = noise(x * 0.0042 - this.seed * 0.0007, y * 0.0042 + 11.3) - 0.5;
 
-        // Comb scar sample-point warp removed. The comb is now a
-        // pixel smudge applied directly to pigmentLayer (see
-        // applyCombImpulse); fieldAt no longer participates in the
-        // comb's visual effect, so we simply omit the subtraction.
-        const sx = x + wxAnis * (DOMAIN_WARP_PX * 2) + tendX * (tendrilPx * 2);
-        const sy = y + wyAnis * (DOMAIN_WARP_PX * 2) + tendY * (tendrilPx * 2);
+        // P3 — per-pool scar sample. The scar texture lives in this
+        // pool's UV space, so sampling never wanders outside the pool's
+        // own footprint (cf. failure mode #1). Adding the scar
+        // displacement to the sample point shifts WHERE the pool is
+        // read — the pool's lobe support stays put, the interior
+        // pigment appears to deform along the scar's vector field.
+        const scarD = sampleScar(this, x, y);
+        const sx = x + wxAnis * (DOMAIN_WARP_PX * 2) + tendX * (tendrilPx * 2) + scarD[0];
+        const sy = y + wyAnis * (DOMAIN_WARP_PX * 2) + tendY * (tendrilPx * 2) + scarD[1];
 
         let sum = 0;
         for (const lobe of this.sampleLobes) {
@@ -2079,15 +2200,15 @@
         window.clearTimeout(pendingReset.timer);
         pendingReset = null;
       }
+      // P3 — per-pool scars die with the pools (GC). No global scar to
+      // clear. combLayer is gone entirely.
       pools = [];
       activePress = null;
       dragSession = null;
       rakeSession = null;
       combSession = null;
       lastPreviewRect = null;
-      clearScarField();
       pigmentLayer.clear();
-      if (combLayer) combLayer.clear();
       renderPaper();
       markFullFieldDirty();
       settled = true;

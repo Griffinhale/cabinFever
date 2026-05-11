@@ -1,0 +1,924 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+  <title>Marbling Advection — WebGL spike</title>
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: #f4eddf;
+      touch-action: none;
+      overscroll-behavior: none;
+      -webkit-user-select: none;
+      user-select: none;
+    }
+    canvas {
+      display: block;
+      position: fixed;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      touch-action: none;
+      background:
+        radial-gradient(ellipse at center, rgba(255,255,255,0.0) 0%, rgba(60,40,20,0.10) 100%),
+        repeating-linear-gradient(0deg, rgba(60,40,20,0.015) 0 1px, transparent 1px 3px),
+        #f3ead8;
+    }
+    #fatal {
+      position: fixed;
+      inset: 0;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+      font: 14px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      color: #522;
+      background: #f4eddf;
+      z-index: 99;
+      text-align: center;
+    }
+    #hint {
+      position: fixed;
+      left: 10px;
+      bottom: 8px;
+      z-index: 10;
+      color: rgba(45, 35, 25, 0.46);
+      font: 11px/1.35 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      letter-spacing: 0.02em;
+      pointer-events: none;
+      text-shadow: 0 1px 0 rgba(255,255,255,0.35);
+    }
+    #cornerActions {
+      position: fixed;
+      right: 8px;
+      bottom: 8px;
+      z-index: 11;
+      color: rgba(45, 35, 25, 0.34);
+      font: 10px/1.35 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      pointer-events: none;
+      text-align: right;
+    }
+    #fps {
+      position: fixed;
+      left: 10px;
+      top: 10px;
+      z-index: 10;
+      color: rgba(45, 35, 25, 0.5);
+      font: 10px/1.2 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      pointer-events: none;
+    }
+    #toolbar {
+      position: fixed;
+      top: 8px;
+      left: 50%;
+      transform: translateX(-50%);
+      z-index: 12;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 10px;
+      background: rgba(244, 237, 223, 0.86);
+      border: 1px solid rgba(45, 35, 25, 0.18);
+      border-radius: 16px;
+      box-shadow: 0 1px 4px rgba(45, 35, 25, 0.10);
+      backdrop-filter: blur(4px);
+      -webkit-backdrop-filter: blur(4px);
+      pointer-events: auto;
+      font: 11px/1.2 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      color: rgba(45, 35, 25, 0.78);
+      user-select: none;
+    }
+    .tool-btn {
+      appearance: none;
+      border: 1px solid rgba(45, 35, 25, 0.25);
+      background: rgba(255, 250, 238, 0.65);
+      color: rgba(45, 35, 25, 0.78);
+      font: inherit;
+      letter-spacing: 0.04em;
+      padding: 4px 10px;
+      border-radius: 12px;
+      cursor: pointer;
+      touch-action: manipulation;
+    }
+    .tool-btn[data-active="true"] {
+      background: rgba(45, 35, 25, 0.82);
+      color: rgba(244, 237, 223, 0.95);
+      border-color: rgba(45, 35, 25, 0.82);
+    }
+    #swatches {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .swatch {
+      appearance: none;
+      width: 22px;
+      height: 22px;
+      border-radius: 50%;
+      border: 1.5px solid rgba(45, 35, 25, 0.22);
+      cursor: pointer;
+      padding: 0;
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.18);
+      transition: transform 80ms ease;
+      touch-action: manipulation;
+    }
+    .swatch[data-active="true"] {
+      transform: scale(1.18);
+      border-color: rgba(45, 35, 25, 0.85);
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.28), 0 0 0 2px rgba(244, 237, 223, 0.85);
+    }
+    .reset-btn {
+      appearance: none;
+      border: 1px solid rgba(45, 35, 25, 0.25);
+      background: rgba(255, 250, 238, 0.65);
+      color: rgba(45, 35, 25, 0.78);
+      font: inherit;
+      padding: 4px 8px;
+      border-radius: 12px;
+      cursor: pointer;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="cv"></canvas>
+  <div id="fatal"></div>
+  <div id="hint">pick swatch · drop / drag / rake / comb · R reset</div>
+  <div id="cornerActions">advection-webgl-v1<br>R reset</div>
+  <div id="fps"></div>
+  <div id="toolbar">
+    <button class="tool-btn" data-tool="drop" data-active="true">drop</button>
+    <button class="tool-btn" data-tool="drag">drag</button>
+    <button class="tool-btn" data-tool="rake">rake</button>
+    <button class="tool-btn" data-tool="comb">comb</button>
+    <div id="swatches"></div>
+    <button class="reset-btn" id="resetBtn">reset</button>
+  </div>
+
+  <script>
+  /*
+    Marbling — Stable-Fluids style advection on the GPU.
+
+    Architecturally distinct from the metaball-pools prototype: pigment is a 2D
+    field stored in an RGBA float texture and pushed around by a velocity field
+    (also a float texture). Each frame:
+      1. advect velocity by itself
+      2. advect dye by velocity
+      3. apply small damping (velocity * 0.99, dye * 0.999)
+      4. splat any new user input (drop/drag/rake/comb tines)
+      5. blit the dye texture onto a paper background
+
+    Pressure projection is skipped — without it the velocity field is mildly
+    divergent, but the goal of this spike is to verify the comb tool produces
+    visible non-pareil ripples, and damping plus a viscous-feeling timestep is
+    enough for that. Adding one Jacobi pass is the obvious next polish if dye
+    starts piling up unnaturally at high stroke speeds.
+  */
+
+  function fatal(msg) {
+    const el = document.getElementById('fatal');
+    el.textContent = msg;
+    el.style.display = 'flex';
+    throw new Error(msg);
+  }
+
+  // -------------------- palette (lifted from metaball-pools-refined) --------------------
+  // Traditional ebru palette: indigo, vermillion, ochre, sap green, ivory, plus ink.
+  const PALETTE = {
+    name: 'traditional marbling',
+    surface: [0.953, 0.918, 0.847],
+    pigments: [
+      { name: 'indigo',     color: [0.090, 0.231, 0.384] }, // #173b62
+      { name: 'vermillion', color: [0.490, 0.149, 0.188] }, // #7d2630
+      { name: 'ochre',      color: [0.757, 0.541, 0.184] }, // #c18a2f
+      { name: 'sap green',  color: [0.325, 0.404, 0.227] }, // #53673a
+      { name: 'ivory',      color: [0.851, 0.784, 0.643] }, // #d9c8a4
+      { name: 'ink',        color: [0.090, 0.078, 0.071] }  // ivory black
+    ]
+  };
+
+  // -------------------- sim config --------------------
+  // 512 sim grid: comb tine pitch in sim cells = floor(8 px display * 512/min(W,H))
+  // which on a 1024+ px window leaves several cells between tines, so the LINEAR
+  // sampled advection can still resolve ~20 separate ripples after one stroke.
+  // 1024 would be smoother but on integrated GPUs the per-frame cost roughly
+  // quadruples; we prefer to ship the spike with comfortable framerate.
+  const SIM_SIZE = 512;
+  const DT = 1.0 / 60.0;          // fixed timestep (s)
+  const VEL_DAMP = 0.992;          // per-frame velocity decay
+  const DYE_DAMP = 0.9995;         // per-frame dye decay (very slow; pigment is ~permanent like real marbling ink)
+  const SPLAT_VEL_SCALE = 2200.0;  // input → velocity (grid-cells/sec)
+  const SPLAT_DYE_BASE = 0.75;     // pigment additive intensity (richer saturation)
+  // Display-time surface treatment (lifted from metaball-pools-refined feel):
+  const SURFACE = {
+    WARP_AMP_UV: 0.010,   // domain-warp amplitude in UV (tendril/swirl edges)
+    WARP_FREQ:   6.0,
+    GRAN_AMOUNT: 0.22,    // granulation depth — pigment density modulation
+    GRAN_FREQ:   18.0,
+    RIM_STRENGTH: 0.55,   // darkening at dye gradient edges
+    BLOOM_RADIUS_UV: 0.014,
+    BLOOM_MIX:   0.28,    // stain bloom into paper around dye edges
+    PAPER_GRAIN: 0.045,
+    PAPER_FREQ:  0.022,
+    VIGNETTE:    0.42,
+    CONTRAST_LO: 0.04,    // smoothstep low edge — sharpens dye boundary
+    CONTRAST_HI: 0.92
+  };
+  const DROP_RADIUS_PX = 36;       // drop tool gaussian radius (display px)
+  const DRAG_RADIUS_PX = 22;
+  const RAKE_RADIUS_PX = 14;
+  const COMB_RADIUS_PX = 5;        // small per-tine kernel — must not overlap neighbours
+  const RAKE_TINES = 4;
+  const RAKE_SPACING_PX = 40;
+  const COMB_TINES = 24;
+  const COMB_SPACING_PX = 8;
+  const DROP_RADIAL_VEL = 600;     // outward push when a drop is placed
+  const COMB_VEL_GAIN = 1.4;       // comb/rake tine velocity multiplier
+  const HOLD_SCALE_RATE = 1.6;     // drop-hold size growth per second
+
+  // -------------------- canvas + GL bootstrap --------------------
+  const canvas = document.getElementById('cv');
+  const gl = canvas.getContext('webgl2', {
+    alpha: true,
+    antialias: false,
+    premultipliedAlpha: false,
+    preserveDrawingBuffer: false
+  });
+  if (!gl) {
+    fatal('WebGL2 not available. This spike requires WebGL2.');
+  }
+
+  // Try for float framebuffer support. Without it we degrade to RGBA8 and
+  // scale velocity range so it survives 8-bit quantization (visible banding
+  // is acceptable as a fallback; the spike runs).
+  const extColorBufferFloat = gl.getExtension('EXT_color_buffer_float');
+  const extColorBufferHalfFloat = gl.getExtension('EXT_color_buffer_half_float');
+  gl.getExtension('OES_texture_float_linear');
+  gl.getExtension('OES_texture_half_float_linear');
+
+  let texInternal, texFormat, texType;
+  if (extColorBufferFloat) {
+    texInternal = gl.RGBA16F;
+    texFormat = gl.RGBA;
+    texType = gl.HALF_FLOAT;
+  } else if (extColorBufferHalfFloat) {
+    texInternal = gl.RGBA16F;
+    texFormat = gl.RGBA;
+    texType = gl.HALF_FLOAT;
+  } else {
+    // 8-bit fallback — velocity will be quantized; clamp magnitudes accordingly.
+    texInternal = gl.RGBA8;
+    texFormat = gl.RGBA;
+    texType = gl.UNSIGNED_BYTE;
+    console.warn('[marble] no float FBO — falling back to RGBA8');
+  }
+
+  function resize() {
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    canvas.width = Math.floor(window.innerWidth * dpr);
+    canvas.height = Math.floor(window.innerHeight * dpr);
+  }
+  resize();
+  window.addEventListener('resize', resize);
+
+  // -------------------- shader helpers --------------------
+  function compile(type, src) {
+    const sh = gl.createShader(type);
+    gl.shaderSource(sh, src);
+    gl.compileShader(sh);
+    if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
+      const log = gl.getShaderInfoLog(sh);
+      console.error(src.split('\n').map((l, i) => `${i+1}: ${l}`).join('\n'));
+      throw new Error('shader compile: ' + log);
+    }
+    return sh;
+  }
+  function program(vsSrc, fsSrc) {
+    const vs = compile(gl.VERTEX_SHADER, vsSrc);
+    const fs = compile(gl.FRAGMENT_SHADER, fsSrc);
+    const p = gl.createProgram();
+    gl.attachShader(p, vs);
+    gl.attachShader(p, fs);
+    gl.linkProgram(p);
+    if (!gl.getProgramParameter(p, gl.LINK_STATUS)) {
+      throw new Error('link: ' + gl.getProgramInfoLog(p));
+    }
+    const uniforms = {};
+    const n = gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS);
+    for (let i = 0; i < n; i++) {
+      const info = gl.getActiveUniform(p, i);
+      uniforms[info.name] = gl.getUniformLocation(p, info.name);
+    }
+    return { prog: p, u: uniforms };
+  }
+
+  // Fullscreen quad (two triangles, position only).
+  const quadVB = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, quadVB);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
+    -1, -1,  1, -1, -1, 1,
+    -1,  1,  1, -1,  1, 1
+  ]), gl.STATIC_DRAW);
+
+  const VS = `#version 300 es
+  precision highp float;
+  layout(location = 0) in vec2 aPos;
+  out vec2 vUV;
+  void main() {
+    vUV = aPos * 0.5 + 0.5;
+    gl_Position = vec4(aPos, 0.0, 1.0);
+  }`;
+
+  // Advect: semi-Lagrangian. Critical sign — sample BACKWARD along velocity.
+  // We treat the input "value" texture as carrying arbitrary RGBA (velocity
+  // or dye). For dye we use the velocity texture to find the backtrace
+  // origin; for velocity self-advection we sample the velocity itself.
+  const FS_ADVECT = `#version 300 es
+  precision highp float;
+  in vec2 vUV;
+  out vec4 outColor;
+  uniform sampler2D uVelocity;
+  uniform sampler2D uSource;
+  uniform float uDt;
+  uniform float uGridSize;      // sim grid resolution (e.g. 512)
+  uniform float uDissipation;
+  void main() {
+    // velocity is stored in "grid cells per second"; convert to UV offset.
+    vec2 v = texture(uVelocity, vUV).xy;
+    vec2 coord = vUV - (uDt * v) / uGridSize;
+    vec4 s = texture(uSource, coord);
+    outColor = uDissipation * s;
+  }`;
+
+  // Splat: read existing texture and add a gaussian blob of (color, velocity).
+  // We write the full RGBA — dye splat uses RGB for color and 0 alpha-add;
+  // velocity splat uses RG for the impulse.
+  const FS_SPLAT = `#version 300 es
+  precision highp float;
+  in vec2 vUV;
+  out vec4 outColor;
+  uniform sampler2D uTarget;
+  uniform vec2 uPoint;          // splat center in UV
+  uniform vec3 uColor;          // dye color or (vx, vy, 0)
+  uniform float uRadius;        // gaussian sigma in UV
+  void main() {
+    vec2 d = vUV - uPoint;
+    float g = exp(-dot(d, d) / max(uRadius * uRadius, 1e-7));
+    vec3 base = texture(uTarget, vUV).rgb;
+    outColor = vec4(base + uColor * g, 1.0);
+  }`;
+
+  // Display: rich marbling surface treatment ported from metaball-pools-refined.
+  // Pipeline per fragment:
+  //   1. Domain-warp the dye sample coord via 2-channel FBM → tendril/swirl edges
+  //   2. Compute dye density with smoothstep contrast curve (sharper boundaries)
+  //   3. Multiplicative granulation noise on density (pigment grit)
+  //   4. Rim darkening via dye-gradient magnitude (edge accent like ink pooling)
+  //   5. Stain bloom: large-radius dye average mixed into surrounding paper
+  //   6. Multi-octave paper grain (FBM) modulating final color
+  //   7. Vignette
+  const FS_DISPLAY = `#version 300 es
+  precision highp float;
+  in vec2 vUV;
+  out vec4 outColor;
+  uniform sampler2D uDye;
+  uniform vec3 uPaper;
+  uniform float uTime;
+  uniform vec2 uResolution;
+  uniform float uWarpAmp;
+  uniform float uWarpFreq;
+  uniform float uGranAmount;
+  uniform float uGranFreq;
+  uniform float uRimStrength;
+  uniform float uBloomRadius;
+  uniform float uBloomMix;
+  uniform float uPaperGrain;
+  uniform float uPaperFreq;
+  uniform float uVignette;
+  uniform float uContrastLo;
+  uniform float uContrastHi;
+
+  float hash21(vec2 p) {
+    p = fract(p * vec2(123.34, 456.21));
+    p += dot(p, p + 45.32);
+    return fract(p.x * p.y);
+  }
+  // value noise on 2D lattice
+  float vnoise(vec2 p) {
+    vec2 i = floor(p);
+    vec2 f = fract(p);
+    f = f * f * (3.0 - 2.0 * f);
+    float a = hash21(i);
+    float b = hash21(i + vec2(1.0, 0.0));
+    float c = hash21(i + vec2(0.0, 1.0));
+    float d = hash21(i + vec2(1.0, 1.0));
+    return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+  }
+  float fbm(vec2 p) {
+    float v = 0.0; float a = 0.5;
+    for (int i = 0; i < 4; i++) { v += vnoise(p) * a; p *= 2.07; a *= 0.5; }
+    return v;
+  }
+
+  // Density mapping: dye is summed pigment in RGB. Use its magnitude as
+  // "how much pigment is here" and its direction as the local color.
+  float densityOf(vec3 d) { return clamp(length(d) * 1.85, 0.0, 1.0); }
+
+  void main() {
+    // (1) Domain warp on the dye sample. Two independent FBM channels give
+    // a 2D vector field; we offset the sample point along it. Amplitude is
+    // in UV; on a 1080p window this is ~10 px of swirl on the dye edges.
+    vec2 wOff = vec2(
+      fbm(vUV * uWarpFreq + vec2(11.3, 5.7)),
+      fbm(vUV * uWarpFreq + vec2(53.7, 91.2))
+    ) - 0.5;
+    vec2 uv = vUV + wOff * uWarpAmp;
+
+    // Dye sample + sharpened density
+    vec3 dye = texture(uDye, uv).rgb;
+    float densRaw = densityOf(dye);
+    float dens = smoothstep(uContrastLo, uContrastHi, densRaw);
+
+    // Local pigment color (direction of dye vec). Falls back to paper at zero.
+    vec3 pig = dye / max(length(dye), 1e-4);
+    pig = mix(uPaper, pig, step(0.001, length(dye)));
+
+    // (3) Granulation — low-freq multiplicative noise on density. Bigger
+    // perturbations on the body of the dye, near-zero at the boundary
+    // (where rim handles it).
+    float gran = fbm(vUV * uGranFreq + 17.0) - 0.5;
+    dens *= 1.0 + gran * uGranAmount;
+    dens = clamp(dens, 0.0, 1.0);
+
+    // (4) Rim darken: sample dye at small offset in two axes; gradient
+    // magnitude marks the edge. Darker just inside the edge gives ink
+    // a "pooling at the boundary" feel.
+    vec2 px = 1.5 / uResolution;
+    float c0 = densityOf(texture(uDye, uv).rgb);
+    float cx = densityOf(texture(uDye, uv + vec2(px.x, 0.0)).rgb);
+    float cy = densityOf(texture(uDye, uv + vec2(0.0, px.y)).rgb);
+    float grad = abs(cx - c0) + abs(cy - c0);
+    float rim = clamp(grad * 4.0, 0.0, 1.0);
+
+    // (5) Stain bloom — large-radius dye sample, mixed into the surrounding
+    // paper outside the dye boundary. Cheap 4-tap radial sample.
+    vec3 bloom = vec3(0.0);
+    for (int i = 0; i < 4; i++) {
+      float a = float(i) * 1.5707963 + 0.7853;
+      bloom += texture(uDye, uv + vec2(cos(a), sin(a)) * uBloomRadius).rgb;
+    }
+    bloom *= 0.25;
+    float bloomD = densityOf(bloom);
+
+    // Composite: paper + dye + bloom around edges.
+    vec3 inkOnPaper = mix(uPaper, pig, dens);
+    vec3 bloomTint = mix(uPaper, pig * 0.7, 0.45);
+    float bloomMask = bloomD * (1.0 - dens) * uBloomMix;
+    vec3 col = mix(inkOnPaper, bloomTint, bloomMask);
+
+    // Apply rim darkening (only where there's actually dye)
+    col *= 1.0 - rim * uRimStrength * dens;
+
+    // (6) Paper grain — multi-octave on screen-pixel coords. Modulates
+    // the whole field multiplicatively so paper and ink both pick up
+    // the texture (more on paper, slightly muted on dye).
+    float paperN = fbm(gl_FragCoord.xy * uPaperFreq);
+    float grainStrength = mix(uPaperGrain, uPaperGrain * 0.45, dens);
+    col *= 1.0 - grainStrength * 0.5 + paperN * grainStrength;
+    // sub-pixel grit
+    float grit = hash21(gl_FragCoord.xy + vec2(uTime * 0.0)) - 0.5;
+    col += grit * 0.008;
+
+    // (7) Vignette
+    vec2 v = vUV - 0.5;
+    float vig = 1.0 - dot(v, v) * uVignette;
+    col *= vig;
+
+    outColor = vec4(col, 1.0);
+  }`;
+
+  // Clear shader (writes a constant color — used for reset).
+  const FS_CLEAR = `#version 300 es
+  precision highp float;
+  out vec4 outColor;
+  uniform vec4 uColor;
+  void main() { outColor = uColor; }`;
+
+  const progAdvect = program(VS, FS_ADVECT);
+  const progSplat = program(VS, FS_SPLAT);
+  const progDisplay = program(VS, FS_DISPLAY);
+  const progClear = program(VS, FS_CLEAR);
+
+  function bindQuad() {
+    gl.bindBuffer(gl.ARRAY_BUFFER, quadVB);
+    gl.enableVertexAttribArray(0);
+    gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+  }
+
+  // -------------------- FBO + texture helpers --------------------
+  function createTex(w, h) {
+    const t = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, t);
+    // LINEAR is critical for smooth semi-Lagrangian advection. Falls back to
+    // NEAREST when float-linear extension is absent (results look blocky but
+    // still flow).
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texImage2D(gl.TEXTURE_2D, 0, texInternal, w, h, 0, texFormat, texType, null);
+    return t;
+  }
+  function createFBO(w, h) {
+    const tex = createTex(w, h);
+    const fbo = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+    const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+    if (status !== gl.FRAMEBUFFER_COMPLETE) {
+      console.warn('FBO incomplete:', status.toString(16));
+    }
+    return { tex, fbo, w, h };
+  }
+  function createPingPong(w, h) {
+    let a = createFBO(w, h);
+    let b = createFBO(w, h);
+    return {
+      read: () => a,
+      write: () => b,
+      swap: () => { const t = a; a = b; b = t; },
+      get w() { return w; },
+      get h() { return h; }
+    };
+  }
+
+  const velocity = createPingPong(SIM_SIZE, SIM_SIZE);
+  const dye = createPingPong(SIM_SIZE, SIM_SIZE);
+
+  function bindFBO(target) {
+    gl.bindFramebuffer(gl.FRAMEBUFFER, target ? target.fbo : null);
+    if (target) gl.viewport(0, 0, target.w, target.h);
+  }
+
+  function clearTarget(target, r, g, b, a) {
+    bindFBO(target);
+    gl.useProgram(progClear.prog);
+    gl.uniform4f(progClear.u.uColor, r, g, b, a);
+    bindQuad();
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+  }
+
+  function resetSim() {
+    clearTarget(velocity.read(), 0, 0, 0, 1);
+    clearTarget(velocity.write(), 0, 0, 0, 1);
+    clearTarget(dye.read(), 0, 0, 0, 1);
+    clearTarget(dye.write(), 0, 0, 0, 1);
+  }
+  resetSim();
+
+  // -------------------- splat helpers --------------------
+  // Splat additively. We do NOT use GL blending (some float formats don't
+  // support blending across all drivers); instead the shader reads the target
+  // texture, adds the gaussian, and writes the result. This requires a
+  // ping-pong: render into the write side, then swap.
+  function splatInto(field, uvX, uvY, vec3, radiusUV) {
+    bindFBO(field.write());
+    gl.useProgram(progSplat.prog);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, field.read().tex);
+    gl.uniform1i(progSplat.u.uTarget, 0);
+    gl.uniform2f(progSplat.u.uPoint, uvX, uvY);
+    gl.uniform3f(progSplat.u.uColor, vec3[0], vec3[1], vec3[2]);
+    gl.uniform1f(progSplat.u.uRadius, radiusUV);
+    bindQuad();
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+    field.swap();
+  }
+
+  // Convert display pixel coordinates to sim UV. Sim is square 512x512 but
+  // window is rectangular, so we map by stretching: the dye texture is
+  // sampled across the whole canvas, so display(x,y) → uv (x/W, y/H) and the
+  // sim grid is 512x512 sampled at those UVs. That means splat radius in UV
+  // doesn't quite correspond to display px in both axes — close enough for
+  // a spike, and we correct radius below.
+  function displayToUV(px, py) {
+    const u = px / window.innerWidth;
+    const v = 1.0 - py / window.innerHeight; // flip Y (texture origin bottom-left)
+    return [u, v];
+  }
+  // Convert a "display pixel" radius to UV-space sigma in a way that gives
+  // round splats. We pick the smaller dimension so a small comb tine reads
+  // sharp even on wide monitors.
+  function pxToRadiusUV(px) {
+    const m = Math.min(window.innerWidth, window.innerHeight);
+    return px / m;
+  }
+
+  function splatDye(px, py, color, radiusPx, intensity) {
+    const uv = displayToUV(px, py);
+    const r = pxToRadiusUV(radiusPx);
+    splatInto(dye, uv[0], uv[1], [
+      color[0] * intensity,
+      color[1] * intensity,
+      color[2] * intensity
+    ], r);
+  }
+  function splatVelocity(px, py, vx, vy, radiusPx) {
+    const uv = displayToUV(px, py);
+    const r = pxToRadiusUV(radiusPx);
+    // velocity texture stores grid-cells/sec in RG.
+    splatInto(velocity, uv[0], uv[1], [vx, vy, 0], r);
+  }
+
+  // -------------------- input + tools --------------------
+  let currentTool = 'drop';
+  let currentPigmentIdx = 0;
+  const pointer = { down: false, x: 0, y: 0, lastT: 0, holdStartT: 0 };
+
+  document.querySelectorAll('.tool-btn').forEach(btn => {
+    btn.addEventListener('pointerdown', e => {
+      e.preventDefault();
+      currentTool = btn.dataset.tool;
+      document.querySelectorAll('.tool-btn').forEach(b =>
+        b.setAttribute('data-active', b === btn ? 'true' : 'false')
+      );
+    });
+  });
+
+  // Build swatches from palette, no innerHTML — use DOM API for safety.
+  function buildSwatches() {
+    const wrap = document.getElementById('swatches');
+    while (wrap.firstChild) wrap.removeChild(wrap.firstChild);
+    PALETTE.pigments.forEach((p, idx) => {
+      const b = document.createElement('button');
+      b.className = 'swatch';
+      const r = Math.round(p.color[0] * 255);
+      const g = Math.round(p.color[1] * 255);
+      const bl = Math.round(p.color[2] * 255);
+      b.style.background = `rgb(${r},${g},${bl})`;
+      b.setAttribute('data-active', idx === 0 ? 'true' : 'false');
+      b.title = p.name;
+      b.addEventListener('pointerdown', e => {
+        e.preventDefault();
+        currentPigmentIdx = idx;
+        document.querySelectorAll('.swatch').forEach((el, i) =>
+          el.setAttribute('data-active', i === idx ? 'true' : 'false')
+        );
+      });
+      wrap.appendChild(b);
+    });
+  }
+  buildSwatches();
+
+  document.getElementById('resetBtn').addEventListener('pointerdown', e => {
+    e.preventDefault();
+    resetSim();
+  });
+  window.addEventListener('keydown', e => {
+    if (e.key === 'r' || e.key === 'R') resetSim();
+  });
+
+  // Pointer handling. We listen on canvas with setPointerCapture so we don't
+  // lose the stream if the user drags off-canvas.
+  canvas.addEventListener('pointerdown', e => {
+    e.preventDefault();
+    canvas.setPointerCapture(e.pointerId);
+    const now = performance.now() / 1000;
+    pointer.down = true;
+    pointer.x = e.clientX;
+    pointer.y = e.clientY;
+    pointer.lastT = now;
+    pointer.holdStartT = now;
+
+    // Tools that act on click/down: drop applies immediately (and grows on
+    // hold via per-frame applyHold). Drag/rake/comb act per pointermove.
+    if (currentTool === 'drop') {
+      applyDrop(e.clientX, e.clientY, 1.0);
+    }
+  });
+  canvas.addEventListener('pointermove', e => {
+    if (!pointer.down) return;
+    e.preventDefault();
+    const now = performance.now() / 1000;
+    const dx = e.clientX - pointer.x;
+    const dy = e.clientY - pointer.y;
+    const dt = Math.max(now - pointer.lastT, 1e-3);
+    const speed = Math.hypot(dx, dy) / dt; // px/s
+    const dirLen = Math.hypot(dx, dy) || 1;
+    const dirX = dx / dirLen;
+    const dirY = dy / dirLen;
+
+    if (currentTool === 'drag') {
+      applyDrag(e.clientX, e.clientY, dirX, dirY, speed);
+    } else if (currentTool === 'rake') {
+      applyComb(e.clientX, e.clientY, dirX, dirY, speed, RAKE_TINES, RAKE_SPACING_PX, RAKE_RADIUS_PX);
+    } else if (currentTool === 'comb') {
+      applyComb(e.clientX, e.clientY, dirX, dirY, speed, COMB_TINES, COMB_SPACING_PX, COMB_RADIUS_PX);
+    }
+    pointer.x = e.clientX;
+    pointer.y = e.clientY;
+    pointer.lastT = now;
+  });
+  function endPointer(e) {
+    if (!pointer.down) return;
+    pointer.down = false;
+    try { canvas.releasePointerCapture(e.pointerId); } catch (_) {}
+  }
+  canvas.addEventListener('pointerup', endPointer);
+  canvas.addEventListener('pointercancel', endPointer);
+
+  function pigmentColor() {
+    return PALETTE.pigments[currentPigmentIdx].color;
+  }
+
+  function applyDrop(px, py, scale) {
+    const color = pigmentColor();
+    const r = DROP_RADIUS_PX * scale;
+    splatDye(px, py, color, r, SPLAT_DYE_BASE * 1.4);
+    // Radial outward velocity: implemented as ring splats around the center,
+    // each pointing outward, so existing pigment is pushed aside.
+    const rings = 10;
+    for (let i = 0; i < rings; i++) {
+      const a = (i / rings) * Math.PI * 2;
+      const ox = Math.cos(a) * r * 0.6;
+      const oy = Math.sin(a) * r * 0.6;
+      const vx = Math.cos(a) * DROP_RADIAL_VEL * scale;
+      const vy = -Math.sin(a) * DROP_RADIAL_VEL * scale; // flip Y for tex space
+      splatVelocity(px + ox, py + oy, vx, vy, r * 0.5);
+    }
+  }
+  function applyDrag(px, py, dirX, dirY, speed) {
+    const color = pigmentColor();
+    splatDye(px, py, color, DRAG_RADIUS_PX, SPLAT_DYE_BASE * 0.5);
+    // Velocity along stroke direction. Note: texture Y is flipped, so we
+    // negate dirY when storing in velocity.
+    const v = SPLAT_VEL_SCALE * Math.min(speed / 800, 1.6);
+    splatVelocity(px, py, dirX * v, -dirY * v, DRAG_RADIUS_PX);
+  }
+
+  // Rake / comb share implementation: N tines spaced perpendicular to stroke,
+  // each contributing a velocity splat along the stroke. All tines splat in a
+  // SINGLE frame so the user doesn't have to drag slowly for visible
+  // separation.
+  function applyComb(px, py, dirX, dirY, speed, tines, spacingPx, radiusPx) {
+    const color = pigmentColor();
+    // Perpendicular axis (rotated 90 deg from stroke direction)
+    const perpX = -dirY;
+    const perpY = dirX;
+    // Center the tine bank on the pointer
+    const halfSpan = (tines - 1) * spacingPx * 0.5;
+    const v = SPLAT_VEL_SCALE * Math.min(speed / 600, 1.8) * COMB_VEL_GAIN;
+    for (let i = 0; i < tines; i++) {
+      const offset = i * spacingPx - halfSpan;
+      const tx = px + perpX * offset;
+      const ty = py + perpY * offset;
+      // Tine velocity is downstream (along stroke), not perpendicular.
+      // The pigment between tines gets pushed forward locally; because each
+      // tine's gaussian is small (radius ~ COMB_RADIUS_PX), the in-between
+      // gaps remain stationary, creating the parallel ripple pattern.
+      splatVelocity(tx, ty, dirX * v, -dirY * v, radiusPx);
+      // Very faint pigment trail under each tine so combs leave a visible
+      // path even on an empty area. Comb is mostly about deforming existing
+      // pigment, so this is intentionally small.
+      splatDye(tx, ty, color, radiusPx * 1.1, SPLAT_DYE_BASE * 0.08);
+    }
+  }
+
+  // -------------------- per-frame applyHold (drop only) --------------------
+  function applyHold(now) {
+    if (!pointer.down) return;
+    if (currentTool !== 'drop') return;
+    // Subsequent drops while held grow over time — but we don't want to spam
+    // the velocity field every frame, so we splat a small additional dye
+    // dollop and a gentle outward kick proportional to held time.
+    const held = now - pointer.holdStartT;
+    const scale = Math.min(1.0 + held * HOLD_SCALE_RATE * 0.05, 2.4);
+    const color = pigmentColor();
+    splatDye(pointer.x, pointer.y, color, DROP_RADIUS_PX * scale * 0.7, SPLAT_DYE_BASE * 0.15);
+    if (held > 0.05) {
+      const rings = 4;
+      for (let i = 0; i < rings; i++) {
+        const a = (i / rings) * Math.PI * 2 + held;
+        const ox = Math.cos(a) * DROP_RADIUS_PX * 0.5;
+        const oy = Math.sin(a) * DROP_RADIUS_PX * 0.5;
+        const vx = Math.cos(a) * DROP_RADIAL_VEL * 0.18;
+        const vy = -Math.sin(a) * DROP_RADIAL_VEL * 0.18;
+        splatVelocity(pointer.x + ox, pointer.y + oy, vx, vy, DROP_RADIUS_PX * 0.35);
+      }
+    }
+  }
+
+  // -------------------- step --------------------
+  function advect(field, dissipation) {
+    bindFBO(field.write());
+    gl.useProgram(progAdvect.prog);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, velocity.read().tex);
+    gl.uniform1i(progAdvect.u.uVelocity, 0);
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D, field.read().tex);
+    gl.uniform1i(progAdvect.u.uSource, 1);
+    gl.uniform1f(progAdvect.u.uDt, DT);
+    gl.uniform1f(progAdvect.u.uGridSize, SIM_SIZE);
+    gl.uniform1f(progAdvect.u.uDissipation, dissipation);
+    bindQuad();
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+    field.swap();
+  }
+
+  function step(now) {
+    // 1. advect velocity by itself
+    advect(velocity, VEL_DAMP);
+    // 2. advect dye by velocity
+    advect(dye, DYE_DAMP);
+    // 3. apply user input (drop-hold continuous)
+    applyHold(now);
+  }
+
+  // -------------------- display --------------------
+  function display() {
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.viewport(0, 0, canvas.width, canvas.height);
+    gl.useProgram(progDisplay.prog);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, dye.read().tex);
+    const u = progDisplay.u;
+    gl.uniform1i(u.uDye, 0);
+    gl.uniform3f(u.uPaper, PALETTE.surface[0], PALETTE.surface[1], PALETTE.surface[2]);
+    gl.uniform1f(u.uTime, performance.now() / 1000);
+    gl.uniform2f(u.uResolution, canvas.width, canvas.height);
+    gl.uniform1f(u.uWarpAmp,      SURFACE.WARP_AMP_UV);
+    gl.uniform1f(u.uWarpFreq,     SURFACE.WARP_FREQ);
+    gl.uniform1f(u.uGranAmount,   SURFACE.GRAN_AMOUNT);
+    gl.uniform1f(u.uGranFreq,     SURFACE.GRAN_FREQ);
+    gl.uniform1f(u.uRimStrength,  SURFACE.RIM_STRENGTH);
+    gl.uniform1f(u.uBloomRadius,  SURFACE.BLOOM_RADIUS_UV);
+    gl.uniform1f(u.uBloomMix,     SURFACE.BLOOM_MIX);
+    gl.uniform1f(u.uPaperGrain,   SURFACE.PAPER_GRAIN);
+    gl.uniform1f(u.uPaperFreq,    SURFACE.PAPER_FREQ);
+    gl.uniform1f(u.uVignette,     SURFACE.VIGNETTE);
+    gl.uniform1f(u.uContrastLo,   SURFACE.CONTRAST_LO);
+    gl.uniform1f(u.uContrastHi,   SURFACE.CONTRAST_HI);
+    bindQuad();
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+  }
+
+  // -------------------- main loop --------------------
+  const fpsEl = document.getElementById('fps');
+  let lastFpsT = performance.now();
+  let frameCount = 0;
+  function tick() {
+    const now = performance.now() / 1000;
+    step(now);
+    display();
+    frameCount++;
+    const t = performance.now();
+    if (t - lastFpsT > 500) {
+      const fps = (frameCount * 1000) / (t - lastFpsT);
+      fpsEl.textContent = `${fps.toFixed(0)} fps · ${SIM_SIZE}^2`;
+      frameCount = 0;
+      lastFpsT = t;
+    }
+    requestAnimationFrame(tick);
+  }
+  requestAnimationFrame(tick);
+
+  // -------------------- DevTools handle --------------------
+  window.__marble = {
+    version: 'advection-webgl-v2',
+    reset: resetSim,
+    setTool: t => { currentTool = t; },
+    setPigment: i => { currentPigmentIdx = i % PALETTE.pigments.length; },
+    config: { SIM_SIZE, DT, VEL_DAMP, DYE_DAMP, COMB_TINES, COMB_SPACING_PX },
+    // Mutate SURFACE.* live in DevTools to tune the look without reloading.
+    surface: SURFACE,
+    palette: PALETTE,
+    // Debug splats for quick console testing of comb behaviour.
+    // Run from DevTools: window.__marble.debugComb()
+    debugComb: (x, y) => {
+      if (x === undefined) x = window.innerWidth / 2;
+      if (y === undefined) y = window.innerHeight / 2;
+      applyDrop(x - 60, y, 1.2);
+      applyDrop(x + 60, y, 1.2);
+      // simulate a horizontal stroke across the two drops
+      const steps = 20;
+      const x0 = x - 200, x1 = x + 200;
+      for (let s = 0; s <= steps; s++) {
+        const px = x0 + (x1 - x0) * (s / steps);
+        applyComb(px, y, 1, 0, 1400, COMB_TINES, COMB_SPACING_PX, COMB_RADIUS_PX);
+      }
+    },
+    glInfo: {
+      floatFBO: !!extColorBufferFloat,
+      halfFloatFBO: !!extColorBufferHalfFloat,
+      texInternal: texInternal === gl.RGBA16F ? 'RGBA16F' : 'RGBA8'
+    }
+  };
+  console.log('[marble] ready', window.__marble.glInfo);
+  </script>
+</body>
+</html>

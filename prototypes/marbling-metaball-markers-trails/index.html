@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
-  <title>Marbling Metaball Pools — Refined</title>
+  <title>Marbling Metaball Pools — Marker Trails (M3)</title>
   <script src="https://cdn.jsdelivr.net/npm/p5@1.11.3/lib/p5.min.js"></script>
   <script>window.p5 && (p5.disableFriendlyErrors = true);</script>
   <style>
@@ -114,7 +114,7 @@
   </style>
 </head>
 <body>
-  <div id="hint">pick swatch · drop / drag / rake / comb · P palette · R reset</div>
+  <div id="hint">M3 marker trails · drop / drag / rake / comb · P palette · R reset</div>
   <div id="cornerActions">tap top-left: palette<br>hold top-right: reset</div>
   <div id="toolbar">
     <button class="tool-btn" data-tool="drop" data-active="true">drop</button>
@@ -132,6 +132,23 @@
       strongest-owner clipping can make soft marbled pools without collapsing
       all colors into one global lava-lamp blob. Kept self-contained for quick
       comparison with sibling architecture prototypes.
+
+      M3 (marker trails) follow-up to P2:
+      - Each pool owns a low-res (SCAR_RES²) scar canvas in pool-local UV
+        coords, framed by `pool.bbox` in screen space. Markers (which still
+        move under rake/comb as in P2) splat additive intensity into the
+        scar along their recent paths. The scar slowly decays per frame.
+        At cell render time, the cell samples its owner pool's scar and
+        adds the result to alpha/wash bias — producing a *persistent* streak
+        of brighter pigment along where the marker came from, not just where
+        it currently is.
+      - Fixes P2's two visible limits: a marker pushed outside its home
+        pool's lobe support no longer disappears (its prior trail is still
+        painted inside the pool's scar); and a single comb stroke leaves
+        20+ persistent parallel ripples that linger for ~3–5 seconds
+        instead of vanishing on cursor release.
+      - All P2 mechanics retained: drop/drag/rake/comb, lobes, markers'
+        own bumps, inner sub-lobes, seam blends, surface treatment.
     */
 
     const DEBUG_PERF = false;
@@ -302,6 +319,86 @@
     const DRAG_GRAB_LOBE_FACTOR = 1.45;
     const DRAG_GRAB_BUFFER_PX = 16;
 
+    // -------------------------------------------------------------------
+    // P2 — Inner Markers
+    //
+    // Each pool carries an interior cloud of marker particles. Markers are
+    // *additional field contributors* alongside lobes: when the metaball
+    // field is sampled at (x, y), the pool's value = sum(lobe field) +
+    // sum(marker field). Marker field is exp(-r²/σ²) so it's sharply
+    // localized — markers create small bumps that ride on top of the
+    // lobes' smooth coverage.
+    //
+    // The rake and comb tools push markers, not lobes. Markers move
+    // freely inside the pool; the lobes (and therefore the smooth
+    // boundary) stay where they are. This decouples fine-grain carving
+    // from the coarse pool shape — exactly the problem the trunk
+    // couldn't solve with field-warp or lobe-follow approaches.
+    //
+    // Spatial hash: markers are bucketed into 32x32 px cells so that
+    // per-cell field evaluation only touches nearby markers, not the
+    // pool's whole marker array. Rebuilt LAZILY — only when markers have
+    // moved more than half a cell on average since the last rebuild.
+    // (Per-frame rebuild would be cheap but wasteful when nothing
+    // moved.)
+    // -------------------------------------------------------------------
+    const MARKERS_PER_POOL = 120;
+    const MARKER_SIGMA = 7;            // px; ~tine_pitch/2 of the rake/comb
+    const MARKER_WEIGHT = 0.28;        // contribution per marker, ~0.25–0.4 of a lobe
+    const MARKER_HASH_CELL = 32;       // spatial-hash cell size in px
+    const MARKER_CUTOFF_FACTOR = 3;    // skip markers > 3σ away (≈ exp(-9) ≈ 1e-4)
+    // Rebuild threshold: when the sum of marker displacement squared
+    // since last rebuild exceeds (half a cell)² × markerCount, rebuild.
+    const MARKER_REBUILD_DISP2_FACTOR = (MARKER_HASH_CELL * 0.5) * (MARKER_HASH_CELL * 0.5);
+    // Marker max excursion from spawn position so a long stroke can't
+    // fling a marker into a neighboring pool. (The lobes also clip the
+    // marker contribution by gating it on pool ownership, but excursion
+    // capping keeps the spatial hash from getting weird.)
+    const MARKER_MAX_EXCURSION = 80;
+    // Force factor: how strongly tines displace markers per unit stroke
+    // motion. Higher = more aggressive carving. Tuned so a typical
+    // pass across a pool produces 2–4px of marker shift, which is
+    // visible against MARKER_SIGMA=7.
+    const MARKER_TINE_PUSH_FACTOR = 0.9;
+    // Tine kernel σ for marker displacement. Should match marker σ so
+    // each tine's force profile lines up with marker bumps. Sum-of-
+    // gaussians across tines produces the ripple stack.
+    const MARKER_TINE_SIGMA = 6;
+    // Cutoff distance from a tine for marker push. Beyond this the
+    // Gaussian is too small to matter; AABB culling for the kernel.
+    const MARKER_TINE_CUTOFF = MARKER_TINE_SIGMA * 3;
+
+    // -------------------------------------------------------------------
+    // M3 — Marker Trails
+    //
+    // Each pool owns a low-resolution single-channel "scar" canvas in
+    // pool-local UV coords. As markers move, they paint additive trails
+    // into the scar; the scar slowly decays. At cell-render time the
+    // pool's effective density at the cell is augmented by sampling the
+    // scar at the cell's pool-local UV. This produces a *persistent*
+    // streak of pigment density along the marker's recent path —
+    // visible inside the pool even after the marker has settled.
+    //
+    // Why this fixes P2's two visible limits:
+    //   1. A marker pushed outside its home pool's lobe support no
+    //      longer "disappears" — the trail it painted while inside the
+    //      pool stays inside the pool's scar (clipped naturally to the
+    //      lobe support during field eval).
+    //   2. The visible ripple is no longer just the current marker
+    //      position — the trail of where the marker came from lingers,
+    //      so comb strokes leave persistent 20+ parallel ripples after
+    //      the user releases.
+    // -------------------------------------------------------------------
+    const SCAR_RES = 128;
+    const SCAR_BBOX_EXPAND = 1.5;            // bbox half-extent = maxR * this
+    const TRAIL_PAINT_THRESHOLD = 1.5;       // px; marker must move at least this before re-painting
+    const TRAIL_PAINT_STEP = 2;              // px; mini-splat spacing along path
+    const TRAIL_PAINT_INTENSITY = 0.3;       // value splatted per step (pre-Gaussian-weight)
+    const TRAIL_PAINT_SIGMA_TEXELS = 1.6;    // splat falloff in scar-texel units
+    const SCAR_DECAY_PER_FRAME = 0.995;      // ~3s half-life at 60fps; ~5s to near-invisible
+    const SCAR_RENDER_STRENGTH = 0.4;        // how strongly trail influences rendered density/color
+    const SCAR_CLAMP_MAX = 6.0;              // saturate per-cell scar so heavy overpaint doesn't blow out
+
     const PALETTES = [
       {
         name: 'traditional marbling',
@@ -405,7 +502,7 @@
       // Diagnostic handle: paste `__marble.constants` or `__marble.toolMode`
       // in the DevTools console to confirm which build is loaded.
       window.__marble = {
-        version: 'comb-pixel-smudge-v6-layered',
+        version: 'metaball-markers-trails-v1',
         get toolMode() { return toolMode; },
         get dragSession() { return dragSession; },
         get rakeSession() { return rakeSession; },
@@ -421,6 +518,53 @@
           }
           return { nonzeroCells: nonzero, totalCells: scarDispl.length / 2, maxMagnitude: maxMag };
         },
+        get markerStats() {
+          let total = 0;
+          let displaced = 0;
+          let maxDisp = 0;
+          for (const pool of pools) {
+            if (!pool.markersX) continue;
+            total += pool.markersX.length;
+            for (let i = 0; i < pool.markersX.length; i++) {
+              const dx = pool.markersX[i] - pool.markerSpawnX[i];
+              const dy = pool.markersY[i] - pool.markerSpawnY[i];
+              const d2 = dx * dx + dy * dy;
+              if (d2 > 0.5) displaced++;
+              if (d2 > maxDisp * maxDisp) maxDisp = Math.sqrt(d2);
+            }
+          }
+          return { totalMarkers: total, displacedMarkers: displaced, maxDisplacement: maxDisp };
+        },
+        // M3 — per-pool scar trail stats. Aggregated across pools so the
+        // diagnostic handle reports a single rollup: total trail painted,
+        // peak per-cell density, and how many cells carry any visible
+        // trail. Useful for verifying "is the scar texture actually
+        // accumulating" when reviewing whether trails should appear.
+        get scarTrailStats() {
+          let pools_with_scar = 0;
+          let totalNonzero = 0;
+          let totalCells = 0;
+          let maxValue = 0;
+          let sumValue = 0;
+          for (const pool of pools) {
+            if (!pool.scar) continue;
+            pools_with_scar++;
+            for (let i = 0; i < pool.scar.length; i++) {
+              const v = pool.scar[i];
+              totalCells++;
+              if (v > 0.01) totalNonzero++;
+              if (v > maxValue) maxValue = v;
+              sumValue += v;
+            }
+          }
+          return {
+            poolsWithScar: pools_with_scar,
+            nonzeroCells: totalNonzero,
+            totalCells,
+            maxValue,
+            sumValue
+          };
+        },
         get constants() {
           return {
             RAKE_PUSH_PER_SECOND, RAKE_RADIUS, MAX_RAKE_DISPLACEMENT,
@@ -428,7 +572,13 @@
             DRAG_GRAB_LOBE_FACTOR, DRAG_GRAB_BUFFER_PX,
             COMB_TINE_COUNT, COMB_TINE_SPACING, COMB_TINE_RADIUS,
             COMB_SMUDGE_ALPHA, COMB_SMUDGE_MAX_STEP, COMB_PAPER_BLEED_ALPHA,
-            MAX_SCAR_PER_CELL, SCAR_CELL_SIZE
+            MAX_SCAR_PER_CELL, SCAR_CELL_SIZE,
+            MARKERS_PER_POOL, MARKER_SIGMA, MARKER_WEIGHT, MARKER_HASH_CELL,
+            MARKER_TINE_PUSH_FACTOR, MARKER_TINE_SIGMA, MARKER_MAX_EXCURSION,
+            // M3 trails block
+            SCAR_RES, SCAR_BBOX_EXPAND, TRAIL_PAINT_THRESHOLD, TRAIL_PAINT_STEP,
+            TRAIL_PAINT_INTENSITY, TRAIL_PAINT_SIGMA_TEXELS,
+            SCAR_DECAY_PER_FRAME, SCAR_RENDER_STRENGTH, SCAR_CLAMP_MAX
           };
         }
       };
@@ -444,6 +594,18 @@
       for (const pool of pools) {
         if (pool.update()) moving = true;
       }
+
+      // M3 — per-frame trail bookkeeping. Order matters:
+      //   1) paint trails first so the just-occurred marker motion is
+      //      written into the scar BEFORE decay; otherwise a marker
+      //      that moves exactly TRAIL_PAINT_THRESHOLD per frame would
+      //      have its splat halved by decay before any other code
+      //      reads it.
+      //   2) decay everyone uniformly so trails fade.
+      // The paint step also flags pools dirty so the cell render
+      // re-evaluates and the new streak is visible immediately.
+      paintAllTrails();
+      decayAllScars();
 
       markActivePreviewDirty();
 
@@ -525,6 +687,297 @@
       __scarOut[1] = scarDispl[si00 + 1] * a00 + scarDispl[si10 + 1] * a10 +
                      scarDispl[si01 + 1] * a01 + scarDispl[si11 + 1] * a11;
       return __scarOut;
+    }
+
+    // -------------------------------------------------------------------
+    // M3 — per-pool scar trail helpers.
+    //
+    // The pool's scar is a SCAR_RES × SCAR_RES Float32Array (single-
+    // channel) stored in pool-local UV coords. The pool's bbox describes
+    // the screen-space frame the texture covers; (px, py) → (u, v) is
+    // u = (px - bbox.x) / bbox.w, v = (py - bbox.y) / bbox.h. Samples
+    // outside [0,1]² return 0 and splats outside [0,1]² are no-ops, so
+    // the scar naturally clips itself to the pool's bbox.
+    //
+    // The bbox is rebuilt from sampleLobes union expanded by
+    // SCAR_BBOX_EXPAND when the pool grows past its current footprint.
+    // The scar texture is resampled to the new bbox to keep painted
+    // marks aligned with the pool's body.
+    // -------------------------------------------------------------------
+
+    // paintScar(pool, px, py, intensity, sigma_texels) — splats `intensity`
+    // into pool.scar at the pool-local UV of (px, py) with a Gaussian
+    // falloff of sigma_texels (in scar-texel units; values around 1.6
+    // give ~3-texel-radius soft splats at SCAR_RES=128).
+    //
+    // Out-of-bbox splats are skipped silently — this is the natural
+    // clip that scopes the trail to the pool's footprint.
+    function paintScar(pool, px, py, intensity, sigmaTexels) {
+      if (!pool.scar || !pool.bbox) return;
+      const bbox = pool.bbox;
+      const u = (px - bbox.x) / bbox.w;
+      const v = (py - bbox.y) / bbox.h;
+      if (u < 0 || u > 1 || v < 0 || v > 1) return;
+      const fx = u * (SCAR_RES - 1);
+      const fy = v * (SCAR_RES - 1);
+      const sigma = Math.max(0.5, sigmaTexels);
+      const invSig2 = 1 / (sigma * sigma);
+      const cutoff = Math.ceil(sigma * 3);
+      const cx = Math.round(fx);
+      const cy = Math.round(fy);
+      const x0 = Math.max(0, cx - cutoff);
+      const y0 = Math.max(0, cy - cutoff);
+      const x1 = Math.min(SCAR_RES - 1, cx + cutoff);
+      const y1 = Math.min(SCAR_RES - 1, cy + cutoff);
+      const scar = pool.scar;
+      for (let yy = y0; yy <= y1; yy++) {
+        const dy = yy - fy;
+        const dy2 = dy * dy;
+        const rowOff = yy * SCAR_RES;
+        for (let xx = x0; xx <= x1; xx++) {
+          const dx = xx - fx;
+          const r2 = dx * dx + dy2;
+          const w = Math.exp(-r2 * invSig2);
+          if (w < 0.01) continue;
+          let next = scar[rowOff + xx] + intensity * w;
+          if (next > SCAR_CLAMP_MAX) next = SCAR_CLAMP_MAX;
+          scar[rowOff + xx] = next;
+        }
+      }
+    }
+
+    // paintScarPath(pool, ax, ay, bx, by, intensity, sigmaTexels) — splat
+    // along the line segment from (ax, ay) to (bx, by) every
+    // TRAIL_PAINT_STEP px so a fast-moving marker leaves a continuous
+    // streak rather than a string of beads. Caller is responsible for
+    // having moved by more than TRAIL_PAINT_THRESHOLD before calling
+    // this (we early-out anyway if the path length is below the step).
+    function paintScarPath(pool, ax, ay, bx, by, intensity, sigmaTexels) {
+      const dx = bx - ax;
+      const dy = by - ay;
+      const len = Math.sqrt(dx * dx + dy * dy);
+      if (len < 0.001) {
+        paintScar(pool, bx, by, intensity, sigmaTexels);
+        return;
+      }
+      const step = TRAIL_PAINT_STEP;
+      const steps = Math.max(1, Math.ceil(len / step));
+      // Splat at every interpolated point INCLUDING endpoints so a
+      // single-step path still drops a mark. We pass the same
+      // intensity per splat; consecutive overlapping Gaussians sum
+      // into a continuous streak naturally.
+      for (let i = 0; i <= steps; i++) {
+        const t = i / steps;
+        const x = ax + dx * t;
+        const y = ay + dy * t;
+        paintScar(pool, x, y, intensity, sigmaTexels);
+      }
+    }
+
+    // sampleScarAt(pool, sx, sy) — bilinear sample of pool.scar at the
+    // pool-local UV of screen point (sx, sy). Returns 0 if pool has no
+    // scar or sample is outside the bbox. Called once per owned cell
+    // in writePigmentCell, so kept allocation-free and tight.
+    function sampleScarAt(pool, sx, sy) {
+      if (!pool.scar || !pool.bbox) return 0;
+      const bbox = pool.bbox;
+      const u = (sx - bbox.x) / bbox.w;
+      const v = (sy - bbox.y) / bbox.h;
+      if (u < 0 || u > 1 || v < 0 || v > 1) return 0;
+      const fx = u * (SCAR_RES - 1);
+      const fy = v * (SCAR_RES - 1);
+      const x0 = fx | 0;
+      const y0 = fy | 0;
+      const x1 = x0 + 1 < SCAR_RES ? x0 + 1 : x0;
+      const y1 = y0 + 1 < SCAR_RES ? y0 + 1 : y0;
+      const tx = fx - x0;
+      const ty = fy - y0;
+      const scar = pool.scar;
+      const r0 = y0 * SCAR_RES;
+      const r1 = y1 * SCAR_RES;
+      const v00 = scar[r0 + x0];
+      const v10 = scar[r0 + x1];
+      const v01 = scar[r1 + x0];
+      const v11 = scar[r1 + x1];
+      const a00 = (1 - tx) * (1 - ty);
+      const a10 = tx * (1 - ty);
+      const a01 = (1 - tx) * ty;
+      const a11 = tx * ty;
+      return v00 * a00 + v10 * a10 + v01 * a01 + v11 * a11;
+    }
+
+    // Per-frame decay of every pool's scar. Cheap: SCAR_RES² × poolCount
+    // = 16k × ~5 pools = 80k Float32 multiplies. Skipped during deep
+    // settle (settled && !activePress && no session) so a quiet canvas
+    // doesn't pointlessly chew CPU and the trail freezes in place at
+    // its current value — restarts decaying when motion resumes. Trail
+    // freeze on settle is acceptable since the static-settle guard
+    // only fires after several seconds with no input.
+    function decayAllScars() {
+      const k = SCAR_DECAY_PER_FRAME;
+      for (const pool of pools) {
+        if (!pool.scar) continue;
+        const scar = pool.scar;
+        let nonzero = false;
+        for (let i = 0; i < scar.length; i++) {
+          const v = scar[i] * k;
+          if (v > 0.001) {
+            scar[i] = v;
+            nonzero = true;
+          } else {
+            scar[i] = 0;
+          }
+        }
+        // If any scar still has visible mass, force the pool to keep
+        // re-rendering so the fade is visible — otherwise the settled
+        // path would freeze the last frame and the trail would never
+        // appear to decay until the user touched the canvas again.
+        if (nonzero) {
+          pool.settled = false;
+          markDirtyRect(pool.fieldRect);
+        }
+      }
+    }
+
+    // rebuildPoolBboxIfNeeded(pool, force) — recompute the pool's
+    // screen-space bbox from its sampleLobes union (or fallback to
+    // targetMass-derived disk for newborns), expanded by
+    // SCAR_BBOX_EXPAND so the texture covers a buffer beyond the lobe
+    // support (so trails painted near the edge don't immediately fall
+    // off the texture). Called on creation (force=true) and on growth
+    // events. Grow-only: if the natural footprint shrank we keep the
+    // larger bbox so the scar texture doesn't lose marks.
+    function rebuildPoolBboxIfNeeded(pool, force) {
+      if (!pool || pool.preview) return;
+      const baseR = Math.sqrt(pool.targetMass / Math.PI);
+      let cx = pool.center.x;
+      let cy = pool.center.y;
+      let maxR = baseR;
+      for (const lobe of pool.lobes) {
+        const lx = cx + Math.cos(lobe.angle) * (Math.abs(lobe.offsetTarget) || 0) + (lobe.displaceTargetX || 0);
+        const ly = cy + Math.sin(lobe.angle) * (Math.abs(lobe.offsetTarget) || 0) + (lobe.displaceTargetY || 0);
+        const dx = lx - cx;
+        const dy = ly - cy;
+        const r = Math.sqrt(dx * dx + dy * dy) + (lobe.targetRadius || lobe.radius || 0);
+        if (r > maxR) maxR = r;
+      }
+      const halfExt = maxR * SCAR_BBOX_EXPAND;
+      const x = cx - halfExt;
+      const y = cy - halfExt;
+      const w = halfExt * 2;
+      const h = halfExt * 2;
+      if (force || !pool.bbox) {
+        pool.bbox = { x, y, w, h };
+        if (!pool.scar) pool.scar = new Float32Array(SCAR_RES * SCAR_RES);
+        return;
+      }
+      // Grow-only: if natural footprint expanded past the bbox edges,
+      // we resample the scar into a larger frame. Cost is one bilinear
+      // lookup per scar texel (~16k); only fires when the pool grows.
+      const bb = pool.bbox;
+      const grew = x < bb.x - 0.5 || y < bb.y - 0.5 ||
+                   x + w > bb.x + bb.w + 0.5 || y + h > bb.y + bb.h + 0.5;
+      if (!grew) return;
+      const newBbox = { x, y, w, h };
+      pool.scar = resampleScarToNewBbox(pool.scar, pool.bbox, newBbox);
+      pool.bbox = newBbox;
+    }
+
+    // Resample the scar texture from oldBbox frame into newBbox frame
+    // so painted marks stay where they were in screen coords. Bilinear
+    // interpolation; out-of-old-bbox samples become 0 (silent clip).
+    function resampleScarToNewBbox(oldScar, oldBbox, newBbox) {
+      const next = new Float32Array(SCAR_RES * SCAR_RES);
+      for (let vy = 0; vy < SCAR_RES; vy++) {
+        const v = vy / (SCAR_RES - 1);
+        const py = newBbox.y + v * newBbox.h;
+        const ov = (py - oldBbox.y) / oldBbox.h;
+        if (ov < 0 || ov > 1) continue;
+        const fv = ov * (SCAR_RES - 1);
+        const v0 = fv | 0;
+        const v1 = v0 + 1 < SCAR_RES ? v0 + 1 : v0;
+        const tv = fv - v0;
+        for (let vx = 0; vx < SCAR_RES; vx++) {
+          const u = vx / (SCAR_RES - 1);
+          const px = newBbox.x + u * newBbox.w;
+          const ou = (px - oldBbox.x) / oldBbox.w;
+          if (ou < 0 || ou > 1) continue;
+          const fu = ou * (SCAR_RES - 1);
+          const u0 = fu | 0;
+          const u1 = u0 + 1 < SCAR_RES ? u0 + 1 : u0;
+          const tu = fu - u0;
+          const off00 = v0 * SCAR_RES + u0;
+          const off10 = v0 * SCAR_RES + u1;
+          const off01 = v1 * SCAR_RES + u0;
+          const off11 = v1 * SCAR_RES + u1;
+          const a00 = (1 - tu) * (1 - tv);
+          const a10 = tu * (1 - tv);
+          const a01 = (1 - tu) * tv;
+          const a11 = tu * tv;
+          next[vy * SCAR_RES + vx] =
+            oldScar[off00] * a00 + oldScar[off10] * a10 +
+            oldScar[off01] * a01 + oldScar[off11] * a11;
+        }
+      }
+      return next;
+    }
+
+    // Shift every pool's scar texture by (dx, dy) screen-space pixels
+    // by simply shifting the bbox origin — since the texture is in
+    // pool-local UV and the bbox places that UV in screen space, the
+    // trail follows the pool for free. Used when the pool is dragged
+    // by the user (drag tool) or pushed by D1 displacement (new drop).
+    function translatePoolBbox(pool, dx, dy) {
+      if (!pool.bbox) return;
+      pool.bbox.x += dx;
+      pool.bbox.y += dy;
+    }
+
+    // paintAllTrails — once per frame, walk every pool's marker arrays
+    // and for any marker that has moved at least TRAIL_PAINT_THRESHOLD
+    // px since its last-painted position, splat into the pool's scar
+    // along the path from last-painted to current. The pool's
+    // markerPaintedX/Y arrays track the last position we painted from
+    // (NOT the spawn position) so a stationary marker stops adding to
+    // the scar but accumulated trail remains.
+    //
+    // Cost budget: only markers that moved this frame get the path
+    // splat. During a rake/comb stroke that's ~markers-in-stroke-zone
+    // per frame; during a static settle it's zero markers. Per-marker
+    // cost is path-length / TRAIL_PAINT_STEP × paintScar (a small
+    // local 5×5 Gaussian splat). Trivial under load.
+    function paintAllTrails() {
+      for (const pool of pools) {
+        if (pool.preview) continue;
+        if (!pool.markersX || !pool.scar) continue;
+        const mx = pool.markersX;
+        const my = pool.markersY;
+        const lpx = pool.markerPaintedX;
+        const lpy = pool.markerPaintedY;
+        if (!lpx || !lpy) continue;
+        const thresh2 = TRAIL_PAINT_THRESHOLD * TRAIL_PAINT_THRESHOLD;
+        let painted = false;
+        for (let i = 0; i < mx.length; i++) {
+          const cx = mx[i];
+          const cy = my[i];
+          const dx = cx - lpx[i];
+          const dy = cy - lpy[i];
+          if (dx * dx + dy * dy < thresh2) continue;
+          paintScarPath(pool, lpx[i], lpy[i], cx, cy,
+            TRAIL_PAINT_INTENSITY, TRAIL_PAINT_SIGMA_TEXELS);
+          lpx[i] = cx;
+          lpy[i] = cy;
+          painted = true;
+        }
+        if (painted) {
+          // Trail painted → cells that read the scar will pick up
+          // higher density, so the field-eval rect needs re-render.
+          // We mark the field rect dirty (which already includes
+          // marker AABB) so the new streak is visible this frame.
+          markDirtyRect(pool.fieldRect);
+          pool.settled = false;
+        }
+      }
     }
 
     function renderPaper() {
@@ -614,6 +1067,12 @@
     // the runner-up owner so the renderer can blend pigment colors at seams.
     function evaluateField(renderPools, rects) {
       const cellSize = quality.cellSize;
+      // P2 — rebuild any pool's marker spatial hash if dirty/drifted.
+      // Done once before per-cell evaluation since the hash is read many
+      // times per pool inside the hot loop.
+      for (const pool of renderPools) {
+        if (pool.rebuildMarkerHashIfNeeded) pool.rebuildMarkerHashIfNeeded();
+      }
       for (const rect of rects) {
         const candidates = poolsForRect(renderPools, rect);
         for (let gy = rect.y0; gy < rect.y1; gy++) {
@@ -679,9 +1138,32 @@
       const cy = gy * cellSize + cellSize * 0.5;
       const n = stableNoise(gx, gy, pool.seed);
       const edgeT = constrain((cell.strength - FIELD_THRESHOLD) / FIELD_RIM_BAND, 0, 1);
-      const alphaBase = 82 + 72 * constrain(edgeT, 0, 1);
+      // M3 — sample the pool's scar trail at this cell. Trail values are
+      // additive density contributions painted by markers along their
+      // recent path; they're sharply localized to the streak, decay
+      // over ~3-5 seconds, and live in pool-local UV (so they're
+      // automatically clipped to the pool's bbox/footprint). We feed
+      // the scar value into two visual channels:
+      //   - alphaBoost: opacity goes up where trail is dense, so the
+      //     pool's color reads more strongly along the streak.
+      //   - washBias: trail-heavy cells skew toward the pool's `wash`
+      //     tint so the streak reads as a brighter "wet" line instead
+      //     of just being more opaque, which is what real non-pareil
+      //     looks like (pulled pigment exposes a brighter inner band).
+      // Clamping the contribution to ~1.0 prevents heavy overpaint
+      // (many tines layered on top of each other) from blowing out the
+      // pool's color entirely.
+      const scarVal = sampleScarAt(pool, cx, cy);
+      const trailContrib = scarVal > 0 ? Math.min(1, scarVal * SCAR_RENDER_STRENGTH) : 0;
+      const alphaBase = 82 + 72 * constrain(edgeT, 0, 1) + 60 * trailContrib;
       const rimT = neighborRim ? 0.72 : Math.max(0, 1 - edgeT) * 0.62;
-      const washT = constrain((cell.strength - 1.5) / 3.2, 0, 0.48);
+      // Trail contribution biases washT upward so streaked regions
+      // read as the pool's wash color — gives a visible "lighter line"
+      // along the carved path, the way real combed pigment exposes the
+      // brighter inner pigment band. Capped so wash never fully
+      // dominates the base.
+      const trailWashBias = trailContrib * 0.45;
+      const washT = Math.min(0.85, constrain((cell.strength - 1.5) / 3.2, 0, 0.48) + trailWashBias);
       const washed = mixRgb(pool.rgb.base, pool.rgb.wash, washT);
       let c = mixRgb(washed, pool.rgb.rim, rimT);
 
@@ -713,7 +1195,8 @@
       const r = clampByte(c.r + noiseShift);
       const g = clampByte(c.g + noiseShift);
       const b = clampByte(c.b + noiseShift);
-      const a = neighborRim ? 166 : (alphaBase | 0);
+      // M3 — alpha can now exceed 255 thanks to trail boost; clamp.
+      const a = neighborRim ? 166 : clampByte(alphaBase);
 
       // Inline cellSize×cellSize block write. Hot path: keep loop tight.
       for (let py = 0; py < cellSize; py++) {
@@ -1062,6 +1545,12 @@
       const prevRect = pool.fieldRect;
       pool.center.x = constrain(pool.center.x + dx, 0, width);
       pool.center.y = constrain(pool.center.y + dy, 0, height);
+      // P2 — translate markers along with the pool. Spawn positions move
+      // too so the excursion clamp continues to reference the marker's
+      // new "home." Without this, markers stay stuck where the pool
+      // started — visually equivalent to the pool sliding out from under
+      // its own carved streaks.
+      pool.translateMarkers(dx, dy);
       pool.settled = false;
       pool.updateGeometry();
       if (prevRect) markDirtyRect(prevRect);
@@ -1110,70 +1599,44 @@
       rakeSession.y = cy;
     }
 
+    // P2 — rake tool now pushes markers, not lobes. The lobes (and pool
+    // boundary) stay where they are; we displace the per-pool marker
+    // cloud along the stroke direction so the *interior* field shows
+    // streaks. Rake is a single-tine kernel (one Gaussian center at the
+    // cursor); comb stacks many tines. Marker displacement scales with
+    // the per-frame stroke vector — so slow strokes carve more (more
+    // frames at any given location) and fast strokes carve less. Same
+    // physical intuition as before, different mechanism.
+    //
+    // We keep RAKE_RADIUS for the cursor UI; the marker push uses a
+    // Gaussian with σ ≈ tine_pitch/2 so a single-tine rake reads as a
+    // single broad streak. Bumping the rake sigma above MARKER_TINE_SIGMA
+    // would make the streak fatter but blur it — current value gives a
+    // distinct furrow.
+    const RAKE_MARKER_SIGMA = MARKER_TINE_SIGMA * 2.6; // broader for rake's "fat brush" feel
+
     function applyRakeImpulse(x, y, vx, vy) {
       if (!rakeSession) return;
-      const radius = RAKE_RADIUS;
-      const radius2 = radius * radius;
-      const maxOffset2 = MAX_RAKE_DISPLACEMENT * MAX_RAKE_DISPLACEMENT;
-      // Normalize the per-frame motion to a unit stroke direction. The
-      // magnitude of (vx, vy) no longer participates in the impulse — it
-      // only tells us *which way* the user is dragging. Net displacement
-      // comes from how long a lobe stays inside the kernel, not how fast
-      // the cursor crossed it.
+      // Single-element tine arrays: rake is a one-tine kernel at the
+      // cursor. We use the same code path as the comb for parity.
+      const tx = _rakeTineX;
+      const ty = _rakeTineY;
+      tx[0] = x;
+      ty[0] = y;
       const speed = Math.hypot(vx, vy);
       if (speed < 0.01) return;
-      const dirX = vx / speed;
-      const dirY = vy / speed;
-      // Perpendicular shear axis (90° CCW from stroke direction).
-      const perpX = -dirY;
-      const perpY = dirX;
-      // Time on contact — clamp dt so a paused-then-resumed stroke (or
-      // a frame skipped by the browser) doesn't dump a huge accumulated
-      // delta on the first frame back.
-      const now = millis();
-      const dt = Math.min(RAKE_MAX_DT, (now - rakeSession.lastImpulseAt) / 1000);
-      rakeSession.lastImpulseAt = now;
-      const pushBase = RAKE_PUSH_PER_SECOND * dt;
-      const perpBase = pushBase * RAKE_PERP_FRACTION;
+      // Stroke vector — markers get pushed by (vx, vy) times the
+      // tine-Gaussian-weight at their location. Magnitude of (vx, vy)
+      // directly controls per-frame displacement so a slow drag still
+      // carves (more frames over the same markers).
       let touchedAny = false;
       for (const pool of pools) {
         if (pool.preview) continue;
-        let touched = false;
-        for (const lobe of pool.lobes) {
-          const lx = pool.center.x + Math.cos(lobe.angle) * lobe.offsetNow + lobe.displaceX;
-          const ly = pool.center.y + Math.sin(lobe.angle) * lobe.offsetNow + lobe.displaceY;
-          const rx = lx - x;
-          const ry = ly - y;
-          const r2 = rx * rx + ry * ry;
-          if (r2 > radius2) continue;
-          const r = Math.sqrt(r2);
-          // Smooth power falloff: 1 at the cursor, 0 at the edge of radius.
-          const f = Math.pow(1 - r / radius, RAKE_FALLOFF_POWER);
-          const push = pushBase * f;
-          lobe.displaceTargetX += dirX * push;
-          lobe.displaceTargetY += dirY * push;
-          // Perpendicular shear: signed by which side of the stroke axis
-          // the lobe sits on. `side` is the projection of (rx, ry) onto
-          // the perp axis, normalized by the kernel radius so it lives
-          // in [-1, 1] regardless of cursor speed. Lobes near the
-          // stroke center get ~0 perp; off-axis lobes get a tangential
-          // nudge — this is what produces the slight swirl at stroke
-          // ends rather than a pure straight tug.
-          const side = (rx * perpX + ry * perpY) / radius;
-          const sk = perpBase * f * side;
-          lobe.displaceTargetX += perpX * sk;
-          lobe.displaceTargetY += perpY * sk;
-          const dist2 = lobe.displaceTargetX * lobe.displaceTargetX +
-                        lobe.displaceTargetY * lobe.displaceTargetY;
-          if (dist2 > maxOffset2) {
-            const scale = MAX_RAKE_DISPLACEMENT / Math.sqrt(dist2);
-            lobe.displaceTargetX *= scale;
-            lobe.displaceTargetY *= scale;
-          }
-          touched = true;
-        }
-        if (touched) {
+        const moved = pool.applyTineDisplacement(
+          vx, vy, tx, ty, RAKE_MARKER_SIGMA, MARKER_TINE_PUSH_FACTOR);
+        if (moved) {
           pool.settled = false;
+          pool.markersDirty = true;
           pool.updateGeometry();
           markDirtyRect(pool.fieldRect);
           touchedAny = true;
@@ -1181,6 +1644,11 @@
       }
       if (touchedAny) dirty = true;
     }
+
+    // Reusable single-tine arrays for the rake. Allocated once so the
+    // hot path doesn't generate Float32Array garbage every frame.
+    const _rakeTineX = new Float32Array(1);
+    const _rakeTineY = new Float32Array(1);
 
     // Comb tool — multi-tine striations. Tines sit along a line perpendicular
     // to the stroke direction; each tine applies a small forward impulse to
@@ -1220,77 +1688,81 @@
       combSession.y = cy;
     }
 
-    // Comb impulse — pixel-smudge along each tine path. Writes to
-    // combLayer (a separate compositing layer) rather than pigmentLayer
-    // so the field re-eval can't wipe the marks. Two stamps per tine
-    // per step:
-    //   1. Pick-up — sample pigmentLayer at the tine's previous
-    //      position and deposit at the current position. This is what
-    //      makes color information get carried forward at all (combLayer
-    //      starts empty; without this pass, drawing combLayer onto
-    //      itself would have nothing to drag).
-    //   2. Propagate — draw combLayer onto itself, shifted by the
-    //      per-step motion. This drags whatever color has accumulated
-    //      in combLayer forward, so successive frames of the same
-    //      stroke build up a continuous trail rather than disconnected
-    //      stamps.
-    // Path subdivision keeps fast strokes from leaving gaps.
+    // P2 — comb impulse. Each tine is a Gaussian force kernel that
+    // displaces nearby markers along the stroke direction. With many
+    // tightly-spaced tines, every marker between two adjacent tines
+    // sees overlapping Gaussian weight from both — the sum-of-Gaussians
+    // superposition is what produces the fine alternating-streak
+    // pattern (closely-spaced peaks of marker density vs. peaks of
+    // depletion). For a non-pareil comb (36 tines × 6px = 216px wide
+    // bar at high tine density), markers get carved into 20+ visible
+    // ripples.
+    //
+    // The previous pixel-smudge approach is replaced entirely: nothing
+    // is drawn to combLayer here. The comb's effect lives in marker
+    // positions, which the next field-eval pass reads as bumps.
     function applyCombImpulse(x, y, vx, vy, dirX, dirY) {
-      if (!combLayer || !pigmentLayer) return;
       const perpX = -dirY;
       const perpY = dirX;
       const half = (COMB_TINE_COUNT - 1) / 2;
-      const tineR = COMB_TINE_RADIUS;
+      // Tine layout: COMB_TINE_COUNT positions evenly spaced
+      // perpendicular to the stroke direction. Built per substep below
+      // since each substep's tines sit at a different point along the
+      // stroke path. Subdivide the per-frame motion if the cursor moved
+      // further than COMB_SMUDGE_MAX_STEP — without this, fast strokes would leave
+      // visible gaps between tine-force evaluations. We accumulate
+      // force over the substeps; each substep pushes markers by a
+      // fraction of (vx, vy).
       const motionLen = Math.sqrt(vx * vx + vy * vy);
       const stepCount = Math.max(1, Math.ceil(motionLen / Math.max(0.5, COMB_SMUDGE_MAX_STEP)));
       const stepVx = vx / stepCount;
       const stepVy = vy / stepCount;
-      const startX = x - vx;
-      const startY = y - vy;
-      const ctx = combLayer.drawingContext;
-      const TWO_PI_LOCAL = Math.PI * 2;
-      const paper = PALETTES[paletteIndex].surface;
-      ctx.save();
-      for (let step = 1; step <= stepCount; step++) {
-        const sx = startX + stepVx * step;
-        const sy = startY + stepVy * step;
+      let touchedAny = false;
+      const stx = _combSubTineX;
+      const sty = _combSubTineY;
+      for (let step = 0; step < stepCount; step++) {
+        // Tine positions for this substep — shifted backward by the
+        // remaining steps so the first substep sits at (start + stepV)
+        // and the last at (x, y). This makes the integrated push along
+        // the path uniform, not bunched at the cursor.
+        const back = stepCount - 1 - step;
+        const subShiftX = -stepVx * back;
+        const subShiftY = -stepVy * back;
         for (let i = 0; i < COMB_TINE_COUNT; i++) {
           const offset = (i - half) * COMB_TINE_SPACING;
-          const tx = sx + perpX * offset;
-          const ty = sy + perpY * offset;
-          if (tx < -tineR || tx > width + tineR || ty < -tineR || ty > height + tineR) continue;
-          ctx.save();
-          ctx.beginPath();
-          ctx.arc(tx, ty, tineR, 0, TWO_PI_LOCAL);
-          ctx.clip();
-          // Stamp 1 — pick up pigment from pigmentLayer at the tine's
-          // previous position and deposit at the current position.
-          // drawImage(src, stepVx, stepVy) places src[0,0] at dest[stepVx,
-          // stepVy], which is equivalent to dest[x, y] := src[x-stepVx,
-          // y-stepVy]. Inside our clip at (tx, ty) that reads
-          // pigmentLayer at (tx-stepVx, ty-stepVy) = previous tine pos.
-          ctx.globalAlpha = COMB_SMUDGE_ALPHA;
-          ctx.drawImage(pigmentLayer.canvas, stepVx, stepVy);
-          // Stamp 2 — propagate any accumulated combLayer pigment
-          // forward. On the first frame of a stroke combLayer is empty
-          // here, so this is a no-op; on subsequent frames it carries
-          // the trail of the prior frames forward by one step.
-          ctx.globalAlpha = COMB_SMUDGE_ALPHA * 0.7;
-          ctx.drawImage(combLayer.canvas, stepVx, stepVy);
-          // Optional paper-color bleed — makes the tine path readable
-          // even when combing through a single-color region. Drawn
-          // last so it sits on top of the smudge in this tine disk.
-          if (COMB_PAPER_BLEED_ALPHA > 0) {
-            ctx.globalAlpha = COMB_PAPER_BLEED_ALPHA;
-            ctx.fillStyle = paper;
-            ctx.fillRect(tx - tineR, ty - tineR, tineR * 2, tineR * 2);
+          stx[i] = x + perpX * offset + subShiftX;
+          sty[i] = y + perpY * offset + subShiftY;
+        }
+        for (const pool of pools) {
+          if (pool.preview) continue;
+          const moved = pool.applyTineDisplacement(
+            stepVx, stepVy, stx, sty, MARKER_TINE_SIGMA, MARKER_TINE_PUSH_FACTOR);
+          if (moved) {
+            pool.settled = false;
+            pool.markersDirty = true;
+            touchedAny = true;
           }
-          ctx.restore();
         }
       }
-      ctx.restore();
-      dirty = true;
+      // updateGeometry + dirty rect once per affected pool, not per
+      // substep — cheaper and just as correct since substeps all
+      // contribute to the same final marker positions.
+      if (touchedAny) {
+        for (const pool of pools) {
+          if (pool.preview) continue;
+          if (pool.markersDirty) {
+            pool.updateGeometry();
+            markDirtyRect(pool.fieldRect);
+          }
+        }
+        dirty = true;
+      }
     }
+
+    // Reusable comb tine arrays. Sized at COMB_TINE_COUNT (constant);
+    // allocated once and reused every frame.
+    const _combSubTineX = new Float32Array(COMB_TINE_COUNT);
+    const _combSubTineY = new Float32Array(COMB_TINE_COUNT);
 
     // Legacy scar-impulse writer — retained as a no-op so nothing
     // breaks if some other tool/test still calls it. The smudge-based
@@ -1373,6 +1845,13 @@
         let touched = false;
         let satellitesSpawnedThisEvent = 0;
         const pendingSatellites = [];
+        // P2 — track the radial push at the pool *center* so we can drag
+        // markers along by the same outward displacement. Without this,
+        // a drop pushes the lobes out but the markers stay where they
+        // were — the carved interior would slide off the new pool body.
+        const pdx = pool.center.x - cx;
+        const pdy = pool.center.y - cy;
+        const pd = Math.sqrt(pdx * pdx + pdy * pdy);
         // Satellite cap math: only count non-satellite lobes when computing
         // remaining headroom, so satellites don't crowd out their own slot.
         const existingSatelliteCount = pool.lobes.reduce(
@@ -1439,6 +1918,24 @@
         if (pendingSatellites.length) {
           pool.lobes.push(...pendingSatellites);
           touched = true;
+        }
+        // P2 — drag the marker cloud outward by the same incompressible-
+        // shell push that the lobes saw at the pool's center. Use the
+        // center's distance d (not per-lobe), so the entire marker cloud
+        // translates rigidly. This is intentional: per-marker push would
+        // *deform* the marker cloud during a drop, eating into the
+        // budget we want preserved for rake/comb-driven streaks.
+        if (pd > 0.5 && pool.markersX && pool.markersX.length > 0) {
+          const safeR = Math.max(pd, Rnew * 0.5);
+          let push = R2 / (2 * safeR);
+          if (pd < Rnew) push += (Rnew - pd) * DISPLACEMENT_INSIDE_BOOST;
+          if (push > DISPLACEMENT_MAX_PX) push = DISPLACEMENT_MAX_PX;
+          if (push >= DISPLACEMENT_MIN_PX) {
+            const ux = pdx / pd;
+            const uy = pdy / pd;
+            pool.translateMarkers(ux * push, uy * push);
+            touched = true;
+          }
         }
         if (touched) {
           pool.settled = false;
@@ -1650,9 +2147,49 @@
         this.sampleLobes = [];
         this.pixelBounds = null;
         this.fieldRect = null;
+        // -----------------------------------------------------------------
+        // P2 — marker arrays. Typed arrays (Float32) per pool for memory
+        // economy and to avoid GC. markerSpawnX/Y is the original spawn
+        // position used as a stable "rest" reference for the displacement
+        // cap; markersX/Y is the live position pushed by rake/comb. count
+        // can be 0 for preview pools (markers aren't shown during preview
+        // and would just be discarded on commit). The hash grid lives on
+        // the pool itself and is rebuilt lazily when the accumulated
+        // marker drift since last build exceeds half a cell on average.
+        // -----------------------------------------------------------------
+        this.markersX = null;
+        this.markersY = null;
+        this.markerSpawnX = null;
+        this.markerSpawnY = null;
+        // M3 — last-painted position per marker. Updated by paintAllTrails
+        // after each splat so we splat once per TRAIL_PAINT_THRESHOLD of
+        // motion (not once per frame). Distinct from markerSpawn (the
+        // excursion-clamp reference); markerPainted is the rolling
+        // "where the path last left off" for trail painting.
+        this.markerPaintedX = null;
+        this.markerPaintedY = null;
+        this.markerHash = null;       // Map<cellKey, Int32Array of marker indices>
+        this.markerHashOriginX = 0;   // bucket grid origin (recomputed on rebuild)
+        this.markerHashOriginY = 0;
+        this.markerHashCols = 0;
+        this.markerHashRows = 0;
+        this.markerHashCellsX0 = 0;
+        this.markerHashCellsY0 = 0;
+        this.markerDriftAccum = 0;    // sum of |Δpos|² since last rebuild
+        this.markersDirty = true;     // forces rebuild after spawn/drag
+        // M3 — per-pool scar canvas + bbox. Allocated by
+        // rebuildPoolBboxIfNeeded(force=true) below so the bbox is
+        // computed from this pool's lobe geometry, not from a stale
+        // default.
+        this.scar = null;
+        this.bbox = null;
         this.makeLobes(lobeCount);
         this.makeInnerLobes();
+        this.makeMarkers();
         this.updateGeometry();
+        // Initialize bbox + scar AFTER updateGeometry so sampleLobes
+        // is populated. Preview pools skip — they don't render scars.
+        if (!preview) rebuildPoolBboxIfNeeded(this, true);
       }
 
       makeLobes(count) {
@@ -1728,6 +2265,308 @@
             intensity: random(-0.95, 0.95)
           });
         }
+      }
+
+      // ------------------------------------------------------------------
+      // P2 — marker spawn. Distribute MARKERS_PER_POOL particles uniformly
+      // inside the pool's idealized footprint at creation time. Preview
+      // pools skip this since their markers would just be discarded on
+      // commit. Markers spawn inside a disk of radius baseR (the pool's
+      // idealized circle); they end up inside the final fingered footprint
+      // through the lobes anyway because the lobes extend past baseR.
+      //
+      // Rejection sampling inside the disk: about π/4 acceptance, fast in
+      // practice. Use a seeded RNG so a re-render with the same seed
+      // produces the same marker pattern.
+      // ------------------------------------------------------------------
+      makeMarkers() {
+        if (this.preview) {
+          // Allocate empty arrays so callers can iterate unconditionally.
+          this.markersX = new Float32Array(0);
+          this.markersY = new Float32Array(0);
+          this.markerSpawnX = new Float32Array(0);
+          this.markerSpawnY = new Float32Array(0);
+          this.markerPaintedX = new Float32Array(0);
+          this.markerPaintedY = new Float32Array(0);
+          return;
+        }
+        randomSeed(floor(this.seed) ^ 0x4d4b);
+        const count = MARKERS_PER_POOL;
+        const baseR = Math.sqrt(this.targetMass / Math.PI);
+        // Slight inset so markers don't spawn AT the boundary where lobes
+        // bleed to ownership: 0.92 of baseR gives a comfortable interior.
+        const spawnR = baseR * 0.92;
+        const mx = new Float32Array(count);
+        const my = new Float32Array(count);
+        const sx = new Float32Array(count);
+        const sy = new Float32Array(count);
+        const lpx = new Float32Array(count);
+        const lpy = new Float32Array(count);
+        let placed = 0;
+        let attempts = 0;
+        const cap = count * 24; // safety cap on rejection sampling
+        while (placed < count && attempts < cap) {
+          attempts++;
+          // Uniform-in-disk via rejection in [-1,1]² — cheaper than the
+          // sqrt(rand) polar trick and a tighter loop.
+          const u = random(-1, 1);
+          const v = random(-1, 1);
+          if (u * u + v * v > 1) continue;
+          const x = this.center.x + u * spawnR;
+          const y = this.center.y + v * spawnR;
+          mx[placed] = x;
+          my[placed] = y;
+          sx[placed] = x;
+          sy[placed] = y;
+          lpx[placed] = x;
+          lpy[placed] = y;
+          placed++;
+        }
+        // If somehow we couldn't fill (degenerate seed), pad with center.
+        for (let i = placed; i < count; i++) {
+          mx[i] = this.center.x;
+          my[i] = this.center.y;
+          sx[i] = this.center.x;
+          sy[i] = this.center.y;
+          lpx[i] = this.center.x;
+          lpy[i] = this.center.y;
+        }
+        this.markersX = mx;
+        this.markersY = my;
+        this.markerSpawnX = sx;
+        this.markerSpawnY = sy;
+        this.markerPaintedX = lpx;
+        this.markerPaintedY = lpy;
+        this.markersDirty = true;
+        this.markerDriftAccum = 0;
+      }
+
+      // ------------------------------------------------------------------
+      // Translate every marker by (dx, dy). Used when the whole pool is
+      // dragged (drag tool) or pushed sideways by a new drop (D1
+      // displacement). Spawn positions move too so the excursion clamp
+      // stays well-defined relative to the new "rest" location.
+      // ------------------------------------------------------------------
+      translateMarkers(dx, dy) {
+        if (!this.markersX) return;
+        const mx = this.markersX;
+        const my = this.markersY;
+        const sx = this.markerSpawnX;
+        const sy = this.markerSpawnY;
+        const lpx = this.markerPaintedX;
+        const lpy = this.markerPaintedY;
+        for (let i = 0; i < mx.length; i++) {
+          mx[i] += dx;
+          my[i] += dy;
+          sx[i] += dx;
+          sy[i] += dy;
+          if (lpx) lpx[i] += dx;
+          if (lpy) lpy[i] += dy;
+        }
+        this.markersDirty = true;
+        // M3 — pool body moved; shift the scar's screen-space frame so
+        // painted trails stay attached to the pool. We just translate
+        // the bbox (no resample needed); the texture data is in pool-
+        // local UV and follows for free.
+        translatePoolBbox(this, dx, dy);
+      }
+
+      // ------------------------------------------------------------------
+      // Spatial hash rebuild. Cells are MARKER_HASH_CELL px squares; we
+      // store, per cell, a list of marker indices that landed in it.
+      //
+      // We use a 2D array of Int32 arrays for predictable access (not a
+      // Map) since the grid origin can shift but the number of cells is
+      // small (~80×60 for a 2560×1440 canvas at 32px cells). Bucket
+      // origin and size are computed from current marker AABB plus a
+      // 1-cell buffer.
+      //
+      // Lazy: skip if markersDirty is false AND drift accumulator hasn't
+      // crossed the threshold. The accumulator is per-marker squared
+      // displacement summed since the last rebuild; the threshold is
+      // (cellSize/2)² × markerCount, i.e. "average marker has moved
+      // half a cell."
+      // ------------------------------------------------------------------
+      rebuildMarkerHashIfNeeded() {
+        if (!this.markersX || this.markersX.length === 0) return;
+        const needRebuild = this.markersDirty ||
+          this.markerDriftAccum > MARKER_REBUILD_DISP2_FACTOR * this.markersX.length;
+        if (!needRebuild && this.markerHash) return;
+        const mx = this.markersX;
+        const my = this.markersY;
+        let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+        for (let i = 0; i < mx.length; i++) {
+          if (mx[i] < x0) x0 = mx[i];
+          if (mx[i] > x1) x1 = mx[i];
+          if (my[i] < y0) y0 = my[i];
+          if (my[i] > y1) y1 = my[i];
+        }
+        // Pad by one cell so adjacent-cell lookups can never reference
+        // a cell outside the grid.
+        const cs = MARKER_HASH_CELL;
+        const ox = Math.floor(x0 / cs) * cs - cs;
+        const oy = Math.floor(y0 / cs) * cs - cs;
+        const cols = Math.ceil((x1 - ox) / cs) + 2;
+        const rows = Math.ceil((y1 - oy) / cs) + 2;
+        // First pass: count per cell.
+        const counts = new Int32Array(cols * rows);
+        const cellIdx = new Int32Array(mx.length);
+        for (let i = 0; i < mx.length; i++) {
+          const cx = ((mx[i] - ox) / cs) | 0;
+          const cy = ((my[i] - oy) / cs) | 0;
+          const ci = cx + cy * cols;
+          cellIdx[i] = ci;
+          counts[ci]++;
+        }
+        // Build per-cell index arrays.
+        const buckets = new Array(cols * rows);
+        for (let c = 0; c < counts.length; c++) {
+          buckets[c] = counts[c] > 0 ? new Int32Array(counts[c]) : null;
+        }
+        const writePos = new Int32Array(cols * rows);
+        for (let i = 0; i < mx.length; i++) {
+          const ci = cellIdx[i];
+          buckets[ci][writePos[ci]++] = i;
+        }
+        this.markerHash = buckets;
+        this.markerHashOriginX = ox;
+        this.markerHashOriginY = oy;
+        this.markerHashCols = cols;
+        this.markerHashRows = rows;
+        this.markersDirty = false;
+        this.markerDriftAccum = 0;
+      }
+
+      // ------------------------------------------------------------------
+      // Marker field contribution at (x, y). Iterates only nearby spatial-
+      // hash cells (3x3 grid centered at the sample) so the inner loop
+      // touches only markers within ~MARKER_HASH_CELL of the sample.
+      //
+      // Each in-range marker contributes MARKER_WEIGHT * exp(-r²/σ²). We
+      // skip markers > MARKER_CUTOFF_FACTOR*σ away (exp(-9) ≈ 1e-4 so
+      // they're noise-floor). σ is fixed pool-wide.
+      // ------------------------------------------------------------------
+      markersFieldAt(x, y) {
+        if (!this.markerHash) return 0;
+        const cs = MARKER_HASH_CELL;
+        const cx = ((x - this.markerHashOriginX) / cs) | 0;
+        const cy = ((y - this.markerHashOriginY) / cs) | 0;
+        const cols = this.markerHashCols;
+        const rows = this.markerHashRows;
+        if (cx < 0 || cy < 0 || cx >= cols || cy >= rows) return 0;
+        const buckets = this.markerHash;
+        const mx = this.markersX;
+        const my = this.markersY;
+        const invSigma2 = 1 / (MARKER_SIGMA * MARKER_SIGMA);
+        const cutoff2 = (MARKER_SIGMA * MARKER_CUTOFF_FACTOR) * (MARKER_SIGMA * MARKER_CUTOFF_FACTOR);
+        const w = MARKER_WEIGHT;
+        let sum = 0;
+        // 3x3 neighborhood. With σ ≈ 7 and cell 32px, 3σ ≈ 21px so a
+        // single-cell neighborhood would already cover it — but 3x3
+        // catches edge cases when the sample is near a cell boundary.
+        // Bounds-check inside the loop to handle samples near the grid
+        // border without an extra branch per inner iteration.
+        for (let dy = -1; dy <= 1; dy++) {
+          const ry = cy + dy;
+          if (ry < 0 || ry >= rows) continue;
+          for (let dx = -1; dx <= 1; dx++) {
+            const rx = cx + dx;
+            if (rx < 0 || rx >= cols) continue;
+            const bucket = buckets[rx + ry * cols];
+            if (!bucket) continue;
+            for (let k = 0; k < bucket.length; k++) {
+              const idx = bucket[k];
+              const ex = mx[idx] - x;
+              const ey = my[idx] - y;
+              const r2 = ex * ex + ey * ey;
+              if (r2 > cutoff2) continue;
+              sum += w * Math.exp(-r2 * invSigma2);
+            }
+          }
+        }
+        return sum;
+      }
+
+      // ------------------------------------------------------------------
+      // Apply a multi-tine displacement kernel to markers. Called per
+      // frame by the rake (1 tine) and comb (many tines) tools.
+      //
+      // Tines are parameterized as world-space points + a stroke
+      // direction vector. For each marker, sum the per-tine Gaussian-
+      // weighted push along the stroke direction. This is the math-
+      // operators-style "sum of Gaussians" superposition that produces
+      // ripples for closely-spaced tines.
+      //
+      // strokeDx, strokeDy: per-step displacement vector (px). Each
+      //   tine pushes markers in this direction.
+      // tineX, tineY: arrays of tine positions in world coords.
+      // sigma: tine kernel sigma (px).
+      // pushFactor: multiplier on the displacement.
+      //
+      // Returns true if any marker was actually moved.
+      // ------------------------------------------------------------------
+      applyTineDisplacement(strokeDx, strokeDy, tineX, tineY, sigma, pushFactor) {
+        if (!this.markersX) return false;
+        const mx = this.markersX;
+        const my = this.markersY;
+        const sx = this.markerSpawnX;
+        const sy = this.markerSpawnY;
+        const n = mx.length;
+        if (n === 0) return false;
+        // Tine AABB plus 3σ buffer — markers outside this can be skipped
+        // entirely without computing per-tine Gaussians.
+        let tx0 = Infinity, ty0 = Infinity, tx1 = -Infinity, ty1 = -Infinity;
+        for (let t = 0; t < tineX.length; t++) {
+          if (tineX[t] < tx0) tx0 = tineX[t];
+          if (tineX[t] > tx1) tx1 = tineX[t];
+          if (tineY[t] < ty0) ty0 = tineY[t];
+          if (tineY[t] > ty1) ty1 = tineY[t];
+        }
+        const buf = sigma * MARKER_CUTOFF_FACTOR;
+        tx0 -= buf; ty0 -= buf; tx1 += buf; ty1 += buf;
+        const invSigma2 = 1 / (sigma * sigma);
+        const cutoff2 = buf * buf;
+        const maxExc2 = MARKER_MAX_EXCURSION * MARKER_MAX_EXCURSION;
+        let moved = false;
+        let drift2Sum = 0;
+        for (let i = 0; i < n; i++) {
+          const x = mx[i];
+          const y = my[i];
+          if (x < tx0 || x > tx1 || y < ty0 || y > ty1) continue;
+          // Sum Gaussian weights from every tine on this marker.
+          let totalW = 0;
+          for (let t = 0; t < tineX.length; t++) {
+            const ex = x - tineX[t];
+            const ey = y - tineY[t];
+            const r2 = ex * ex + ey * ey;
+            if (r2 > cutoff2) continue;
+            totalW += Math.exp(-r2 * invSigma2);
+          }
+          if (totalW < 0.001) continue;
+          let dx = strokeDx * totalW * pushFactor;
+          let dy = strokeDy * totalW * pushFactor;
+          // Clamp by total excursion from spawn — prevents long strokes
+          // from flinging a marker into a neighboring pool.
+          const nx = x + dx;
+          const ny = y + dy;
+          const rx = nx - sx[i];
+          const ry = ny - sy[i];
+          const r2 = rx * rx + ry * ry;
+          if (r2 > maxExc2) {
+            const scale = MARKER_MAX_EXCURSION / Math.sqrt(r2);
+            mx[i] = sx[i] + rx * scale;
+            my[i] = sy[i] + ry * scale;
+          } else {
+            mx[i] = nx;
+            my[i] = ny;
+          }
+          drift2Sum += dx * dx + dy * dy;
+          moved = true;
+        }
+        if (moved) {
+          this.markerDriftAccum += drift2Sum;
+        }
+        return moved;
       }
 
       // Roundness envelope. For each non-satellite lobe, scan other pools and
@@ -1872,6 +2711,25 @@
         let y0 = Infinity;
         let x1 = -Infinity;
         let y1 = -Infinity;
+        // P2 — include markers in the bounds so the field-eval rect always
+        // covers regions where markers can influence the field. Add a 3σ
+        // buffer so the Gaussian tail outside the marker cloud is captured.
+        if (this.markersX && this.markersX.length > 0) {
+          const mx = this.markersX;
+          const my = this.markersY;
+          const mBuf = MARKER_SIGMA * MARKER_CUTOFF_FACTOR;
+          let mx0 = Infinity, my0 = Infinity, mx1 = -Infinity, my1 = -Infinity;
+          for (let i = 0; i < mx.length; i++) {
+            if (mx[i] < mx0) mx0 = mx[i];
+            if (mx[i] > mx1) mx1 = mx[i];
+            if (my[i] < my0) my0 = my[i];
+            if (my[i] > my1) my1 = my[i];
+          }
+          x0 = Math.min(x0, mx0 - mBuf);
+          y0 = Math.min(y0, my0 - mBuf);
+          x1 = Math.max(x1, mx1 + mBuf);
+          y1 = Math.max(y1, my1 + mBuf);
+        }
         for (const lobe of this.lobes) {
           // D1 — displacement is added in screen coordinates after the
           // angular offset, so pools deform asymmetrically when neighbours
@@ -1908,6 +2766,13 @@
           x1: ceil(x1 / cellSize) + 1,
           y1: ceil(y1 / cellSize) + 1
         });
+        // M3 — grow the scar bbox if the pool's natural footprint has
+        // expanded past the current frame. The scar texture is
+        // resampled in pool-local UV so painted marks stay aligned
+        // with the pool body. Grow-only (handled inside the helper);
+        // shrinking the bbox would erase trails painted near the old
+        // outer edge.
+        if (!this.preview && this.bbox) rebuildPoolBboxIfNeeded(this, false);
       }
 
       containsPoint(x, y) {
@@ -1969,6 +2834,13 @@
           const d2 = dx * dx + dy * dy + 18;
           sum += lobe.radius2 / d2;
         }
+        // P2 — marker contributions. Markers add sharply-localized bumps
+        // on top of the lobes' smooth field. Sampled at the *unwarped*
+        // (x, y) so rake/comb-driven streaks read as sharp ripples and
+        // aren't smeared by the domain warp that softens the lobe
+        // boundary. Markers' own positions already carry the streak
+        // information; warping the read point too would double-blur it.
+        sum += this.markersFieldAt(x, y);
         return sum;
       }
 
@@ -2095,7 +2967,7 @@
 
     function updateHint() {
       const el = document.getElementById('hint');
-      el.textContent = `pick swatch · drop / drag / rake / comb · P palette · R reset`;
+      el.textContent = `M3 marker trails · drop / drag / rake / comb · P palette · R reset`;
     }
 
     function keyPressed() {

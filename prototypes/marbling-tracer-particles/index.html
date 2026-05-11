@@ -1,0 +1,654 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+  <title>Marbling Tracer Particles</title>
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: #f4eddf;
+      touch-action: none;
+      overscroll-behavior: none;
+      -webkit-user-select: none;
+      user-select: none;
+    }
+    canvas { display: block; touch-action: none; }
+    #hint {
+      position: fixed;
+      left: 10px;
+      bottom: 8px;
+      z-index: 10;
+      color: rgba(45, 35, 25, 0.46);
+      font: 11px/1.35 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      letter-spacing: 0.02em;
+      pointer-events: none;
+      text-shadow: 0 1px 0 rgba(255,255,255,0.35);
+    }
+    #cornerActions {
+      position: fixed;
+      right: 8px;
+      bottom: 8px;
+      z-index: 11;
+      color: rgba(45, 35, 25, 0.34);
+      font: 10px/1.35 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      pointer-events: none;
+      text-align: right;
+    }
+    #stats {
+      position: fixed;
+      right: 8px;
+      top: 8px;
+      z-index: 11;
+      color: rgba(45, 35, 25, 0.55);
+      font: 10px/1.35 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      pointer-events: none;
+      text-align: right;
+      background: rgba(244, 237, 223, 0.6);
+      padding: 4px 6px;
+      border-radius: 6px;
+      white-space: pre;
+    }
+    #toolbar {
+      position: fixed;
+      top: 8px;
+      left: 50%;
+      transform: translateX(-50%);
+      z-index: 12;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 10px;
+      background: rgba(244, 237, 223, 0.86);
+      border: 1px solid rgba(45, 35, 25, 0.18);
+      border-radius: 16px;
+      box-shadow: 0 1px 4px rgba(45, 35, 25, 0.10);
+      backdrop-filter: blur(4px);
+      -webkit-backdrop-filter: blur(4px);
+      pointer-events: auto;
+      font: 11px/1.2 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      color: rgba(45, 35, 25, 0.78);
+      user-select: none;
+    }
+    .tool-btn {
+      appearance: none;
+      border: 1px solid rgba(45, 35, 25, 0.25);
+      background: rgba(255, 250, 238, 0.65);
+      color: rgba(45, 35, 25, 0.78);
+      font: inherit;
+      letter-spacing: 0.04em;
+      padding: 4px 10px;
+      border-radius: 12px;
+      cursor: pointer;
+      touch-action: manipulation;
+    }
+    .tool-btn[data-active="true"] {
+      background: rgba(45, 35, 25, 0.82);
+      color: rgba(244, 237, 223, 0.95);
+      border-color: rgba(45, 35, 25, 0.82);
+    }
+    #swatches { display: flex; align-items: center; gap: 6px; }
+    .swatch {
+      appearance: none;
+      width: 22px;
+      height: 22px;
+      border-radius: 50%;
+      border: 1.5px solid rgba(45, 35, 25, 0.22);
+      cursor: pointer;
+      padding: 0;
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.18);
+      transition: transform 80ms ease;
+      touch-action: manipulation;
+    }
+    .swatch[data-active="true"] {
+      transform: scale(1.18);
+      border-color: rgba(45, 35, 25, 0.85);
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.28), 0 0 0 2px rgba(244, 237, 223, 0.85);
+    }
+    .palette-name {
+      letter-spacing: 0.05em;
+      font-size: 10px;
+      opacity: 0.7;
+      padding: 0 4px;
+      max-width: 140px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+  </style>
+</head>
+<body>
+  <div id="hint">pick swatch · drop / drag / rake / comb · R reset · [/] cap · P palette</div>
+  <div id="cornerActions">tracer-particles spike<br>sum-of-tines comb</div>
+  <div id="stats"></div>
+  <div id="toolbar">
+    <button class="tool-btn" data-tool="drop" data-active="true">drop</button>
+    <button class="tool-btn" data-tool="drag">drag</button>
+    <button class="tool-btn" data-tool="rake">rake</button>
+    <button class="tool-btn" data-tool="comb">comb</button>
+    <span class="palette-name" id="paletteName">traditional</span>
+    <div id="swatches"></div>
+  </div>
+  <canvas id="cv"></canvas>
+  <script>
+  /*
+    Marbling tracer-particles spike.
+
+    Architecture: each particle is one position + palette index. The image
+    is produced by rasterizing every particle as a small disk onto a
+    paper-colored backbuffer. Tools mutate particle positions; "drop" also
+    appends new particles.
+
+    The whole point of this spike is to find out whether the dense-tracer
+    architecture can produce non-pareil with 30–100k particles. If it
+    cannot, the goal is the cleanest possible failure.
+  */
+
+  // ---------------- palette (lifted from metaball-pools-refined) ----------------
+  const PALETTES = [
+    {
+      name: 'traditional',
+      surface: '#f3ead8',
+      pigments: ['#173b62','#7d2630','#c18a2f','#53673a','#d9c8a4','#3a2a21','#0b2138']
+    },
+    {
+      name: 'bright',
+      surface: '#fbf2df',
+      pigments: ['#f0645f','#17a6a5','#f3cf38','#8066c8','#2351c6','#24212b','#9e2d32']
+    },
+    {
+      name: 'subdued',
+      surface: '#f1eadc',
+      pigments: ['#29313a','#a85f47','#4f827f','#d8c6a0','#b8733b','#2b2925','#653225']
+    }
+  ];
+
+  // ---------------- tunables ----------------
+  let MAX_PARTICLES = 120000;        // hard cap on storage
+  const TARGET_FILL   = 60000;       // soft target for fillTest()
+  const DISK_R       = 2;            // particle render radius (px). 2 gives ~13-px footprint
+  const DISK_ALPHA   = 220;          // 0..255 paint alpha per disk write
+  const DROP_PARTICLES_BASE  = 320;  // particles per drop-click before hold
+  const DROP_PARTICLES_HOLD  = 2400; // max additional from a long hold
+  const DROP_BASE_RADIUS_PX  = 28;   // base displacement radius for a tap
+  const DROP_MAX_RADIUS_PX   = 160;  // displacement radius after a long hold
+  const DRAG_RADIUS          = 80;   // perpendicular falloff for drag
+  const RAKE_TINES           = 4;
+  const RAKE_SPACING         = 50;
+  const RAKE_FALLOFF         = 18;   // perpendicular sigma per tine
+  const COMB_TINES           = 24;
+  const COMB_SPACING         = 8;
+  const COMB_FALLOFF         = 3.0;  // perpendicular sigma per tine. Must be < spacing/2 to leave gaps.
+  const HASH_CELL            = 64;   // spatial hash cell size (px)
+  const BROAD_PAD            = 150;  // px padding on stroke AABB for broad-phase
+  const HOLD_MAX_MS          = 1600;
+  const DROP_SPAWN_SIGMA     = 14;   // gaussian radius for spawn disk
+
+  // ---------------- canvas / dpr ----------------
+  const cv = document.getElementById('cv');
+  const ctx = cv.getContext('2d', { alpha: false, desynchronized: true });
+  let W = 0, H = 0;             // backbuffer (logical px)
+  let DPR = 1;
+  function resize() {
+    DPR = Math.min(window.devicePixelRatio || 1, 1.5);
+    const cssW = window.innerWidth, cssH = window.innerHeight;
+    cv.style.width = cssW + 'px';
+    cv.style.height = cssH + 'px';
+    W = Math.floor(cssW * DPR);
+    H = Math.floor(cssH * DPR);
+    cv.width = W;
+    cv.height = H;
+    allocImage();
+    primePaper();
+    requestRender();
+  }
+
+  // ---------------- particle store ----------------
+  let xs = new Float32Array(MAX_PARTICLES);
+  let ys = new Float32Array(MAX_PARTICLES);
+  let cs = new Uint8Array(MAX_PARTICLES);
+  let count = 0;
+
+  // ---------------- palette state ----------------
+  let paletteIndex = 0;
+  let selectedPigmentIndex = 0;
+  let rgbTable = new Uint8Array(7 * 3);
+  function rebuildRGBTable() {
+    const pig = PALETTES[paletteIndex].pigments;
+    rgbTable = new Uint8Array(pig.length * 3);
+    for (let i = 0; i < pig.length; i++) {
+      const h = pig[i];
+      rgbTable[i*3]   = parseInt(h.slice(1,3),16);
+      rgbTable[i*3+1] = parseInt(h.slice(3,5),16);
+      rgbTable[i*3+2] = parseInt(h.slice(5,7),16);
+    }
+  }
+  function hexToRGB(h) {
+    return [parseInt(h.slice(1,3),16), parseInt(h.slice(3,5),16), parseInt(h.slice(5,7),16)];
+  }
+  rebuildRGBTable();
+
+  // ---------------- image buffers ----------------
+  let imgData = null;       // working ImageData
+  let pixels = null;        // Uint8ClampedArray view into imgData.data
+  let paperBuf = null;      // pre-baked paper pixels
+  function allocImage() {
+    imgData = ctx.createImageData(W, H);
+    pixels = imgData.data;
+    paperBuf = new Uint8ClampedArray(W * H * 4);
+  }
+  function primePaper() {
+    const surf = hexToRGB(PALETTES[paletteIndex].surface);
+    const cx = W * 0.5, cy = H * 0.5;
+    const maxR = Math.hypot(cx, cy);
+    const invMaxR2 = 1 / (maxR * maxR);
+    for (let y = 0; y < H; y++) {
+      for (let x = 0; x < W; x++) {
+        const dx = x - cx, dy = y - cy;
+        const t = (dx*dx + dy*dy) * invMaxR2;
+        const vign = 1 - t * 0.18;
+        const g = ((x * 1103515245 + y * 12345) & 31) - 16;
+        const o = (y * W + x) * 4;
+        paperBuf[o  ] = Math.max(0, Math.min(255, surf[0] * vign + g * 0.35));
+        paperBuf[o+1] = Math.max(0, Math.min(255, surf[1] * vign + g * 0.35));
+        paperBuf[o+2] = Math.max(0, Math.min(255, surf[2] * vign + g * 0.35));
+        paperBuf[o+3] = 255;
+      }
+    }
+  }
+
+  // precomputed disk offsets — (dx, dy, weight 0..1)
+  let diskOffsets = null;
+  function buildDiskOffsets(r) {
+    const arr = [];
+    const r2 = r * r;
+    for (let dy = -r; dy <= r; dy++) {
+      for (let dx = -r; dx <= r; dx++) {
+        const d2 = dx*dx + dy*dy;
+        if (d2 <= r2) {
+          const t = 1 - Math.sqrt(d2) / (r + 0.5);
+          arr.push(dx, dy, t);
+        }
+      }
+    }
+    diskOffsets = new Float32Array(arr);
+  }
+  buildDiskOffsets(DISK_R);
+
+  // ---------------- spatial hash (rebuilt per tool stroke begin) ----------------
+  // counting-sort over a uniform grid covering the canvas.
+  let hashCols = 0, hashRows = 0;
+  let cellStart = null;     // Int32Array length cells+1
+  let particleOrder = null; // Int32Array, holds particle indices grouped by cell
+  function rebuildHash() {
+    hashCols = Math.ceil(W / HASH_CELL);
+    hashRows = Math.ceil(H / HASH_CELL);
+    const cells = hashCols * hashRows;
+    const cellCounts = new Int32Array(cells);
+    for (let i = 0; i < count; i++) {
+      const x = xs[i], y = ys[i];
+      if (x < 0 || y < 0 || x >= W || y >= H) continue;
+      const cx = (x / HASH_CELL) | 0;
+      const cy = (y / HASH_CELL) | 0;
+      cellCounts[cy * hashCols + cx]++;
+    }
+    cellStart = new Int32Array(cells + 1);
+    let acc = 0;
+    for (let c = 0; c < cells; c++) {
+      cellStart[c] = acc;
+      acc += cellCounts[c];
+    }
+    cellStart[cells] = acc;
+    particleOrder = new Int32Array(acc);
+    const cursor = new Int32Array(cells);
+    for (let i = 0; i < count; i++) {
+      const x = xs[i], y = ys[i];
+      if (x < 0 || y < 0 || x >= W || y >= H) continue;
+      const cx = (x / HASH_CELL) | 0;
+      const cy = (y / HASH_CELL) | 0;
+      const c = cy * hashCols + cx;
+      particleOrder[cellStart[c] + cursor[c]++] = i;
+    }
+  }
+  // visit each particle index in cells overlapping AABB
+  function forEachInAABB(x0, y0, x1, y1, cb) {
+    if (!cellStart) return;
+    const cx0 = Math.max(0, (x0 / HASH_CELL) | 0);
+    const cy0 = Math.max(0, (y0 / HASH_CELL) | 0);
+    const cx1 = Math.min(hashCols - 1, (x1 / HASH_CELL) | 0);
+    const cy1 = Math.min(hashRows - 1, (y1 / HASH_CELL) | 0);
+    for (let cy = cy0; cy <= cy1; cy++) {
+      for (let cx = cx0; cx <= cx1; cx++) {
+        const c = cy * hashCols + cx;
+        const a = cellStart[c], b = cellStart[c+1];
+        for (let k = a; k < b; k++) cb(particleOrder[k]);
+      }
+    }
+  }
+
+  // ---------------- drop / spawn ----------------
+  function gaussian() {
+    let u = 0, v = 0;
+    while (u === 0) u = Math.random();
+    while (v === 0) v = Math.random();
+    return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+  }
+  function spawnGaussianDisk(cx, cy, n, sigma, colorIdx) {
+    const cap = Math.min(count + n, MAX_PARTICLES);
+    for (let i = count; i < cap; i++) {
+      xs[i] = cx + gaussian() * sigma;
+      ys[i] = cy + gaussian() * sigma;
+      cs[i] = colorIdx;
+    }
+    count = cap;
+  }
+  // area-preserving radial displacement (the classic marbling drop math)
+  function radialDisplaceAll(cx, cy, R) {
+    if (R <= 0) return;
+    const R2 = R * R;
+    for (let i = 0; i < count; i++) {
+      const dx = xs[i] - cx;
+      const dy = ys[i] - cy;
+      const r2 = dx*dx + dy*dy;
+      if (r2 < 0.5) continue;
+      const s = Math.sqrt(1 + R2 / r2);
+      xs[i] = cx + dx * s;
+      ys[i] = cy + dy * s;
+    }
+  }
+
+  // ---------------- drag / rake / comb ----------------
+  function applyDrag(px, py, qx, qy) {
+    const sx = qx - px, sy = qy - py;
+    const len = Math.sqrt(sx*sx + sy*sy);
+    if (len < 0.001) return;
+    const dirX = sx / len, dirY = sy / len;
+    const perpX = -dirY, perpY = dirX;
+    const cxm = (px + qx) * 0.5, cym = (py + qy) * 0.5;
+    const ax = Math.min(px, qx) - DRAG_RADIUS - BROAD_PAD;
+    const ay = Math.min(py, qy) - DRAG_RADIUS - BROAD_PAD;
+    const bx = Math.max(px, qx) + DRAG_RADIUS + BROAD_PAD;
+    const by = Math.max(py, qy) + DRAG_RADIUS + BROAD_PAD;
+    const invSigma2 = 1 / (DRAG_RADIUS * DRAG_RADIUS * 0.5);
+    forEachInAABB(ax, ay, bx, by, (i) => {
+      const dx = xs[i] - cxm, dy = ys[i] - cym;
+      const d_perp = dx * perpX + dy * perpY;
+      const w = Math.exp(-d_perp * d_perp * invSigma2);
+      xs[i] += sx * w;
+      ys[i] += sy * w;
+    });
+  }
+  function applyRake(px, py, qx, qy) {
+    const sx = qx - px, sy = qy - py;
+    const len = Math.sqrt(sx*sx + sy*sy);
+    if (len < 0.001) return;
+    const dirX = sx / len, dirY = sy / len;
+    const perpX = -dirY, perpY = dirX;
+    const cxm = (px + qx) * 0.5, cym = (py + qy) * 0.5;
+    const halfPerp = (RAKE_TINES * RAKE_SPACING) * 0.5 + RAKE_FALLOFF * 3 + BROAD_PAD;
+    const ax = Math.min(px, qx) - halfPerp;
+    const ay = Math.min(py, qy) - halfPerp;
+    const bx = Math.max(px, qx) + halfPerp;
+    const by = Math.max(py, qy) + halfPerp;
+    const invSigma2 = 1 / (RAKE_FALLOFF * RAKE_FALLOFF);
+    forEachInAABB(ax, ay, bx, by, (i) => {
+      const dx = xs[i] - cxm, dy = ys[i] - cym;
+      const d_perp = dx * perpX + dy * perpY;
+      let total = 0;
+      for (let t = 0; t < RAKE_TINES; t++) {
+        const off = (t - (RAKE_TINES - 1) * 0.5) * RAKE_SPACING;
+        const r = d_perp - off;
+        total += Math.exp(-r * r * invSigma2);
+      }
+      xs[i] += sx * total;
+      ys[i] += sy * total;
+    });
+  }
+  function applyComb(px, py, qx, qy) {
+    // THE critical operator. Sum of Gaussian contributions over all tines.
+    const sx = qx - px, sy = qy - py;
+    const len = Math.sqrt(sx*sx + sy*sy);
+    if (len < 0.001) return;
+    const dirX = sx / len, dirY = sy / len;
+    const perpX = -dirY, perpY = dirX;
+    const cxm = (px + qx) * 0.5, cym = (py + qy) * 0.5;
+    const halfBar = (COMB_TINES - 1) * 0.5 * COMB_SPACING;
+    const cutoff = halfBar + COMB_FALLOFF * 3;
+    const halfPerp = cutoff + BROAD_PAD;
+    const ax = Math.min(px, qx) - halfPerp;
+    const ay = Math.min(py, qy) - halfPerp;
+    const bx = Math.max(px, qx) + halfPerp;
+    const by = Math.max(py, qy) + halfPerp;
+    const invSigma2 = 1 / (COMB_FALLOFF * COMB_FALLOFF);
+    forEachInAABB(ax, ay, bx, by, (i) => {
+      const dx = xs[i] - cxm, dy = ys[i] - cym;
+      const d_perp = dx * perpX + dy * perpY;
+      if (d_perp < -cutoff || d_perp > cutoff) return;
+      let total = 0;
+      // sum-of-tines (NOT nearest)
+      for (let t = 0; t < COMB_TINES; t++) {
+        const off = (t - (COMB_TINES - 1) * 0.5) * COMB_SPACING;
+        const r = d_perp - off;
+        const r2 = r * r;
+        if (r2 < 36) {            // cull tines >~6 sigma away (sigma=3 → 9*4=36 px²)
+          total += Math.exp(-r2 * invSigma2);
+        }
+      }
+      xs[i] += sx * total;
+      ys[i] += sy * total;
+    });
+  }
+
+  // ---------------- render ----------------
+  function redrawAll() {
+    if (!pixels) return;
+    pixels.set(paperBuf);                       // fast memcpy of baked paper
+    const offs = diskOffsets;
+    const nOff = (offs.length / 3) | 0;
+    const palLen = rgbTable.length / 3;
+    const aNorm = DISK_ALPHA / 255;
+    for (let i = 0; i < count; i++) {
+      const x = xs[i] | 0;
+      const y = ys[i] | 0;
+      if (x < DISK_R || y < DISK_R || x >= W - DISK_R || y >= H - DISK_R) continue;
+      const ci = cs[i];
+      if (ci >= palLen) continue;
+      const r = rgbTable[ci*3], g = rgbTable[ci*3+1], b = rgbTable[ci*3+2];
+      for (let k = 0; k < nOff; k++) {
+        const dx = offs[k*3] | 0;
+        const dy = offs[k*3+1] | 0;
+        const w  = offs[k*3+2];
+        const o = ((y + dy) * W + (x + dx)) * 4;
+        const a = aNorm * w;
+        const ia = 1 - a;
+        pixels[o]   = pixels[o]   * ia + r * a;
+        pixels[o+1] = pixels[o+1] * ia + g * a;
+        pixels[o+2] = pixels[o+2] * ia + b * a;
+      }
+    }
+    ctx.putImageData(imgData, 0, 0);
+  }
+
+  // ---------------- input / interaction ----------------
+  let tool = 'drop';
+  const toolButtons = document.querySelectorAll('.tool-btn');
+  toolButtons.forEach(btn => {
+    btn.addEventListener('pointerdown', e => {
+      e.stopPropagation();
+      tool = btn.dataset.tool;
+      toolButtons.forEach(b => b.dataset.active = (b === btn) ? 'true' : 'false');
+    });
+  });
+
+  function clearChildren(el) {
+    while (el.firstChild) el.removeChild(el.firstChild);
+  }
+  function setPaletteUI() {
+    const p = PALETTES[paletteIndex];
+    document.getElementById('paletteName').textContent = p.name;
+    const host = document.getElementById('swatches');
+    clearChildren(host);
+    p.pigments.forEach((hex, i) => {
+      const b = document.createElement('button');
+      b.className = 'swatch';
+      b.style.background = hex;
+      b.dataset.active = (i === selectedPigmentIndex) ? 'true' : 'false';
+      b.addEventListener('pointerdown', e => {
+        e.stopPropagation();
+        selectedPigmentIndex = i;
+        host.querySelectorAll('.swatch').forEach((el, j) => el.dataset.active = (j === i) ? 'true' : 'false');
+      });
+      host.appendChild(b);
+    });
+  }
+  setPaletteUI();
+
+  // pointer handling
+  let pressActive = false;
+  let pressStartT = 0;
+  let pressStartX = 0, pressStartY = 0;
+  let lastX = 0, lastY = 0;
+  let toolAtPress = 'drop';
+
+  function pxFromEvent(e) {
+    const rect = cv.getBoundingClientRect();
+    return [ (e.clientX - rect.left) * (W / rect.width),
+             (e.clientY - rect.top)  * (H / rect.height) ];
+  }
+
+  cv.addEventListener('pointerdown', e => {
+    cv.setPointerCapture(e.pointerId);
+    pressActive = true;
+    toolAtPress = tool;
+    pressStartT = performance.now();
+    const [x, y] = pxFromEvent(e);
+    pressStartX = x; pressStartY = y;
+    lastX = x; lastY = y;
+    rebuildHash();
+  });
+  cv.addEventListener('pointermove', e => {
+    if (!pressActive) return;
+    const [x, y] = pxFromEvent(e);
+    if (toolAtPress === 'drag') applyDrag(lastX, lastY, x, y);
+    else if (toolAtPress === 'rake') applyRake(lastX, lastY, x, y);
+    else if (toolAtPress === 'comb') applyComb(lastX, lastY, x, y);
+    lastX = x; lastY = y;
+    requestRender();
+  });
+  cv.addEventListener('pointerup', e => {
+    if (!pressActive) return;
+    pressActive = false;
+    const [x, y] = pxFromEvent(e);
+    if (toolAtPress === 'drop') {
+      const heldMs = Math.min(performance.now() - pressStartT, HOLD_MAX_MS);
+      const t = heldMs / HOLD_MAX_MS;     // 0..1
+      const nNew = (DROP_PARTICLES_BASE + t * DROP_PARTICLES_HOLD) | 0;
+      const R    = DROP_BASE_RADIUS_PX + t * (DROP_MAX_RADIUS_PX - DROP_BASE_RADIUS_PX);
+      radialDisplaceAll(pressStartX, pressStartY, R);
+      const sigma = DROP_SPAWN_SIGMA + t * 30;
+      spawnGaussianDisk(pressStartX, pressStartY, nNew, sigma, selectedPigmentIndex);
+    }
+    requestRender();
+  });
+
+  window.addEventListener('keydown', e => {
+    if (e.key === 'r' || e.key === 'R') resetAll();
+    if (e.key === '[') { MAX_PARTICLES = Math.max(20000, MAX_PARTICLES - 20000); reallocStore(); }
+    if (e.key === ']') { MAX_PARTICLES = Math.min(300000, MAX_PARTICLES + 20000); reallocStore(); }
+    if (e.key === 'p' || e.key === 'P') {
+      paletteIndex = (paletteIndex + 1) % PALETTES.length;
+      rebuildRGBTable();
+      primePaper();
+      setPaletteUI();
+      requestRender();
+    }
+  });
+
+  function reallocStore() {
+    const newX = new Float32Array(MAX_PARTICLES);
+    const newY = new Float32Array(MAX_PARTICLES);
+    const newC = new Uint8Array(MAX_PARTICLES);
+    const n = Math.min(count, MAX_PARTICLES);
+    newX.set(xs.subarray(0, n));
+    newY.set(ys.subarray(0, n));
+    newC.set(cs.subarray(0, n));
+    xs = newX; ys = newY; cs = newC;
+    count = n;
+    requestRender();
+  }
+
+  function resetAll() {
+    count = 0;
+    requestRender();
+  }
+
+  // ---------------- render loop ----------------
+  let renderQueued = false;
+  let frameAccum = 0, framesSinceStat = 0;
+  function requestRender() {
+    if (renderQueued) return;
+    renderQueued = true;
+    requestAnimationFrame(() => {
+      renderQueued = false;
+      const t0 = performance.now();
+      redrawAll();
+      const t1 = performance.now();
+      frameAccum += (t1 - t0);
+      framesSinceStat++;
+      if (framesSinceStat >= 6) {
+        const ms = frameAccum / framesSinceStat;
+        document.getElementById('stats').textContent =
+          'particles: ' + count.toLocaleString() + ' / ' + MAX_PARTICLES.toLocaleString() + '\n' +
+          'render:    ' + ms.toFixed(1) + ' ms (~' + Math.min(60, (1000/ms)|0) + ' fps draw)\n' +
+          'tool:      ' + tool;
+        frameAccum = 0; framesSinceStat = 0;
+      }
+    });
+  }
+
+  // bootstrap
+  window.addEventListener('resize', resize);
+  resize();
+
+  // ---------------- diagnostic handle ----------------
+  window.__marble = {
+    version: 'tracer-particles-v1',
+    get count() { return count; },
+    get cap() { return MAX_PARTICLES; },
+    reset: resetAll,
+    setPalette: (i) => { paletteIndex = i % PALETTES.length; rebuildRGBTable(); primePaper(); setPaletteUI(); requestRender(); },
+    setColor: (i) => { selectedPigmentIndex = i; setPaletteUI(); },
+    setTool: (name) => {
+      tool = name;
+      toolButtons.forEach(b => b.dataset.active = (b.dataset.tool === name) ? 'true' : 'false');
+    },
+    spawn: spawnGaussianDisk,
+    radialDisplace: radialDisplaceAll,
+    rebuildHash,
+    applyComb, applyRake, applyDrag,
+    forceRender: redrawAll,
+    fillTest: (n) => {
+      n = n || TARGET_FILL;
+      const cw = W * 0.5, ch = H * 0.5;
+      const sigmaX = W * 0.28, sigmaY = H * 0.28;
+      const k = Math.min(7, rgbTable.length / 3);
+      for (let i = 0; i < n && count < MAX_PARTICLES; i++) {
+        xs[count] = cw + gaussian() * sigmaX;
+        ys[count] = ch + gaussian() * sigmaY;
+        cs[count] = (Math.random() * k) | 0;
+        count++;
+      }
+      requestRender();
+    },
+    constants: {
+      DISK_R, DISK_ALPHA, COMB_TINES, COMB_SPACING, COMB_FALLOFF,
+      RAKE_TINES, RAKE_SPACING, RAKE_FALLOFF, HASH_CELL, BROAD_PAD
+    }
+  };
+  </script>
+</body>
+</html>

@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
-  <title>Marbling Metaball Pools — Refined</title>
+  <title>Marbling Metaball Pools — Anisotropic Streak Markers (M2)</title>
   <script src="https://cdn.jsdelivr.net/npm/p5@1.11.3/lib/p5.min.js"></script>
   <script>window.p5 && (p5.disableFriendlyErrors = true);</script>
   <style>
@@ -114,7 +114,7 @@
   </style>
 </head>
 <body>
-  <div id="hint">pick swatch · drop / drag / rake / comb · P palette · R reset</div>
+  <div id="hint">M2 streak markers · drop / drag / rake / comb · P palette · R reset</div>
   <div id="cornerActions">tap top-left: palette<br>hold top-right: reset</div>
   <div id="toolbar">
     <button class="tool-btn" data-tool="drop" data-active="true">drop</button>
@@ -302,6 +302,99 @@
     const DRAG_GRAB_LOBE_FACTOR = 1.45;
     const DRAG_GRAB_BUFFER_PX = 16;
 
+    // -------------------------------------------------------------------
+    // M2 — Anisotropic Streak Markers (built on P2)
+    //
+    // Each pool carries an interior cloud of marker particles. Markers are
+    // *additional field contributors* alongside lobes. Field contribution
+    // is now an ELONGATED Gaussian — each marker carries an orientation
+    // (theta) and an aspect ratio (σ_par / σ_perp). At rest, aspect ≈ 1
+    // and theta is random, so a marker reads as a circular bump. When the
+    // rake/comb pushes a marker, theta is lerped toward the stroke
+    // direction and aspect is increased — the bump elongates along the
+    // stroke. This converts the "displaced dot" look of P2 into visible
+    // streaks of pigment flowing along the stroke direction.
+    //
+    // The math, given marker at (mx, my) with orientation theta:
+    //   ux, uy = cos(theta), sin(theta)            // parallel axis
+    //   px, py = -uy, ux                           // perpendicular axis
+    //   d_par  = (x-mx)*ux + (y-my)*uy
+    //   d_perp = (x-mx)*px + (y-my)*py
+    //   f = W * exp(-(d_par²/σ_par² + d_perp²/σ_perp²))
+    //
+    // Tuning: σ_perp narrow (clean stroke-banding); σ_par at rest equals
+    // σ_perp (circular default); after a stroke σ_par ≈ 5–7× σ_perp.
+    // Aspect decays slowly back to 1.0 so the streak persists past the
+    // stroke and then relaxes.
+    //
+    // Spatial hash: markers are still bucketed into 32x32 px cells. The
+    // 3x3 neighborhood lookup is no longer quite sufficient when a marker
+    // is highly elongated — the σ_par axis may extend 3 cells from the
+    // marker center. We bump the lookup radius to ceil(σ_par_max·3 / cell)
+    // so the elongated tail is captured.
+    // -------------------------------------------------------------------
+    const MARKERS_PER_POOL = 120;
+    // σ across the stroke direction. Narrow → clear stroke-banding.
+    // Replaces P2's isotropic MARKER_SIGMA in the field eval.
+    const MARKER_SIGMA_PERP = 3.0;
+    // Default σ along the stroke axis. At rest a marker is circular
+    // (aspect = 1), so σ_par == σ_perp until a stroke elongates it.
+    const MARKER_SIGMA_PAR_DEFAULT = MARKER_SIGMA_PERP;
+    // Maximum σ_par after streak elongation. With σ_perp ≈ 3 px this
+    // gives a 5–6× aspect — visible streak, not an oval. Per-marker
+    // σ_par = MARKER_SIGMA_PERP * aspect.
+    const MARKER_MAX_ASPECT = 6.0;
+    // Per-frame decay applied to aspect every frame:
+    //   aspect = max(1.0, aspect * MARKER_ASPECT_DECAY)
+    // 0.992/frame ≈ ~85 frames (1.4 s @ 60fps) to relax 5× → 1.5×, so the
+    // streak character persists across the whole stroke and dissolves
+    // afterward.
+    const MARKER_ASPECT_DECAY = 0.992;
+    // How quickly theta tracks the stroke direction when a marker is
+    // being pushed. 0.6 → near-instant snap; lower values let the marker
+    // keep some of its previous orientation (interesting for curved
+    // strokes but here we want clean stroke-aligned streaks).
+    const MARKER_THETA_LERP = 0.6;
+    // Aspect gain per unit Gaussian-tine weight per stroke step. Each
+    // frame a marker sits under a tine, aspect grows toward MAX_ASPECT.
+    // Tuned so a single ~150 ms pass plants visible streaks.
+    const MARKER_ASPECT_GAIN = 0.55;
+    // Marker contribution weight. Slightly higher than P2 to compensate
+    // for the narrower σ_perp (smaller area integral → less visual mass).
+    const MARKER_WEIGHT = 0.36;
+    const MARKER_HASH_CELL = 32;       // spatial-hash cell size in px
+    const MARKER_CUTOFF_FACTOR = 3;    // skip markers > 3σ away (≈ exp(-9) ≈ 1e-4)
+    // Maximum σ_par at full aspect; used for spatial-hash lookup radius.
+    const MARKER_MAX_SIGMA_PAR = MARKER_SIGMA_PERP * MARKER_MAX_ASPECT;
+    // How many extra hash cells to scan in each direction in fieldAt to
+    // catch elongated marker tails. With cell=32 and max σ_par ≈ 18 px
+    // (3σ ≈ 54 px), we need ceil(54/32) = 2 cells beyond center.
+    const MARKER_HASH_RADIUS = Math.max(1,
+      Math.ceil((MARKER_MAX_SIGMA_PAR * MARKER_CUTOFF_FACTOR) / MARKER_HASH_CELL));
+    // Aspect threshold below which a marker uses the cheap circular
+    // Gaussian fast path (no rotation math, no AABB rejection).
+    const MARKER_CIRCULAR_FAST_PATH_THRESHOLD = 1.08;
+    // Rebuild threshold: when the sum of marker displacement squared
+    // since last rebuild exceeds (half a cell)² × markerCount, rebuild.
+    const MARKER_REBUILD_DISP2_FACTOR = (MARKER_HASH_CELL * 0.5) * (MARKER_HASH_CELL * 0.5);
+    // Marker max excursion from spawn position so a long stroke can't
+    // fling a marker into a neighboring pool. (The lobes also clip the
+    // marker contribution by gating it on pool ownership, but excursion
+    // capping keeps the spatial hash from getting weird.)
+    const MARKER_MAX_EXCURSION = 80;
+    // Force factor: how strongly tines displace markers per unit stroke
+    // motion. Higher = more aggressive carving. Tuned so a typical
+    // pass across a pool produces 2–4px of marker shift, which is
+    // visible against the streak width.
+    const MARKER_TINE_PUSH_FACTOR = 0.9;
+    // Tine kernel σ for marker displacement. Matched roughly to σ_perp
+    // so a tine carves a clean band of markers. Sum-of-gaussians across
+    // closely-spaced tines produces the ripple stack.
+    const MARKER_TINE_SIGMA = 6;
+    // Cutoff distance from a tine for marker push. Beyond this the
+    // Gaussian is too small to matter; AABB culling for the kernel.
+    const MARKER_TINE_CUTOFF = MARKER_TINE_SIGMA * 3;
+
     const PALETTES = [
       {
         name: 'traditional marbling',
@@ -405,7 +498,7 @@
       // Diagnostic handle: paste `__marble.constants` or `__marble.toolMode`
       // in the DevTools console to confirm which build is loaded.
       window.__marble = {
-        version: 'comb-pixel-smudge-v6-layered',
+        version: 'metaball-markers-streak-v1',
         get toolMode() { return toolMode; },
         get dragSession() { return dragSession; },
         get rakeSession() { return rakeSession; },
@@ -421,6 +514,36 @@
           }
           return { nonzeroCells: nonzero, totalCells: scarDispl.length / 2, maxMagnitude: maxMag };
         },
+        get markerStats() {
+          let total = 0;
+          let displaced = 0;
+          let streaky = 0;     // markers with aspect significantly > 1
+          let maxAspect = 1;
+          let sumAspect = 0;
+          let maxDisp = 0;
+          for (const pool of pools) {
+            if (!pool.markersX) continue;
+            total += pool.markersX.length;
+            for (let i = 0; i < pool.markersX.length; i++) {
+              const dx = pool.markersX[i] - pool.markerSpawnX[i];
+              const dy = pool.markersY[i] - pool.markerSpawnY[i];
+              const d2 = dx * dx + dy * dy;
+              if (d2 > 0.5) displaced++;
+              if (d2 > maxDisp * maxDisp) maxDisp = Math.sqrt(d2);
+              const a = pool.markerAspect ? pool.markerAspect[i] : 1;
+              sumAspect += a;
+              if (a > 1.4) streaky++;
+              if (a > maxAspect) maxAspect = a;
+            }
+          }
+          return {
+            totalMarkers: total, displacedMarkers: displaced,
+            maxDisplacement: maxDisp,
+            streakyMarkers: streaky,
+            meanAspect: total > 0 ? sumAspect / total : 0,
+            maxAspect
+          };
+        },
         get constants() {
           return {
             RAKE_PUSH_PER_SECOND, RAKE_RADIUS, MAX_RAKE_DISPLACEMENT,
@@ -428,7 +551,13 @@
             DRAG_GRAB_LOBE_FACTOR, DRAG_GRAB_BUFFER_PX,
             COMB_TINE_COUNT, COMB_TINE_SPACING, COMB_TINE_RADIUS,
             COMB_SMUDGE_ALPHA, COMB_SMUDGE_MAX_STEP, COMB_PAPER_BLEED_ALPHA,
-            MAX_SCAR_PER_CELL, SCAR_CELL_SIZE
+            MAX_SCAR_PER_CELL, SCAR_CELL_SIZE,
+            MARKERS_PER_POOL, MARKER_WEIGHT, MARKER_HASH_CELL,
+            MARKER_SIGMA_PERP, MARKER_SIGMA_PAR_DEFAULT,
+            MARKER_MAX_ASPECT, MARKER_MAX_SIGMA_PAR,
+            MARKER_ASPECT_DECAY, MARKER_THETA_LERP, MARKER_ASPECT_GAIN,
+            MARKER_CIRCULAR_FAST_PATH_THRESHOLD, MARKER_HASH_RADIUS,
+            MARKER_TINE_PUSH_FACTOR, MARKER_TINE_SIGMA, MARKER_MAX_EXCURSION
           };
         }
       };
@@ -614,6 +743,12 @@
     // the runner-up owner so the renderer can blend pigment colors at seams.
     function evaluateField(renderPools, rects) {
       const cellSize = quality.cellSize;
+      // P2 — rebuild any pool's marker spatial hash if dirty/drifted.
+      // Done once before per-cell evaluation since the hash is read many
+      // times per pool inside the hot loop.
+      for (const pool of renderPools) {
+        if (pool.rebuildMarkerHashIfNeeded) pool.rebuildMarkerHashIfNeeded();
+      }
       for (const rect of rects) {
         const candidates = poolsForRect(renderPools, rect);
         for (let gy = rect.y0; gy < rect.y1; gy++) {
@@ -1062,6 +1197,12 @@
       const prevRect = pool.fieldRect;
       pool.center.x = constrain(pool.center.x + dx, 0, width);
       pool.center.y = constrain(pool.center.y + dy, 0, height);
+      // P2 — translate markers along with the pool. Spawn positions move
+      // too so the excursion clamp continues to reference the marker's
+      // new "home." Without this, markers stay stuck where the pool
+      // started — visually equivalent to the pool sliding out from under
+      // its own carved streaks.
+      pool.translateMarkers(dx, dy);
       pool.settled = false;
       pool.updateGeometry();
       if (prevRect) markDirtyRect(prevRect);
@@ -1110,70 +1251,44 @@
       rakeSession.y = cy;
     }
 
+    // P2 — rake tool now pushes markers, not lobes. The lobes (and pool
+    // boundary) stay where they are; we displace the per-pool marker
+    // cloud along the stroke direction so the *interior* field shows
+    // streaks. Rake is a single-tine kernel (one Gaussian center at the
+    // cursor); comb stacks many tines. Marker displacement scales with
+    // the per-frame stroke vector — so slow strokes carve more (more
+    // frames at any given location) and fast strokes carve less. Same
+    // physical intuition as before, different mechanism.
+    //
+    // We keep RAKE_RADIUS for the cursor UI; the marker push uses a
+    // Gaussian with σ ≈ tine_pitch/2 so a single-tine rake reads as a
+    // single broad streak. Bumping the rake sigma above MARKER_TINE_SIGMA
+    // would make the streak fatter but blur it — current value gives a
+    // distinct furrow.
+    const RAKE_MARKER_SIGMA = MARKER_TINE_SIGMA * 2.6; // broader for rake's "fat brush" feel
+
     function applyRakeImpulse(x, y, vx, vy) {
       if (!rakeSession) return;
-      const radius = RAKE_RADIUS;
-      const radius2 = radius * radius;
-      const maxOffset2 = MAX_RAKE_DISPLACEMENT * MAX_RAKE_DISPLACEMENT;
-      // Normalize the per-frame motion to a unit stroke direction. The
-      // magnitude of (vx, vy) no longer participates in the impulse — it
-      // only tells us *which way* the user is dragging. Net displacement
-      // comes from how long a lobe stays inside the kernel, not how fast
-      // the cursor crossed it.
+      // Single-element tine arrays: rake is a one-tine kernel at the
+      // cursor. We use the same code path as the comb for parity.
+      const tx = _rakeTineX;
+      const ty = _rakeTineY;
+      tx[0] = x;
+      ty[0] = y;
       const speed = Math.hypot(vx, vy);
       if (speed < 0.01) return;
-      const dirX = vx / speed;
-      const dirY = vy / speed;
-      // Perpendicular shear axis (90° CCW from stroke direction).
-      const perpX = -dirY;
-      const perpY = dirX;
-      // Time on contact — clamp dt so a paused-then-resumed stroke (or
-      // a frame skipped by the browser) doesn't dump a huge accumulated
-      // delta on the first frame back.
-      const now = millis();
-      const dt = Math.min(RAKE_MAX_DT, (now - rakeSession.lastImpulseAt) / 1000);
-      rakeSession.lastImpulseAt = now;
-      const pushBase = RAKE_PUSH_PER_SECOND * dt;
-      const perpBase = pushBase * RAKE_PERP_FRACTION;
+      // Stroke vector — markers get pushed by (vx, vy) times the
+      // tine-Gaussian-weight at their location. Magnitude of (vx, vy)
+      // directly controls per-frame displacement so a slow drag still
+      // carves (more frames over the same markers).
       let touchedAny = false;
       for (const pool of pools) {
         if (pool.preview) continue;
-        let touched = false;
-        for (const lobe of pool.lobes) {
-          const lx = pool.center.x + Math.cos(lobe.angle) * lobe.offsetNow + lobe.displaceX;
-          const ly = pool.center.y + Math.sin(lobe.angle) * lobe.offsetNow + lobe.displaceY;
-          const rx = lx - x;
-          const ry = ly - y;
-          const r2 = rx * rx + ry * ry;
-          if (r2 > radius2) continue;
-          const r = Math.sqrt(r2);
-          // Smooth power falloff: 1 at the cursor, 0 at the edge of radius.
-          const f = Math.pow(1 - r / radius, RAKE_FALLOFF_POWER);
-          const push = pushBase * f;
-          lobe.displaceTargetX += dirX * push;
-          lobe.displaceTargetY += dirY * push;
-          // Perpendicular shear: signed by which side of the stroke axis
-          // the lobe sits on. `side` is the projection of (rx, ry) onto
-          // the perp axis, normalized by the kernel radius so it lives
-          // in [-1, 1] regardless of cursor speed. Lobes near the
-          // stroke center get ~0 perp; off-axis lobes get a tangential
-          // nudge — this is what produces the slight swirl at stroke
-          // ends rather than a pure straight tug.
-          const side = (rx * perpX + ry * perpY) / radius;
-          const sk = perpBase * f * side;
-          lobe.displaceTargetX += perpX * sk;
-          lobe.displaceTargetY += perpY * sk;
-          const dist2 = lobe.displaceTargetX * lobe.displaceTargetX +
-                        lobe.displaceTargetY * lobe.displaceTargetY;
-          if (dist2 > maxOffset2) {
-            const scale = MAX_RAKE_DISPLACEMENT / Math.sqrt(dist2);
-            lobe.displaceTargetX *= scale;
-            lobe.displaceTargetY *= scale;
-          }
-          touched = true;
-        }
-        if (touched) {
+        const moved = pool.applyTineDisplacement(
+          vx, vy, tx, ty, RAKE_MARKER_SIGMA, MARKER_TINE_PUSH_FACTOR);
+        if (moved) {
           pool.settled = false;
+          pool.markersDirty = true;
           pool.updateGeometry();
           markDirtyRect(pool.fieldRect);
           touchedAny = true;
@@ -1181,6 +1296,11 @@
       }
       if (touchedAny) dirty = true;
     }
+
+    // Reusable single-tine arrays for the rake. Allocated once so the
+    // hot path doesn't generate Float32Array garbage every frame.
+    const _rakeTineX = new Float32Array(1);
+    const _rakeTineY = new Float32Array(1);
 
     // Comb tool — multi-tine striations. Tines sit along a line perpendicular
     // to the stroke direction; each tine applies a small forward impulse to
@@ -1220,77 +1340,81 @@
       combSession.y = cy;
     }
 
-    // Comb impulse — pixel-smudge along each tine path. Writes to
-    // combLayer (a separate compositing layer) rather than pigmentLayer
-    // so the field re-eval can't wipe the marks. Two stamps per tine
-    // per step:
-    //   1. Pick-up — sample pigmentLayer at the tine's previous
-    //      position and deposit at the current position. This is what
-    //      makes color information get carried forward at all (combLayer
-    //      starts empty; without this pass, drawing combLayer onto
-    //      itself would have nothing to drag).
-    //   2. Propagate — draw combLayer onto itself, shifted by the
-    //      per-step motion. This drags whatever color has accumulated
-    //      in combLayer forward, so successive frames of the same
-    //      stroke build up a continuous trail rather than disconnected
-    //      stamps.
-    // Path subdivision keeps fast strokes from leaving gaps.
+    // P2 — comb impulse. Each tine is a Gaussian force kernel that
+    // displaces nearby markers along the stroke direction. With many
+    // tightly-spaced tines, every marker between two adjacent tines
+    // sees overlapping Gaussian weight from both — the sum-of-Gaussians
+    // superposition is what produces the fine alternating-streak
+    // pattern (closely-spaced peaks of marker density vs. peaks of
+    // depletion). For a non-pareil comb (36 tines × 6px = 216px wide
+    // bar at high tine density), markers get carved into 20+ visible
+    // ripples.
+    //
+    // The previous pixel-smudge approach is replaced entirely: nothing
+    // is drawn to combLayer here. The comb's effect lives in marker
+    // positions, which the next field-eval pass reads as bumps.
     function applyCombImpulse(x, y, vx, vy, dirX, dirY) {
-      if (!combLayer || !pigmentLayer) return;
       const perpX = -dirY;
       const perpY = dirX;
       const half = (COMB_TINE_COUNT - 1) / 2;
-      const tineR = COMB_TINE_RADIUS;
+      // Tine layout: COMB_TINE_COUNT positions evenly spaced
+      // perpendicular to the stroke direction. Built per substep below
+      // since each substep's tines sit at a different point along the
+      // stroke path. Subdivide the per-frame motion if the cursor moved
+      // further than COMB_SMUDGE_MAX_STEP — without this, fast strokes would leave
+      // visible gaps between tine-force evaluations. We accumulate
+      // force over the substeps; each substep pushes markers by a
+      // fraction of (vx, vy).
       const motionLen = Math.sqrt(vx * vx + vy * vy);
       const stepCount = Math.max(1, Math.ceil(motionLen / Math.max(0.5, COMB_SMUDGE_MAX_STEP)));
       const stepVx = vx / stepCount;
       const stepVy = vy / stepCount;
-      const startX = x - vx;
-      const startY = y - vy;
-      const ctx = combLayer.drawingContext;
-      const TWO_PI_LOCAL = Math.PI * 2;
-      const paper = PALETTES[paletteIndex].surface;
-      ctx.save();
-      for (let step = 1; step <= stepCount; step++) {
-        const sx = startX + stepVx * step;
-        const sy = startY + stepVy * step;
+      let touchedAny = false;
+      const stx = _combSubTineX;
+      const sty = _combSubTineY;
+      for (let step = 0; step < stepCount; step++) {
+        // Tine positions for this substep — shifted backward by the
+        // remaining steps so the first substep sits at (start + stepV)
+        // and the last at (x, y). This makes the integrated push along
+        // the path uniform, not bunched at the cursor.
+        const back = stepCount - 1 - step;
+        const subShiftX = -stepVx * back;
+        const subShiftY = -stepVy * back;
         for (let i = 0; i < COMB_TINE_COUNT; i++) {
           const offset = (i - half) * COMB_TINE_SPACING;
-          const tx = sx + perpX * offset;
-          const ty = sy + perpY * offset;
-          if (tx < -tineR || tx > width + tineR || ty < -tineR || ty > height + tineR) continue;
-          ctx.save();
-          ctx.beginPath();
-          ctx.arc(tx, ty, tineR, 0, TWO_PI_LOCAL);
-          ctx.clip();
-          // Stamp 1 — pick up pigment from pigmentLayer at the tine's
-          // previous position and deposit at the current position.
-          // drawImage(src, stepVx, stepVy) places src[0,0] at dest[stepVx,
-          // stepVy], which is equivalent to dest[x, y] := src[x-stepVx,
-          // y-stepVy]. Inside our clip at (tx, ty) that reads
-          // pigmentLayer at (tx-stepVx, ty-stepVy) = previous tine pos.
-          ctx.globalAlpha = COMB_SMUDGE_ALPHA;
-          ctx.drawImage(pigmentLayer.canvas, stepVx, stepVy);
-          // Stamp 2 — propagate any accumulated combLayer pigment
-          // forward. On the first frame of a stroke combLayer is empty
-          // here, so this is a no-op; on subsequent frames it carries
-          // the trail of the prior frames forward by one step.
-          ctx.globalAlpha = COMB_SMUDGE_ALPHA * 0.7;
-          ctx.drawImage(combLayer.canvas, stepVx, stepVy);
-          // Optional paper-color bleed — makes the tine path readable
-          // even when combing through a single-color region. Drawn
-          // last so it sits on top of the smudge in this tine disk.
-          if (COMB_PAPER_BLEED_ALPHA > 0) {
-            ctx.globalAlpha = COMB_PAPER_BLEED_ALPHA;
-            ctx.fillStyle = paper;
-            ctx.fillRect(tx - tineR, ty - tineR, tineR * 2, tineR * 2);
+          stx[i] = x + perpX * offset + subShiftX;
+          sty[i] = y + perpY * offset + subShiftY;
+        }
+        for (const pool of pools) {
+          if (pool.preview) continue;
+          const moved = pool.applyTineDisplacement(
+            stepVx, stepVy, stx, sty, MARKER_TINE_SIGMA, MARKER_TINE_PUSH_FACTOR);
+          if (moved) {
+            pool.settled = false;
+            pool.markersDirty = true;
+            touchedAny = true;
           }
-          ctx.restore();
         }
       }
-      ctx.restore();
-      dirty = true;
+      // updateGeometry + dirty rect once per affected pool, not per
+      // substep — cheaper and just as correct since substeps all
+      // contribute to the same final marker positions.
+      if (touchedAny) {
+        for (const pool of pools) {
+          if (pool.preview) continue;
+          if (pool.markersDirty) {
+            pool.updateGeometry();
+            markDirtyRect(pool.fieldRect);
+          }
+        }
+        dirty = true;
+      }
     }
+
+    // Reusable comb tine arrays. Sized at COMB_TINE_COUNT (constant);
+    // allocated once and reused every frame.
+    const _combSubTineX = new Float32Array(COMB_TINE_COUNT);
+    const _combSubTineY = new Float32Array(COMB_TINE_COUNT);
 
     // Legacy scar-impulse writer — retained as a no-op so nothing
     // breaks if some other tool/test still calls it. The smudge-based
@@ -1373,6 +1497,13 @@
         let touched = false;
         let satellitesSpawnedThisEvent = 0;
         const pendingSatellites = [];
+        // P2 — track the radial push at the pool *center* so we can drag
+        // markers along by the same outward displacement. Without this,
+        // a drop pushes the lobes out but the markers stay where they
+        // were — the carved interior would slide off the new pool body.
+        const pdx = pool.center.x - cx;
+        const pdy = pool.center.y - cy;
+        const pd = Math.sqrt(pdx * pdx + pdy * pdy);
         // Satellite cap math: only count non-satellite lobes when computing
         // remaining headroom, so satellites don't crowd out their own slot.
         const existingSatelliteCount = pool.lobes.reduce(
@@ -1439,6 +1570,24 @@
         if (pendingSatellites.length) {
           pool.lobes.push(...pendingSatellites);
           touched = true;
+        }
+        // P2 — drag the marker cloud outward by the same incompressible-
+        // shell push that the lobes saw at the pool's center. Use the
+        // center's distance d (not per-lobe), so the entire marker cloud
+        // translates rigidly. This is intentional: per-marker push would
+        // *deform* the marker cloud during a drop, eating into the
+        // budget we want preserved for rake/comb-driven streaks.
+        if (pd > 0.5 && pool.markersX && pool.markersX.length > 0) {
+          const safeR = Math.max(pd, Rnew * 0.5);
+          let push = R2 / (2 * safeR);
+          if (pd < Rnew) push += (Rnew - pd) * DISPLACEMENT_INSIDE_BOOST;
+          if (push > DISPLACEMENT_MAX_PX) push = DISPLACEMENT_MAX_PX;
+          if (push >= DISPLACEMENT_MIN_PX) {
+            const ux = pdx / pd;
+            const uy = pdy / pd;
+            pool.translateMarkers(ux * push, uy * push);
+            touched = true;
+          }
         }
         if (touched) {
           pool.settled = false;
@@ -1650,8 +1799,41 @@
         this.sampleLobes = [];
         this.pixelBounds = null;
         this.fieldRect = null;
+        // -----------------------------------------------------------------
+        // P2 — marker arrays. Typed arrays (Float32) per pool for memory
+        // economy and to avoid GC. markerSpawnX/Y is the original spawn
+        // position used as a stable "rest" reference for the displacement
+        // cap; markersX/Y is the live position pushed by rake/comb. count
+        // can be 0 for preview pools (markers aren't shown during preview
+        // and would just be discarded on commit). The hash grid lives on
+        // the pool itself and is rebuilt lazily when the accumulated
+        // marker drift since last build exceeds half a cell on average.
+        // -----------------------------------------------------------------
+        this.markersX = null;
+        this.markersY = null;
+        this.markerSpawnX = null;
+        this.markerSpawnY = null;
+        // M2 — per-marker orientation (radians) and aspect ratio (σ_par /
+        // σ_perp). Both default to circular (random theta, aspect = 1.0)
+        // at spawn; rake/comb mutate them to produce streaks.
+        this.markerTheta = null;
+        this.markerAspect = null;
+        this.markerHash = null;       // Map<cellKey, Int32Array of marker indices>
+        this.markerHashOriginX = 0;   // bucket grid origin (recomputed on rebuild)
+        this.markerHashOriginY = 0;
+        this.markerHashCols = 0;
+        this.markerHashRows = 0;
+        this.markerHashCellsX0 = 0;
+        this.markerHashCellsY0 = 0;
+        this.markerDriftAccum = 0;    // sum of |Δpos|² since last rebuild
+        this.markersDirty = true;     // forces rebuild after spawn/drag
+        // M2 — when any marker has aspect > 1 we need to re-render every
+        // frame for the decay back toward circular to be visible. Tracked
+        // here so update() can keep the pool unsettled while streaks relax.
+        this.maxMarkerAspect = 1;
         this.makeLobes(lobeCount);
         this.makeInnerLobes();
+        this.makeMarkers();
         this.updateGeometry();
       }
 
@@ -1730,6 +1912,420 @@
         }
       }
 
+      // ------------------------------------------------------------------
+      // P2 — marker spawn. Distribute MARKERS_PER_POOL particles uniformly
+      // inside the pool's idealized footprint at creation time. Preview
+      // pools skip this since their markers would just be discarded on
+      // commit. Markers spawn inside a disk of radius baseR (the pool's
+      // idealized circle); they end up inside the final fingered footprint
+      // through the lobes anyway because the lobes extend past baseR.
+      //
+      // Rejection sampling inside the disk: about π/4 acceptance, fast in
+      // practice. Use a seeded RNG so a re-render with the same seed
+      // produces the same marker pattern.
+      // ------------------------------------------------------------------
+      makeMarkers() {
+        if (this.preview) {
+          // Allocate empty arrays so callers can iterate unconditionally.
+          this.markersX = new Float32Array(0);
+          this.markersY = new Float32Array(0);
+          this.markerSpawnX = new Float32Array(0);
+          this.markerSpawnY = new Float32Array(0);
+          this.markerTheta = new Float32Array(0);
+          this.markerAspect = new Float32Array(0);
+          return;
+        }
+        randomSeed(floor(this.seed) ^ 0x4d4b);
+        const count = MARKERS_PER_POOL;
+        const baseR = Math.sqrt(this.targetMass / Math.PI);
+        // Slight inset so markers don't spawn AT the boundary where lobes
+        // bleed to ownership: 0.92 of baseR gives a comfortable interior.
+        const spawnR = baseR * 0.92;
+        const mx = new Float32Array(count);
+        const my = new Float32Array(count);
+        const sx = new Float32Array(count);
+        const sy = new Float32Array(count);
+        const mt = new Float32Array(count);
+        const ma = new Float32Array(count);
+        let placed = 0;
+        let attempts = 0;
+        const cap = count * 24; // safety cap on rejection sampling
+        while (placed < count && attempts < cap) {
+          attempts++;
+          // Uniform-in-disk via rejection in [-1,1]² — cheaper than the
+          // sqrt(rand) polar trick and a tighter loop.
+          const u = random(-1, 1);
+          const v = random(-1, 1);
+          if (u * u + v * v > 1) continue;
+          const x = this.center.x + u * spawnR;
+          const y = this.center.y + v * spawnR;
+          mx[placed] = x;
+          my[placed] = y;
+          sx[placed] = x;
+          sy[placed] = y;
+          // M2 — random theta so default-circular markers don't all share
+          // the same axis (irrelevant when aspect = 1, but cheap to do
+          // here and would prevent a "fake circular" via aspect = 1.00001
+          // from showing up as a coherent grain pattern).
+          mt[placed] = Math.random() * Math.PI * 2;
+          ma[placed] = 1.0;
+          placed++;
+        }
+        // If somehow we couldn't fill (degenerate seed), pad with center.
+        for (let i = placed; i < count; i++) {
+          mx[i] = this.center.x;
+          my[i] = this.center.y;
+          sx[i] = this.center.x;
+          sy[i] = this.center.y;
+          mt[i] = 0;
+          ma[i] = 1.0;
+        }
+        this.markersX = mx;
+        this.markersY = my;
+        this.markerSpawnX = sx;
+        this.markerSpawnY = sy;
+        this.markerTheta = mt;
+        this.markerAspect = ma;
+        this.maxMarkerAspect = 1;
+        this.markersDirty = true;
+        this.markerDriftAccum = 0;
+      }
+
+      // ------------------------------------------------------------------
+      // Translate every marker by (dx, dy). Used when the whole pool is
+      // dragged (drag tool) or pushed sideways by a new drop (D1
+      // displacement). Spawn positions move too so the excursion clamp
+      // stays well-defined relative to the new "rest" location.
+      // ------------------------------------------------------------------
+      translateMarkers(dx, dy) {
+        if (!this.markersX) return;
+        const mx = this.markersX;
+        const my = this.markersY;
+        const sx = this.markerSpawnX;
+        const sy = this.markerSpawnY;
+        for (let i = 0; i < mx.length; i++) {
+          mx[i] += dx;
+          my[i] += dy;
+          sx[i] += dx;
+          sy[i] += dy;
+        }
+        this.markersDirty = true;
+      }
+
+      // ------------------------------------------------------------------
+      // Spatial hash rebuild. Cells are MARKER_HASH_CELL px squares; we
+      // store, per cell, a list of marker indices that landed in it.
+      //
+      // We use a 2D array of Int32 arrays for predictable access (not a
+      // Map) since the grid origin can shift but the number of cells is
+      // small (~80×60 for a 2560×1440 canvas at 32px cells). Bucket
+      // origin and size are computed from current marker AABB plus a
+      // 1-cell buffer.
+      //
+      // Lazy: skip if markersDirty is false AND drift accumulator hasn't
+      // crossed the threshold. The accumulator is per-marker squared
+      // displacement summed since the last rebuild; the threshold is
+      // (cellSize/2)² × markerCount, i.e. "average marker has moved
+      // half a cell."
+      // ------------------------------------------------------------------
+      rebuildMarkerHashIfNeeded() {
+        if (!this.markersX || this.markersX.length === 0) return;
+        const needRebuild = this.markersDirty ||
+          this.markerDriftAccum > MARKER_REBUILD_DISP2_FACTOR * this.markersX.length;
+        if (!needRebuild && this.markerHash) return;
+        const mx = this.markersX;
+        const my = this.markersY;
+        let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+        for (let i = 0; i < mx.length; i++) {
+          if (mx[i] < x0) x0 = mx[i];
+          if (mx[i] > x1) x1 = mx[i];
+          if (my[i] < y0) y0 = my[i];
+          if (my[i] > y1) y1 = my[i];
+        }
+        // Pad by one cell so adjacent-cell lookups can never reference
+        // a cell outside the grid.
+        const cs = MARKER_HASH_CELL;
+        const ox = Math.floor(x0 / cs) * cs - cs;
+        const oy = Math.floor(y0 / cs) * cs - cs;
+        const cols = Math.ceil((x1 - ox) / cs) + 2;
+        const rows = Math.ceil((y1 - oy) / cs) + 2;
+        // First pass: count per cell.
+        const counts = new Int32Array(cols * rows);
+        const cellIdx = new Int32Array(mx.length);
+        for (let i = 0; i < mx.length; i++) {
+          const cx = ((mx[i] - ox) / cs) | 0;
+          const cy = ((my[i] - oy) / cs) | 0;
+          const ci = cx + cy * cols;
+          cellIdx[i] = ci;
+          counts[ci]++;
+        }
+        // Build per-cell index arrays.
+        const buckets = new Array(cols * rows);
+        for (let c = 0; c < counts.length; c++) {
+          buckets[c] = counts[c] > 0 ? new Int32Array(counts[c]) : null;
+        }
+        const writePos = new Int32Array(cols * rows);
+        for (let i = 0; i < mx.length; i++) {
+          const ci = cellIdx[i];
+          buckets[ci][writePos[ci]++] = i;
+        }
+        this.markerHash = buckets;
+        this.markerHashOriginX = ox;
+        this.markerHashOriginY = oy;
+        this.markerHashCols = cols;
+        this.markerHashRows = rows;
+        this.markersDirty = false;
+        this.markerDriftAccum = 0;
+      }
+
+      // ------------------------------------------------------------------
+      // M2 — anisotropic marker field contribution at (x, y).
+      //
+      // Each marker contributes an ELONGATED Gaussian aligned with its
+      // theta and stretched by aspect = σ_par / σ_perp. For aspect = 1
+      // this is identical to the P2 circular Gaussian; for aspect > 1 it
+      // produces a streak aligned along (cos θ, sin θ).
+      //
+      // Field math:
+      //   ux, uy = cos θ, sin θ         // parallel axis
+      //   d_par  = (x-mx)*ux + (y-my)*uy
+      //   d_perp = -(x-mx)*uy + (y-my)*ux   // = dx*px + dy*py with px=-uy
+      //   σ_par  = MARKER_SIGMA_PERP * aspect
+      //   f = W * exp(-(d_par²/σ_par² + d_perp²/σ_perp²))
+      //
+      // Spatial hash: lookup radius widens with MARKER_HASH_RADIUS so the
+      // elongated tail (σ_par × 3 along stroke axis) is captured even when
+      // the marker center sits ≥1 cell away from the sample point. Per-
+      // marker rough AABB rejection is kept for the elongated path.
+      // Markers with aspect ≤ FAST_PATH_THRESHOLD take a circular fast
+      // path: same as P2 (no rotation math, single isotropic Gaussian).
+      // ------------------------------------------------------------------
+      markersFieldAt(x, y) {
+        if (!this.markerHash) return 0;
+        const cs = MARKER_HASH_CELL;
+        const cx = ((x - this.markerHashOriginX) / cs) | 0;
+        const cy = ((y - this.markerHashOriginY) / cs) | 0;
+        const cols = this.markerHashCols;
+        const rows = this.markerHashRows;
+        // If sample sits outside the marker AABB by more than the hash
+        // radius, skip without iterating.
+        if (cx < -MARKER_HASH_RADIUS || cy < -MARKER_HASH_RADIUS ||
+            cx >= cols + MARKER_HASH_RADIUS || cy >= rows + MARKER_HASH_RADIUS) {
+          return 0;
+        }
+        const buckets = this.markerHash;
+        const mx = this.markersX;
+        const my = this.markersY;
+        const mt = this.markerTheta;
+        const ma = this.markerAspect;
+        const sigmaPerp = MARKER_SIGMA_PERP;
+        const invSigmaPerp2 = 1 / (sigmaPerp * sigmaPerp);
+        // Worst-case cutoff = max σ_par × MARKER_CUTOFF_FACTOR, since a
+        // streaked marker can reach this far along its parallel axis.
+        const maxReach = MARKER_MAX_SIGMA_PAR * MARKER_CUTOFF_FACTOR;
+        const maxReach2 = maxReach * maxReach;
+        const circThresh = MARKER_CIRCULAR_FAST_PATH_THRESHOLD;
+        const w = MARKER_WEIGHT;
+        let sum = 0;
+        const r0 = Math.max(0, cy - MARKER_HASH_RADIUS);
+        const r1 = Math.min(rows - 1, cy + MARKER_HASH_RADIUS);
+        const c0 = Math.max(0, cx - MARKER_HASH_RADIUS);
+        const c1 = Math.min(cols - 1, cx + MARKER_HASH_RADIUS);
+        for (let ry = r0; ry <= r1; ry++) {
+          for (let rx = c0; rx <= c1; rx++) {
+            const bucket = buckets[rx + ry * cols];
+            if (!bucket) continue;
+            for (let k = 0; k < bucket.length; k++) {
+              const idx = bucket[k];
+              const ex = x - mx[idx];
+              const ey = y - my[idx];
+              // Cheap rejection: > worst-case 3σ_par from the marker
+              // center can't contribute, regardless of orientation.
+              const rough2 = ex * ex + ey * ey;
+              if (rough2 > maxReach2) continue;
+              const aspect = ma[idx];
+              if (aspect <= circThresh) {
+                // Fast path — circular Gaussian, no rotation math.
+                // Cutoff against the circular footprint (3σ_perp²).
+                const cutCirc2 = (sigmaPerp * MARKER_CUTOFF_FACTOR) *
+                                 (sigmaPerp * MARKER_CUTOFF_FACTOR);
+                if (rough2 > cutCirc2) continue;
+                sum += w * Math.exp(-rough2 * invSigmaPerp2);
+              } else {
+                const theta = mt[idx];
+                const ux = Math.cos(theta);
+                const uy = Math.sin(theta);
+                // d_par along (ux, uy); d_perp along (-uy, ux).
+                const dpar = ex * ux + ey * uy;
+                const dperp = -ex * uy + ey * ux;
+                const sigmaPar = sigmaPerp * aspect;
+                const invSigmaPar2 = 1 / (sigmaPar * sigmaPar);
+                const arg = dpar * dpar * invSigmaPar2 +
+                            dperp * dperp * invSigmaPerp2;
+                // Cull by exponent magnitude — 9 = (3σ)² in normalized
+                // units, beyond which exp(-9) ≈ 1e-4 is below noise.
+                if (arg > 9) continue;
+                sum += w * Math.exp(-arg);
+              }
+            }
+          }
+        }
+        return sum;
+      }
+
+      // ------------------------------------------------------------------
+      // Apply a multi-tine displacement kernel to markers. Called per
+      // frame by the rake (1 tine) and comb (many tines) tools.
+      //
+      // Tines are parameterized as world-space points + a stroke
+      // direction vector. For each marker, sum the per-tine Gaussian-
+      // weighted push along the stroke direction. This is the math-
+      // operators-style "sum of Gaussians" superposition that produces
+      // ripples for closely-spaced tines.
+      //
+      // strokeDx, strokeDy: per-step displacement vector (px). Each
+      //   tine pushes markers in this direction.
+      // tineX, tineY: arrays of tine positions in world coords.
+      // sigma: tine kernel sigma (px).
+      // pushFactor: multiplier on the displacement.
+      //
+      // Returns true if any marker was actually moved.
+      // ------------------------------------------------------------------
+      applyTineDisplacement(strokeDx, strokeDy, tineX, tineY, sigma, pushFactor) {
+        if (!this.markersX) return false;
+        const mx = this.markersX;
+        const my = this.markersY;
+        const sx = this.markerSpawnX;
+        const sy = this.markerSpawnY;
+        const mt = this.markerTheta;
+        const ma = this.markerAspect;
+        const n = mx.length;
+        if (n === 0) return false;
+        // Tine AABB plus 3σ buffer — markers outside this can be skipped
+        // entirely without computing per-tine Gaussians.
+        let tx0 = Infinity, ty0 = Infinity, tx1 = -Infinity, ty1 = -Infinity;
+        for (let t = 0; t < tineX.length; t++) {
+          if (tineX[t] < tx0) tx0 = tineX[t];
+          if (tineX[t] > tx1) tx1 = tineX[t];
+          if (tineY[t] < ty0) ty0 = tineY[t];
+          if (tineY[t] > ty1) ty1 = tineY[t];
+        }
+        const buf = sigma * MARKER_CUTOFF_FACTOR;
+        tx0 -= buf; ty0 -= buf; tx1 += buf; ty1 += buf;
+        const invSigma2 = 1 / (sigma * sigma);
+        const cutoff2 = buf * buf;
+        const maxExc2 = MARKER_MAX_EXCURSION * MARKER_MAX_EXCURSION;
+        // M2 — stroke direction and target theta. atan2 once here, not
+        // per marker, since the whole frame's stroke direction is uniform
+        // across all tines.
+        const strokeMag = Math.sqrt(strokeDx * strokeDx + strokeDy * strokeDy);
+        const targetTheta = strokeMag > 0.001 ? Math.atan2(strokeDy, strokeDx) : 0;
+        // M2 — when the stroke direction differs from a marker's current
+        // theta by more than π/2, flipping the marker by π is closer than
+        // a 180° rotation. Streaks have no head/tail (mirror symmetric
+        // along the par axis), so we lerp toward (targetTheta + π) when
+        // it's the shorter path.
+        let moved = false;
+        let drift2Sum = 0;
+        let runningMaxAspect = 1;
+        // Track existing max in case this frame doesn't visit every marker.
+        for (let i = 0; i < n; i++) {
+          if (ma[i] > runningMaxAspect) runningMaxAspect = ma[i];
+        }
+        for (let i = 0; i < n; i++) {
+          const x = mx[i];
+          const y = my[i];
+          if (x < tx0 || x > tx1 || y < ty0 || y > ty1) continue;
+          // Sum Gaussian weights from every tine on this marker.
+          let totalW = 0;
+          for (let t = 0; t < tineX.length; t++) {
+            const ex = x - tineX[t];
+            const ey = y - tineY[t];
+            const r2 = ex * ex + ey * ey;
+            if (r2 > cutoff2) continue;
+            totalW += Math.exp(-r2 * invSigma2);
+          }
+          if (totalW < 0.001) continue;
+          let dx = strokeDx * totalW * pushFactor;
+          let dy = strokeDy * totalW * pushFactor;
+          // Clamp by total excursion from spawn — prevents long strokes
+          // from flinging a marker into a neighboring pool.
+          const nx = x + dx;
+          const ny = y + dy;
+          const rx = nx - sx[i];
+          const ry = ny - sy[i];
+          const rSpawn2 = rx * rx + ry * ry;
+          if (rSpawn2 > maxExc2) {
+            const scale = MARKER_MAX_EXCURSION / Math.sqrt(rSpawn2);
+            mx[i] = sx[i] + rx * scale;
+            my[i] = sy[i] + ry * scale;
+          } else {
+            mx[i] = nx;
+            my[i] = ny;
+          }
+          drift2Sum += dx * dx + dy * dy;
+          moved = true;
+          // M2 — anisotropy update. Per-marker theta lerps toward the
+          // stroke direction (or its π-flipped equivalent, since streaks
+          // are mirror-symmetric). Aspect grows toward MAX_ASPECT, scaled
+          // by the per-marker Gaussian weight so markers under the tine
+          // center elongate faster than those at the edge.
+          if (strokeMag > 0.001) {
+            const lerpAmt = Math.min(1, MARKER_THETA_LERP * totalW);
+            let cur = mt[i];
+            // Pick the shortest signed delta to target ±π.
+            let dTheta = targetTheta - cur;
+            // Wrap into [-π, π].
+            while (dTheta > Math.PI) dTheta -= Math.PI * 2;
+            while (dTheta < -Math.PI) dTheta += Math.PI * 2;
+            // Mirror trick: streaks are axis-symmetric, so a half-flip
+            // is the closest path if |dTheta| > π/2.
+            if (dTheta > Math.PI * 0.5) dTheta -= Math.PI;
+            else if (dTheta < -Math.PI * 0.5) dTheta += Math.PI;
+            mt[i] = cur + dTheta * lerpAmt;
+            // Aspect grows by the tine Gaussian weight, capped at max.
+            const grown = ma[i] + MARKER_ASPECT_GAIN * totalW;
+            ma[i] = grown > MARKER_MAX_ASPECT ? MARKER_MAX_ASPECT : grown;
+            if (ma[i] > runningMaxAspect) runningMaxAspect = ma[i];
+          }
+        }
+        if (moved) {
+          this.markerDriftAccum += drift2Sum;
+          this.maxMarkerAspect = runningMaxAspect;
+        }
+        return moved;
+      }
+
+      // ------------------------------------------------------------------
+      // M2 — per-frame aspect decay. Every frame, multiply each marker's
+      // aspect by MARKER_ASPECT_DECAY, clamped to ≥1. This relaxes
+      // streaks back toward circular over ~1–2 s after the stroke ends,
+      // matching how real ink streaks blur out as surface tension acts.
+      //
+      // Returns true if any marker is still streaky (aspect > 1.02), so
+      // the pool keeps updating until everything is back to circular and
+      // the streak character has dissolved.
+      // ------------------------------------------------------------------
+      decayMarkerAspect() {
+        if (!this.markerAspect || this.markerAspect.length === 0) return false;
+        // Cheap early-out: if no marker is currently streaky, skip.
+        if (this.maxMarkerAspect <= 1.001) return false;
+        const ma = this.markerAspect;
+        const n = ma.length;
+        let maxA = 1;
+        let anyStreaky = false;
+        for (let i = 0; i < n; i++) {
+          const a = ma[i];
+          if (a <= 1.001) continue;
+          const next = a * MARKER_ASPECT_DECAY;
+          ma[i] = next < 1.0 ? 1.0 : next;
+          if (ma[i] > 1.02) anyStreaky = true;
+          if (ma[i] > maxA) maxA = ma[i];
+        }
+        this.maxMarkerAspect = maxA;
+        return anyStreaky;
+      }
+
       // Roundness envelope. For each non-satellite lobe, scan other pools and
       // record the maximum (alignment * proximity) — alignment is the dot of
       // the lobe's outward unit vector with the unit vector toward the
@@ -1799,7 +2395,18 @@
           Math.abs((l.displaceTargetX + l.previewPushX) - l.displaceX) > 0.05 ||
           Math.abs((l.displaceTargetY + l.previewPushY) - l.displaceY) > 0.05
         );
-        if (this.settled && !hasPendingDisplacement) return false;
+        // M2 — also unsettle while any marker is mid-decay back to circular.
+        // The field changes every frame as σ_par shrinks, so we need to
+        // re-evaluate the dirty rect until everything is back to aspect = 1.
+        const hasDecayingStreaks = this.maxMarkerAspect > 1.02;
+        if (hasDecayingStreaks) {
+          const stillStreaky = this.decayMarkerAspect();
+          if (stillStreaky) {
+            this.settled = false;
+            markDirtyRect(this.fieldRect);
+          }
+        }
+        if (this.settled && !hasPendingDisplacement && !hasDecayingStreaks) return false;
         // Refresh contact pressure each frame the pool is alive. Cheap
         // (O(pools * lobes)); contactT smoothly tracks neighbor presence so
         // the asymmetry envelope eases in/out as drops land or get dragged.
@@ -1872,6 +2479,27 @@
         let y0 = Infinity;
         let x1 = -Infinity;
         let y1 = -Infinity;
+        // M2 — include markers in the bounds, padded by the *maximum*
+        // σ_par × 3 (worst-case streak reach along its parallel axis).
+        // A fully-elongated marker can reach MARKER_MAX_SIGMA_PAR × 3 from
+        // its center, so the dirty rect must cover that or we'll get
+        // truncated streaks at the pool periphery.
+        if (this.markersX && this.markersX.length > 0) {
+          const mx = this.markersX;
+          const my = this.markersY;
+          const mBuf = MARKER_MAX_SIGMA_PAR * MARKER_CUTOFF_FACTOR;
+          let mx0 = Infinity, my0 = Infinity, mx1 = -Infinity, my1 = -Infinity;
+          for (let i = 0; i < mx.length; i++) {
+            if (mx[i] < mx0) mx0 = mx[i];
+            if (mx[i] > mx1) mx1 = mx[i];
+            if (my[i] < my0) my0 = my[i];
+            if (my[i] > my1) my1 = my[i];
+          }
+          x0 = Math.min(x0, mx0 - mBuf);
+          y0 = Math.min(y0, my0 - mBuf);
+          x1 = Math.max(x1, mx1 + mBuf);
+          y1 = Math.max(y1, my1 + mBuf);
+        }
         for (const lobe of this.lobes) {
           // D1 — displacement is added in screen coordinates after the
           // angular offset, so pools deform asymmetrically when neighbours
@@ -1969,6 +2597,13 @@
           const d2 = dx * dx + dy * dy + 18;
           sum += lobe.radius2 / d2;
         }
+        // P2 — marker contributions. Markers add sharply-localized bumps
+        // on top of the lobes' smooth field. Sampled at the *unwarped*
+        // (x, y) so rake/comb-driven streaks read as sharp ripples and
+        // aren't smeared by the domain warp that softens the lobe
+        // boundary. Markers' own positions already carry the streak
+        // information; warping the read point too would double-blur it.
+        sum += this.markersFieldAt(x, y);
         return sum;
       }
 
@@ -2095,7 +2730,7 @@
 
     function updateHint() {
       const el = document.getElementById('hint');
-      el.textContent = `pick swatch · drop / drag / rake / comb · P palette · R reset`;
+      el.textContent = `M2 streak markers · drop / drag / rake / comb · P palette · R reset`;
     }
 
     function keyPressed() {

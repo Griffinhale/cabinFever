@@ -1,0 +1,652 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+  <title>Marbling — Mathematical Operators</title>
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: #f4eddf;
+      touch-action: none;
+      overscroll-behavior: none;
+      -webkit-user-select: none;
+      user-select: none;
+    }
+    canvas { display: block; touch-action: none; }
+    #hint {
+      position: fixed;
+      left: 10px;
+      bottom: 8px;
+      z-index: 10;
+      color: rgba(45, 35, 25, 0.46);
+      font: 11px/1.35 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      letter-spacing: 0.02em;
+      pointer-events: none;
+      text-shadow: 0 1px 0 rgba(255,255,255,0.35);
+    }
+    #cornerActions {
+      position: fixed;
+      right: 8px;
+      bottom: 8px;
+      z-index: 11;
+      color: rgba(45, 35, 25, 0.34);
+      font: 10px/1.35 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      pointer-events: none;
+      text-align: right;
+    }
+    #toolbar {
+      position: fixed;
+      top: 8px;
+      left: 50%;
+      transform: translateX(-50%);
+      z-index: 12;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 10px;
+      background: rgba(244, 237, 223, 0.86);
+      border: 1px solid rgba(45, 35, 25, 0.18);
+      border-radius: 16px;
+      box-shadow: 0 1px 4px rgba(45, 35, 25, 0.10);
+      backdrop-filter: blur(4px);
+      -webkit-backdrop-filter: blur(4px);
+      pointer-events: auto;
+      font: 11px/1.2 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      color: rgba(45, 35, 25, 0.78);
+      user-select: none;
+    }
+    .tool-btn {
+      appearance: none;
+      border: 1px solid rgba(45, 35, 25, 0.25);
+      background: rgba(255, 250, 238, 0.65);
+      color: rgba(45, 35, 25, 0.78);
+      font: inherit;
+      letter-spacing: 0.04em;
+      padding: 4px 10px;
+      border-radius: 12px;
+      cursor: pointer;
+      touch-action: manipulation;
+    }
+    .tool-btn[data-active="true"] {
+      background: rgba(45, 35, 25, 0.82);
+      color: rgba(244, 237, 223, 0.95);
+      border-color: rgba(45, 35, 25, 0.82);
+    }
+    #swatches { display: flex; align-items: center; gap: 6px; }
+    .swatch {
+      appearance: none;
+      width: 22px;
+      height: 22px;
+      border-radius: 50%;
+      border: 1.5px solid rgba(45, 35, 25, 0.22);
+      cursor: pointer;
+      padding: 0;
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.18);
+      transition: transform 80ms ease;
+      touch-action: manipulation;
+    }
+    .swatch[data-active="true"] {
+      transform: scale(1.18);
+      border-color: rgba(45, 35, 25, 0.85);
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.28), 0 0 0 2px rgba(244, 237, 223, 0.85);
+    }
+    .palette-name {
+      letter-spacing: 0.05em;
+      font-size: 10px;
+      opacity: 0.7;
+      padding: 0 4px;
+      max-width: 140px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    #stats {
+      position: fixed;
+      right: 10px;
+      top: 8px;
+      z-index: 13;
+      color: rgba(45, 35, 25, 0.5);
+      font: 10px/1.3 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      pointer-events: none;
+      text-align: right;
+    }
+  </style>
+</head>
+<body>
+  <div id="hint">pick swatch · drop / drag / rake / comb · P palette · R reset</div>
+  <div id="cornerActions">comb is the test — drop 2+ colors then sweep horizontally</div>
+  <div id="stats"></div>
+  <div id="toolbar">
+    <button class="tool-btn" data-tool="drop" data-active="true">drop</button>
+    <button class="tool-btn" data-tool="drag">drag</button>
+    <button class="tool-btn" data-tool="rake">rake</button>
+    <button class="tool-btn" data-tool="comb">comb</button>
+    <span class="palette-name" id="paletteName"></span>
+    <div id="swatches"></div>
+  </div>
+  <canvas id="paper"></canvas>
+  <script>
+  /*
+    Marbling — Mathematical Operators (Lu, Mao, Tian, Zhang, 2012).
+
+    Pigment is a flat list of {x, y, colorIdx} points stored in parallel
+    typed arrays. Every gesture applies a closed-form deformation to
+    every point; nothing about pigment density or grid resolution is
+    baked in. Non-pareil emerges from summed-Gaussian tine shears.
+
+    Salvaged from sibling metaball prototype:
+      - palette swatches + toolbar markup
+      - paper surface color + hint/cornerActions
+    Discarded:
+      - Pool / Lobe model, evaluateField, scarDispl, combLayer,
+        quality auto-adapt — replaced wholesale by the point list.
+  */
+
+  (() => {
+    "use strict";
+
+    // ---------- palettes (lifted from sibling prototype) ----------
+    const PALETTES = [
+      {
+        name: 'traditional marbling',
+        surface: '#f3ead8',
+        pigments: ['#173b62', '#7d2630', '#c18a2f', '#53673a', '#d9c8a4']
+      },
+      {
+        name: 'bright playful',
+        surface: '#fbf2df',
+        pigments: ['#f0645f', '#17a6a5', '#f3cf38', '#8066c8', '#2351c6']
+      },
+      {
+        name: 'portfolio subdued',
+        surface: '#f1eadc',
+        pigments: ['#29313a', '#a85f47', '#4f827f', '#d8c6a0', '#b8733b']
+      },
+      {
+        name: 'monochrome ink',
+        surface: '#f5f1e8',
+        pigments: ['#101b2a', '#3e4855', '#777a76', '#b6b7aa']
+      }
+    ];
+
+    // ---------- tuning ----------
+    // Target ~22k points peak. Each drop adds ~360 points; with the
+    // area-preserving radial push existing points get rearranged, so
+    // density holds even after a session of drops/combs. Disk radius
+    // 1.5 px (i.e. 3x3 ImageData stamp) is the sweet spot — small
+    // enough that comb ripples don't blur into each other (~6 px tine
+    // spacing needs sub-3-px points), big enough that pools read as
+    // continuous medium rather than pointillism.
+    const POINTS_PER_DROP = 360;
+    const POINT_CAP = 60000;           // hard ceiling (allocation size)
+    const POINT_WARNING = 45000;       // soft warning; reset suggested
+
+    // Drop operator
+    const DROP_BASE_RADIUS = 18;       // px, at MIN_HOLD_MS
+    const DROP_MAX_RADIUS = 90;        // px, at MAX_HOLD_MS
+    const DROP_MIN_HOLD_MS = 60;
+    const DROP_MAX_HOLD_MS = 1400;
+
+    // Drag (line operator)
+    const DRAG_FALLOFF_C = 32;         // gaussian width (px)
+    const DRAG_STRENGTH = 1.0;         // M multiplier on (B-A)
+
+    // Rake (coarse multi-tine)
+    const RAKE_TINES = 4;
+    const RAKE_SPACING = 50;
+    const RAKE_FALLOFF_C = 22;         // wide enough that adjacent tines blend a little
+    const RAKE_STRENGTH = 1.0;
+
+    // Comb (fine multi-tine — the critical test)
+    const COMB_TINES = 24;
+    const COMB_SPACING = 8;
+    const COMB_FALLOFF_C = 4;          // ~s/2 → narrow enough that tines stay distinct
+    const COMB_STRENGTH = 1.0;
+
+    // ---------- canvas + buffers ----------
+    const canvas = document.getElementById('paper');
+    const ctx = canvas.getContext('2d', { alpha: false });
+    let W = 0, H = 0;
+    let imageData = null;
+    let pixels = null;     // Uint8ClampedArray view onto imageData.data
+    let bgR = 0, bgG = 0, bgB = 0;
+    let pigRGB = null;     // Uint8Array, 3 bytes per pigment
+
+    // Point storage (parallel typed arrays).
+    const xs = new Float32Array(POINT_CAP);
+    const ys = new Float32Array(POINT_CAP);
+    const cs = new Uint8Array(POINT_CAP);
+    let nPoints = 0;
+
+    // ---------- state ----------
+    let paletteIndex = 0;
+    let pigmentIndex = 0;
+    let tool = 'drop';
+    let press = null;      // active gesture state
+
+    // ---------- helpers ----------
+    function hexToRgb(hex) {
+      const h = hex.replace('#', '');
+      return [
+        parseInt(h.substring(0, 2), 16),
+        parseInt(h.substring(2, 4), 16),
+        parseInt(h.substring(4, 6), 16)
+      ];
+    }
+
+    function rebuildPaletteCaches() {
+      const pal = PALETTES[paletteIndex];
+      const bg = hexToRgb(pal.surface);
+      bgR = bg[0]; bgG = bg[1]; bgB = bg[2];
+      pigRGB = new Uint8Array(pal.pigments.length * 3);
+      for (let i = 0; i < pal.pigments.length; i++) {
+        const rgb = hexToRgb(pal.pigments[i]);
+        pigRGB[i * 3] = rgb[0];
+        pigRGB[i * 3 + 1] = rgb[1];
+        pigRGB[i * 3 + 2] = rgb[2];
+      }
+      pigmentIndex = Math.min(pigmentIndex, pal.pigments.length - 1);
+    }
+
+    function resize() {
+      // CSS-pixel canvas — DPR scaling would multiply point count cost
+      // by DPR² with no visible win for a marbling pattern at this scale.
+      W = window.innerWidth | 0;
+      H = window.innerHeight | 0;
+      canvas.width = W;
+      canvas.height = H;
+      canvas.style.width = W + 'px';
+      canvas.style.height = H + 'px';
+      imageData = ctx.createImageData(W, H);
+      pixels = imageData.data;
+    }
+
+    // ---------- operators ----------
+
+    // Drop: area-preserving radial push.
+    // P' = C + (P - C) * sqrt(1 + r² / |P-C|²)
+    function applyDrop(cx, cy, r) {
+      const r2 = r * r;
+      const x = xs, y = ys;
+      const n = nPoints;
+      // Skip points exactly at center to avoid div-by-zero; nudge them
+      // outward by r in an arbitrary direction. In practice newly-spawned
+      // points are jittered, so |P-C|=0 is rare but possible.
+      for (let i = 0; i < n; i++) {
+        const dx = x[i] - cx;
+        const dy = y[i] - cy;
+        const d2 = dx * dx + dy * dy;
+        if (d2 < 1e-6) {
+          // arbitrary outward nudge
+          x[i] = cx + r;
+          continue;
+        }
+        const k = Math.sqrt(1 + r2 / d2);
+        x[i] = cx + dx * k;
+        y[i] = cy + dy * k;
+      }
+    }
+
+    // Line / drag: every point shifts by M * û * exp(-d² / c²) where
+    // d = perpendicular distance from the line through A→B and û is
+    // the unit vector along (B-A). Per Lu et al., shear is purely
+    // parallel to the stroke.
+    function applyLine(ax, ay, bx, by, strengthM, falloffC) {
+      const vx = bx - ax;
+      const vy = by - ay;
+      const vlen = Math.hypot(vx, vy);
+      if (vlen < 1e-4) return;
+      const ux = vx / vlen;
+      const uy = vy / vlen;
+      // Perpendicular unit vector for projecting distance:
+      // perp · (P - A)  gives signed perpendicular distance.
+      const px = -uy;
+      const py = ux;
+      const invC2 = 1 / (falloffC * falloffC);
+      // Magnitude of displacement is M * |B-A|, so a long stroke
+      // displaces farther than a short one. This matches the
+      // paper's intent that a drag "moves pigment along its path."
+      const Mx = strengthM * vx;
+      const My = strengthM * vy;
+      const x = xs, y = ys;
+      const n = nPoints;
+      for (let i = 0; i < n; i++) {
+        const rx = x[i] - ax;
+        const ry = y[i] - ay;
+        const d = rx * px + ry * py;
+        const w = Math.exp(-d * d * invC2);
+        x[i] += Mx * w;
+        y[i] += My * w;
+      }
+    }
+
+    // Multi-tine shear (rake/comb). Tines are parallel lines along the
+    // stroke direction; perpendicular spacing = s. For each point we
+    // SUM the Gaussian-shear contributions from every tine. With many
+    // narrow tines this sum is a sinusoid-like envelope along the
+    // perpendicular axis — that's the non-pareil.
+    //
+    // Tine offset buffer is module-scoped (reused per call) so the hot
+    // path doesn't allocate. Sized for the max tine count we'll ever
+    // use; resize if a config ever exceeds it.
+    const tineOffsets = new Float32Array(64);
+
+    function applyTines(ax, ay, bx, by, strengthM, falloffC, tineCount, spacing) {
+      const vx = bx - ax;
+      const vy = by - ay;
+      const vlen = Math.hypot(vx, vy);
+      if (vlen < 1e-4) return;
+      const ux = vx / vlen;
+      const uy = vy / vlen;
+      const perpX = -uy;
+      const perpY = ux;
+      const invC2 = 1 / (falloffC * falloffC);
+      const Mx = strengthM * vx;
+      const My = strengthM * vy;
+
+      // Precompute tine perpendicular offsets (centered around the
+      // midpoint of the stroke). offsets[i] is the signed perp
+      // distance of tine i from the stroke center line.
+      const half = (tineCount - 1) * 0.5;
+      const offsets = tineOffsets;
+      for (let i = 0; i < tineCount; i++) {
+        offsets[i] = (i - half) * spacing;
+      }
+
+      // Reference point for perp-projection: midpoint of A→B. The
+      // tine lines themselves are infinite in the û direction, so
+      // we only care about the perpendicular coord of each point.
+      const refX = (ax + bx) * 0.5;
+      const refY = (ay + by) * 0.5;
+
+      const x = xs, y = ys;
+      const n = nPoints;
+      for (let i = 0; i < n; i++) {
+        const rx = x[i] - refX;
+        const ry = y[i] - refY;
+        const pp = rx * perpX + ry * perpY; // signed perp coord of point
+        // Sum gaussian weights over all tines.
+        let wSum = 0;
+        for (let t = 0; t < tineCount; t++) {
+          const d = pp - offsets[t];
+          wSum += Math.exp(-d * d * invC2);
+        }
+        x[i] += Mx * wSum;
+        y[i] += My * wSum;
+      }
+    }
+
+    // Spawn N points uniformly inside a disk of radius r at (cx, cy).
+    // Uses rejection sampling — for r ≤ 90 px this stays cheap and
+    // gives a flat density distribution (sqrt-of-uniform polar gives
+    // the same but with a sqrt per sample; rejection is simpler).
+    function spawnDisk(cx, cy, r, colorIdx, count) {
+      let added = 0;
+      let tries = 0;
+      const cap = POINT_CAP;
+      while (added < count && nPoints < cap && tries < count * 6) {
+        tries++;
+        const dx = (Math.random() * 2 - 1) * r;
+        const dy = (Math.random() * 2 - 1) * r;
+        if (dx * dx + dy * dy > r * r) continue;
+        xs[nPoints] = cx + dx;
+        ys[nPoints] = cy + dy;
+        cs[nPoints] = colorIdx;
+        nPoints++;
+        added++;
+      }
+    }
+
+    // ---------- rendering ----------
+    // Direct ImageData pixel writes. For each point we paint a 3x3
+    // stamp (effective radius ~1.5 px). With ~20k points that's
+    // ~180k pixel writes per frame, well within budget. Older paint
+    // is overwritten by newer paint — natural since the paper itself
+    // is uniform color, and we redraw bg + all points every frame.
+    function render() {
+      const data = pixels;
+      const w = W, h = H;
+      // Fill background.
+      // Tight inner loop; setting bytes is faster than data.fill
+      // for non-uniform values across RGBA.
+      let p = 0;
+      const lim = w * h * 4;
+      while (p < lim) {
+        data[p++] = bgR;
+        data[p++] = bgG;
+        data[p++] = bgB;
+        data[p++] = 255;
+      }
+
+      const x = xs, y = ys, c = cs;
+      const n = nPoints;
+      const prgb = pigRGB;
+      for (let i = 0; i < n; i++) {
+        const px = x[i] | 0;
+        const py = y[i] | 0;
+        if (px < 1 || py < 1 || px >= w - 1 || py >= h - 1) continue;
+        const ci = c[i] * 3;
+        const r = prgb[ci], g = prgb[ci + 1], b = prgb[ci + 2];
+        // 3x3 stamp. Unrolled to dodge inner-loop bounds checks since
+        // we already guarded px/py at the edge above.
+        const row0 = ((py - 1) * w + (px - 1)) * 4;
+        const row1 = (py * w + (px - 1)) * 4;
+        const row2 = ((py + 1) * w + (px - 1)) * 4;
+        data[row0]     = r; data[row0 + 1] = g; data[row0 + 2] = b;
+        data[row0 + 4] = r; data[row0 + 5] = g; data[row0 + 6] = b;
+        data[row0 + 8] = r; data[row0 + 9] = g; data[row0 + 10] = b;
+        data[row1]     = r; data[row1 + 1] = g; data[row1 + 2] = b;
+        data[row1 + 4] = r; data[row1 + 5] = g; data[row1 + 6] = b;
+        data[row1 + 8] = r; data[row1 + 9] = g; data[row1 + 10] = b;
+        data[row2]     = r; data[row2 + 1] = g; data[row2 + 2] = b;
+        data[row2 + 4] = r; data[row2 + 5] = g; data[row2 + 6] = b;
+        data[row2 + 8] = r; data[row2 + 9] = g; data[row2 + 10] = b;
+      }
+      ctx.putImageData(imageData, 0, 0);
+    }
+
+    // ---------- gesture wiring ----------
+    function pointerXY(e) {
+      const rect = canvas.getBoundingClientRect();
+      return [e.clientX - rect.left, e.clientY - rect.top];
+    }
+
+    function onPointerDown(e) {
+      e.preventDefault();
+      canvas.setPointerCapture(e.pointerId);
+      const [x, y] = pointerXY(e);
+      press = {
+        id: e.pointerId,
+        tool,
+        startX: x, startY: y,
+        lastX: x, lastY: y,
+        startTime: performance.now(),
+        // For drop we'll snapshot points at down-time and apply on up,
+        // so the radius can scale with hold duration. Simpler than
+        // mutating mid-hold (paper does drop as a single event).
+        dropApplied: false
+      };
+      if (tool !== 'drop') {
+        // First sample point — no displacement on the down event itself
+        // for drag/rake/comb. Movement is what does the work.
+      }
+    }
+
+    function onPointerMove(e) {
+      if (!press || e.pointerId !== press.id) return;
+      e.preventDefault();
+      const [x, y] = pointerXY(e);
+      const px = press.lastX, py = press.lastY;
+      if (press.tool === 'drag') {
+        applyLine(px, py, x, y, DRAG_STRENGTH, DRAG_FALLOFF_C);
+      } else if (press.tool === 'rake') {
+        applyTines(px, py, x, y, RAKE_STRENGTH, RAKE_FALLOFF_C, RAKE_TINES, RAKE_SPACING);
+      } else if (press.tool === 'comb') {
+        applyTines(px, py, x, y, COMB_STRENGTH, COMB_FALLOFF_C, COMB_TINES, COMB_SPACING);
+      }
+      // For drop we don't react to move. The displacement happens at up.
+      press.lastX = x;
+      press.lastY = y;
+      requestRender();
+    }
+
+    function onPointerUp(e) {
+      if (!press || e.pointerId !== press.id) return;
+      e.preventDefault();
+      try { canvas.releasePointerCapture(e.pointerId); } catch (_) {}
+      if (press.tool === 'drop' && !press.dropApplied) {
+        const dt = performance.now() - press.startTime;
+        const norm = Math.max(0, Math.min(1,
+          (dt - DROP_MIN_HOLD_MS) / (DROP_MAX_HOLD_MS - DROP_MIN_HOLD_MS)));
+        const r = DROP_BASE_RADIUS + (DROP_MAX_RADIUS - DROP_BASE_RADIUS) * norm;
+        // Per the brief: spawn the new points FIRST, then apply the
+        // radial push. The just-spawned disk gets shoved outward too,
+        // which is exactly the paper's drop semantics — a drop of
+        // radius r introduces a circular region of pigment AND
+        // displaces everything (including itself) by the area-
+        // preserving formula.
+        //
+        // Spawn radius = r: after the push every point at original
+        // radius d ends up at sqrt(d² + r²), so the spawn disk maps
+        // to an annulus from r (was at 0) to r√2 (was at r). That
+        // matches the paper's filled-disk-of-radius-r drop. If the
+        // spawn radius were larger, the displacement would shove
+        // the disk further out and leave a hollow center.
+        spawnDisk(press.lastX, press.lastY, r, pigmentIndex, POINTS_PER_DROP);
+        applyDrop(press.lastX, press.lastY, r);
+        press.dropApplied = true;
+      }
+      press = null;
+      requestRender();
+    }
+
+    // ---------- render scheduling ----------
+    let rafScheduled = false;
+    let lastFrame = performance.now();
+    let smoothedFps = 60;
+    function requestRender() {
+      if (rafScheduled) return;
+      rafScheduled = true;
+      requestAnimationFrame(() => {
+        rafScheduled = false;
+        const t0 = performance.now();
+        render();
+        const t1 = performance.now();
+        const dt = t1 - lastFrame;
+        lastFrame = t1;
+        const fps = 1000 / Math.max(1, dt);
+        smoothedFps = smoothedFps * 0.9 + fps * 0.1;
+        updateStats(t1 - t0);
+      });
+    }
+
+    function updateStats(renderMs) {
+      const el = document.getElementById('stats');
+      if (!el) return;
+      el.textContent = `${nPoints} pts · ${smoothedFps.toFixed(0)} fps · render ${renderMs.toFixed(1)} ms` +
+        (nPoints > POINT_WARNING ? ' · near cap' : '');
+    }
+
+    // ---------- UI ----------
+    function bindToolButtons() {
+      document.querySelectorAll('.tool-btn').forEach(btn => {
+        btn.addEventListener('click', () => {
+          tool = btn.dataset.tool;
+          document.querySelectorAll('.tool-btn').forEach(b => {
+            b.dataset.active = (b === btn) ? 'true' : 'false';
+          });
+        });
+      });
+    }
+
+    function rebuildSwatches() {
+      const pal = PALETTES[paletteIndex];
+      const nameEl = document.getElementById('paletteName');
+      nameEl.textContent = pal.name;
+      const host = document.getElementById('swatches');
+      host.replaceChildren();
+      pal.pigments.forEach((hex, idx) => {
+        const btn = document.createElement('button');
+        btn.className = 'swatch';
+        btn.style.background = hex;
+        btn.dataset.active = (idx === pigmentIndex) ? 'true' : 'false';
+        btn.addEventListener('click', () => {
+          pigmentIndex = idx;
+          host.querySelectorAll('.swatch').forEach((el, i) => {
+            el.dataset.active = (i === idx) ? 'true' : 'false';
+          });
+        });
+        host.appendChild(btn);
+      });
+    }
+
+    function reset() {
+      nPoints = 0;
+      render();
+    }
+
+    function cyclePalette() {
+      paletteIndex = (paletteIndex + 1) % PALETTES.length;
+      rebuildPaletteCaches();
+      rebuildSwatches();
+      requestRender();
+    }
+
+    window.addEventListener('keydown', (e) => {
+      if (e.key === 'r' || e.key === 'R') { reset(); }
+      else if (e.key === 'p' || e.key === 'P') { cyclePalette(); }
+    });
+
+    // ---------- bootstrap ----------
+    rebuildPaletteCaches();
+    resize();
+    bindToolButtons();
+    rebuildSwatches();
+    render();
+
+    canvas.addEventListener('pointerdown', onPointerDown);
+    canvas.addEventListener('pointermove', onPointerMove);
+    canvas.addEventListener('pointerup', onPointerUp);
+    canvas.addEventListener('pointercancel', onPointerUp);
+    window.addEventListener('resize', () => {
+      resize();
+      render();
+    });
+
+    // DevTools handle.
+    window.__marble = {
+      version: 'math-operators-v1',
+      get points() {
+        return { xs: xs.subarray(0, nPoints), ys: ys.subarray(0, nPoints), cs: cs.subarray(0, nPoints), n: nPoints };
+      },
+      reset,
+      cyclePalette,
+      // direct operator access for scripted reproductions
+      applyDrop,
+      applyLine,
+      applyTines,
+      spawnDisk,
+      setTool: (t) => {
+        tool = t;
+        document.querySelectorAll('.tool-btn').forEach(b => {
+          b.dataset.active = (b.dataset.tool === t) ? 'true' : 'false';
+        });
+      },
+      setPigment: (i) => { pigmentIndex = i; },
+      tuning: {
+        POINTS_PER_DROP, POINT_CAP,
+        DROP_BASE_RADIUS, DROP_MAX_RADIUS,
+        DRAG_FALLOFF_C, DRAG_STRENGTH,
+        RAKE_TINES, RAKE_SPACING, RAKE_FALLOFF_C, RAKE_STRENGTH,
+        COMB_TINES, COMB_SPACING, COMB_FALLOFF_C, COMB_STRENGTH
+      }
+    };
+  })();
+  </script>
+</body>
+</html>
