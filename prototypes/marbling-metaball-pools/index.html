@@ -198,10 +198,13 @@
     let rakeDx = [];
     let rakeDy = [];
     let rakeCut = [];
+    let rakePaintId = [];
+    let rakePaintStrength = [];
     let raking = false;
     let lastRakePoint = null;
     let lastRakeRawPoint = null;
     let rakeDirection = null;
+    let activeRakeSourceId = 0;
     let dirtyRects = [];
     let fullFieldDirty = true;
     let paperLayer;
@@ -325,6 +328,7 @@
     function evaluateField(renderPools, rects) {
       const cellSize = quality.cellSize;
       const rakeCellPadding = ceil(RAKE_MAX_OFFSET / cellSize) + 1;
+      const poolIndexById = new Map(renderPools.map((pool, index) => [pool.id, index]));
       for (const rect of rects) {
         const candidateRect = clampRect(expandRect(rect, rakeCellPadding)) || rect;
         const candidates = poolsForRect(renderPools, candidateRect);
@@ -356,6 +360,14 @@
             }
             const cut = rakeCut[idx] || 0;
             if (cut > 0) bestField *= 1 - constrain(cut, 0, 0.96);
+            const paintId = rakePaintId[idx] || 0;
+            const paintIndex = paintId ? poolIndexById.get(paintId) : -1;
+            if (paintIndex >= 0) {
+              const paintStrength = constrain(rakePaintStrength[idx] || 0, 0, 1);
+              best = paintIndex;
+              bestField = FIELD_THRESHOLD + FIELD_RIM_BAND * (0.38 + 0.7 * paintStrength);
+              secondField = 0;
+            }
             field[idx] = bestField >= FIELD_THRESHOLD
               ? { owner: best, strength: bestField, margin: bestField - secondField }
               : { owner: -1, strength: bestField, margin: 0 };
@@ -450,10 +462,13 @@
       rakeDx = new Array(len).fill(0);
       rakeDy = new Array(len).fill(0);
       rakeCut = new Array(len).fill(0);
+      rakePaintId = new Array(len).fill(0);
+      rakePaintStrength = new Array(len).fill(0);
       raking = false;
       lastRakePoint = null;
       lastRakeRawPoint = null;
       rakeDirection = null;
+      activeRakeSourceId = 0;
     }
 
     function markFullFieldDirty() {
@@ -725,8 +740,10 @@
     function beginRake(x, y) {
       cancelResetHold();
       activePress = null;
+      if (dirty || fullFieldDirty || dirtyRects.length) renderScene();
       raking = true;
       const point = { x: constrain(x, 0, width), y: constrain(y, 0, height) };
+      activeRakeSourceId = samplePoolIdAt(point.x, point.y);
       lastRakePoint = point;
       lastRakeRawPoint = point;
       rakeDirection = null;
@@ -738,8 +755,18 @@
       lastRakePoint = null;
       lastRakeRawPoint = null;
       rakeDirection = null;
+      activeRakeSourceId = 0;
       dirty = true;
       return true;
+    }
+
+    function samplePoolIdAt(x, y) {
+      const gx = constrain(floor(x / quality.cellSize), 0, fieldCols - 1);
+      const gy = constrain(floor(y / quality.cellSize), 0, fieldRows - 1);
+      const cell = field[gx + gy * fieldCols];
+      if (!cell || cell.owner < 0) return 0;
+      const pool = pools[cell.owner];
+      return pool ? pool.id : 0;
     }
 
     function updateRake(x, y) {
@@ -847,10 +874,18 @@
 
           const idx = gx + gy * fieldCols;
           const cell = field[idx];
-          if (!cell || cell.owner < 0) continue;
-
           const falloff = smoothFalloff(1 - dist / RAKE_RADIUS);
-          rakeCut[idx] = max(rakeCut[idx] || 0, falloff * RAKE_CUT_STRENGTH);
+
+          if (activeRakeSourceId) {
+            rakePaintId[idx] = activeRakeSourceId;
+            rakePaintStrength[idx] = max(rakePaintStrength[idx] || 0, falloff);
+            rakeCut[idx] = 0;
+          } else {
+            if (!cell || cell.owner < 0) continue;
+            rakeCut[idx] = max(rakeCut[idx] || 0, falloff * RAKE_CUT_STRENGTH);
+          }
+
+          if (!cell || cell.owner < 0) continue;
 
           const edgeT = constrain((cell.strength - FIELD_THRESHOLD) / FIELD_RIM_BAND, 0, 1);
           const borderPin = hasDifferentNeighbor(gx, gy, cell.owner) ? 0.82 : (1 - edgeT) * 0.58;
