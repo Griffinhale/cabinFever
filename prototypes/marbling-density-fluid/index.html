@@ -93,9 +93,9 @@
 
       Standalone p5 sketch that keeps the metaball drop/growth frontend but
       bakes settled pigment into a clipped density+velocity grid. Raking injects
-      velocity; semi-Lagrangian advection bunches density into saturated strands
-      and stretches it into paler lanes while pinned metaball borders preserve
-      organic silhouettes.
+      velocity and stamps a persistent comb substrate: pale tine lanes, saturated
+      side ridges, and dragged line history. Semi-Lagrangian advection bends both
+      density and comb traces while pinned metaball borders preserve organic silhouettes.
     */
 
     const DEBUG_PERF = false;
@@ -127,6 +127,20 @@
     const RAKE_STRENGTH = 3.8;
     const RAKE_MAX_OFFSET = 92;
     const RAKE_MIN_MOVE = 3;
+    const COMB_CENTER_LANE_RADIUS = 2.2;
+    const COMB_RIDGE_OFFSET = 4.5;
+    const COMB_RIDGE_WIDTH = 3.0;
+    const COMB_LINE_STRENGTH = 0.78;
+    const COMB_RIDGE_STRENGTH = 0.42;
+    const COMB_STRETCH_STRENGTH = 0.54;
+    const COMB_LINE_DECAY = 0.992;
+    const COMB_AGE_DECAY = 0.985;
+    const COMB_DIRECTION_BLEND = 0.35;
+    const FINE_RAKE_TOOTH_COUNT = 14;
+    const FINE_RAKE_TOOTH_SPACING = 6;
+    const FINE_RAKE_RADIUS = 5.5;
+    const FINE_RAKE_STRENGTH = 1.9;
+    const FINE_RAKE_LINE_MULTIPLIER = 0.72;
     const FLUID_STEPS_PER_RAKE = 2;
     const FLUID_DT = 0.72;
     const VELOCITY_DAMPING = 0.84;
@@ -215,6 +229,18 @@
     let fluidVyNext;
     let fluidBaseDensity;
     let fluidStrength;
+    let fluidMatU;
+    let fluidMatV;
+    let fluidLine;
+    let fluidLineNext;
+    let fluidLineAge;
+    let fluidLineAgeNext;
+    let fluidLineDirX;
+    let fluidLineDirY;
+    let fluidRidge;
+    let fluidRidgeNext;
+    let fluidStretch;
+    let fluidStretchNext;
     let fluidDirty = false;
     let fluidEverRaked = false;
     let raking = false;
@@ -452,6 +478,7 @@
               fluidDensity[idx] = base;
               fluidVx[idx] = 0;
               fluidVy[idx] = 0;
+              resetCombCell(idx, gx, gy, pool);
             } else if (!fluidEverRaked) {
               fluidDensity[idx] = lerp(fluidDensity[idx], base, 0.22);
             }
@@ -473,6 +500,26 @@
       fluidStrength[idx] = 0;
       fluidVx[idx] = 0;
       fluidVy[idx] = 0;
+      fluidMatU[idx] = 0;
+      fluidMatV[idx] = 0;
+      fluidLine[idx] = 0;
+      fluidLineAge[idx] = 0;
+      fluidLineDirX[idx] = 0;
+      fluidLineDirY[idx] = 0;
+      fluidRidge[idx] = 0;
+      fluidStretch[idx] = 0;
+    }
+
+    function resetCombCell(idx, gx, gy, pool) {
+      const seed = pool ? pool.seed : 0;
+      fluidMatU[idx] = gx + 0.18 * stableNoise(gx, gy, seed + 1701);
+      fluidMatV[idx] = gy + 0.18 * stableNoise(gx, gy, seed + 1702);
+      fluidLine[idx] = 0;
+      fluidLineAge[idx] = 0;
+      fluidLineDirX[idx] = 0;
+      fluidLineDirY[idx] = 0;
+      fluidRidge[idx] = 0;
+      fluidStretch[idx] = 0;
     }
 
     function drawFluidCell(gx, gy, idx, pool) {
@@ -488,19 +535,40 @@
 
       const paleT = constrain(1 - density, 0, 1);
       const saturatedT = constrain((density - 1) / (MAX_DENSITY_VISUAL - 1), 0, 1);
-      const baseToWash = mixRgb(pool.rgb.base, pool.rgb.wash, 0.78 * paleT);
-      const saturated = mixRgb(pool.rgb.base, pool.rgb.rim, 0.46 * saturatedT);
-      let c = mixRgb(baseToWash, saturated, saturatedT);
-      c = mixRgb(c, pool.rgb.rim, pin * 0.68);
-      const alpha = constrain(42 + density * 86 + saturatedT * 54 + pin * 44 - paleT * 24, 18, 190);
+      const line = constrain(fluidLine[idx], -1.4, 1.8);
+      const lineAge = constrain(fluidLineAge[idx], 0, 1);
+      const ridgeT = constrain(fluidRidge[idx] + max(line, 0) * 0.65, 0, 1.6);
+      const stretchT = constrain(fluidStretch[idx] + max(-line, 0) * 0.75, 0, 1.8);
+      const combContrast = smoothFalloff(lineAge) * (1 - pin * 0.45);
+      const combPaleT = constrain(paleT + stretchT * 0.45 * combContrast, 0, 1);
+      const combSatT = constrain(saturatedT + ridgeT * 0.55 * combContrast, 0, 1);
+      const dirX = fluidLineDirX[idx];
+      const dirY = fluidLineDirY[idx];
+      const dirPhase = stableNoise(
+        gx * 3 + floor(fluidMatU[idx] * 11 + dirX * 17),
+        gy * 3 + floor(fluidMatV[idx] * 7 + dirY * 17),
+        pool.seed + 2301
+      );
+      const hairline = combContrast * (dirPhase > lerp(0.76, 0.40, constrain(ridgeT, 0, 1)) ? ridgeT : 0);
+      let c = mixRgb(pool.rgb.base, pool.rgb.wash, 0.82 * combPaleT);
+      c = mixRgb(c, pool.rgb.rim, 0.42 * combSatT);
+      c = mixRgb(c, pool.rgb.rim, pin * 0.60 + hairline * 0.18);
+      const alpha = constrain(
+        38 + density * 76 + combSatT * 64 + pin * 44 - combPaleT * 38 + hairline * 28,
+        10,
+        205
+      );
       pigmentLayer.fill(
-        constrain(c.r + (n - 0.5) * 12, 0, 255),
-        constrain(c.g + (n - 0.5) * 12, 0, 255),
-        constrain(c.b + (n - 0.5) * 12, 0, 255),
+        constrain(c.r + (n - 0.5) * 10, 0, 255),
+        constrain(c.g + (n - 0.5) * 10, 0, 255),
+        constrain(c.b + (n - 0.5) * 10, 0, 255),
         alpha
       );
-      const shrink = pin > 0.4 ? 0 : paleT * 0.9;
-      pigmentLayer.rect(x + shrink, y + shrink, cellSize + 0.8 - shrink, cellSize + 0.8 - shrink);
+      const shrink = pin > 0.4 ? 0 : combPaleT * 1.15 + stretchT * combContrast * 0.35;
+      const skipLane = stretchT > 0.7 && combContrast > 0.25 && dirPhase < lerp(0.08, 0.26, constrain(stretchT, 0, 1));
+      if (!skipLane) {
+        pigmentLayer.rect(x + shrink, y + shrink, cellSize + 0.8 - shrink, cellSize + 0.8 - shrink);
+      }
 
       if (pin > 0.62 && (gx + gy) % 2 === 0) {
         pigmentLayer.fill(pool.rgb.rim.r, pool.rgb.rim.g, pool.rgb.rim.b, 48 + 38 * pin);
@@ -592,6 +660,14 @@
         vy: fluidVy,
         baseDensity: fluidBaseDensity,
         strength: fluidStrength,
+        matU: fluidMatU,
+        matV: fluidMatV,
+        line: fluidLine,
+        lineAge: fluidLineAge,
+        lineDirX: fluidLineDirX,
+        lineDirY: fluidLineDirY,
+        ridge: fluidRidge,
+        stretch: fluidStretch,
         everRaked: fluidEverRaked
       };
     }
@@ -616,6 +692,14 @@
           fluidStrength[idx] = previous.strength ? previous.strength[oldIdx] || 0 : 0;
           fluidVx[idx] = previous.vx ? previous.vx[oldIdx] || 0 : 0;
           fluidVy[idx] = previous.vy ? previous.vy[oldIdx] || 0 : 0;
+          fluidMatU[idx] = previous.matU ? previous.matU[oldIdx] || gx : gx;
+          fluidMatV[idx] = previous.matV ? previous.matV[oldIdx] || gy : gy;
+          fluidLine[idx] = previous.line ? previous.line[oldIdx] || 0 : 0;
+          fluidLineAge[idx] = previous.lineAge ? previous.lineAge[oldIdx] || 0 : 0;
+          fluidLineDirX[idx] = previous.lineDirX ? previous.lineDirX[oldIdx] || 0 : 0;
+          fluidLineDirY[idx] = previous.lineDirY ? previous.lineDirY[oldIdx] || 0 : 0;
+          fluidRidge[idx] = previous.ridge ? previous.ridge[oldIdx] || 0 : 0;
+          fluidStretch[idx] = previous.stretch ? previous.stretch[oldIdx] || 0 : 0;
         }
       }
     }
@@ -634,6 +718,18 @@
       fluidVyNext = new Float32Array(len);
       fluidBaseDensity = new Float32Array(len);
       fluidStrength = new Float32Array(len);
+      fluidMatU = new Float32Array(len);
+      fluidMatV = new Float32Array(len);
+      fluidLine = new Float32Array(len);
+      fluidLineNext = new Float32Array(len);
+      fluidLineAge = new Float32Array(len);
+      fluidLineAgeNext = new Float32Array(len);
+      fluidLineDirX = new Float32Array(len);
+      fluidLineDirY = new Float32Array(len);
+      fluidRidge = new Float32Array(len);
+      fluidRidgeNext = new Float32Array(len);
+      fluidStretch = new Float32Array(len);
+      fluidStretchNext = new Float32Array(len);
       fluidDirty = false;
       raking = false;
       lastRakePoint = null;
@@ -999,10 +1095,11 @@
       const uy = direction ? direction.y : dy / len;
       const nx = -uy;
       const ny = ux;
-      const start = -(RAKE_TOOTH_COUNT - 1) * 0.5;
+      const profile = currentRakeProfile();
+      const start = -(profile.toothCount - 1) * 0.5;
       let dirtyRect = null;
-      for (let i = 0; i < RAKE_TOOTH_COUNT; i++) {
-        const offset = (start + i) * RAKE_TOOTH_SPACING;
+      for (let i = 0; i < profile.toothCount; i++) {
+        const offset = (start + i) * profile.toothSpacing;
         const toothRect = injectFluidTooth(
           x0 + nx * offset,
           y0 + ny * offset,
@@ -1013,7 +1110,8 @@
           uy,
           nx,
           ny,
-          i
+          i,
+          profile
         );
         if (toothRect) dirtyRect = dirtyRect ? unionRects(dirtyRect, toothRect) : toothRect;
       }
@@ -1023,14 +1121,25 @@
         clampVelocityToMask();
         advectVelocitySemiLagrangian();
         advectDensitySemiLagrangian();
+        advectCombFieldsSemiLagrangian();
+        dampCombFields();
         dampAndPinFluid();
       }
-      markDirtyRect(expandRect(dirtyRect, ceil(RAKE_MAX_OFFSET / quality.cellSize)));
+      const combPad = profile.radius + COMB_RIDGE_OFFSET + COMB_RIDGE_WIDTH;
+      markDirtyRect(expandRect(dirtyRect, ceil((RAKE_MAX_OFFSET + combPad) / quality.cellSize)));
     }
 
-    function injectFluidTooth(x0, y0, x1, y1, len, ux, uy, nx, ny, toothIndex) {
+    function currentRakeProfile() {
+      const altKeyCode = typeof ALT !== 'undefined' ? ALT : 18;
+      const fine = typeof keyIsDown === 'function' && keyIsDown(altKeyCode);
+      return fine
+        ? { toothCount: FINE_RAKE_TOOTH_COUNT, toothSpacing: FINE_RAKE_TOOTH_SPACING, radius: FINE_RAKE_RADIUS, strength: FINE_RAKE_STRENGTH, lineMultiplier: FINE_RAKE_LINE_MULTIPLIER }
+        : { toothCount: RAKE_TOOTH_COUNT, toothSpacing: RAKE_TOOTH_SPACING, radius: RAKE_RADIUS, strength: RAKE_STRENGTH, lineMultiplier: 1 };
+    }
+
+    function injectFluidTooth(x0, y0, x1, y1, len, ux, uy, nx, ny, toothIndex, profile) {
       const cellSize = quality.cellSize;
-      const editPad = RAKE_RADIUS + cellSize * 2;
+      const editPad = profile.radius + COMB_RIDGE_OFFSET + COMB_RIDGE_WIDTH + cellSize * 2;
       const rect = clampRect({
         x0: floor((min(x0, x1) - editPad) / cellSize),
         y0: floor((min(y0, y1) - editPad) / cellSize),
@@ -1048,16 +1157,32 @@
           const ddx = cx - nearest.x;
           const ddy = cy - nearest.y;
           const dist = sqrt(ddx * ddx + ddy * ddy);
-          if (dist > RAKE_RADIUS) continue;
+          if (dist > profile.radius) continue;
           const idx = gx + gy * fieldCols;
           if (fluidOwners[idx] < 0 || fluidMask[idx] <= 0) continue;
-          const falloff = smoothFalloff(1 - dist / RAKE_RADIUS);
+          const falloff = smoothFalloff(1 - dist / profile.radius);
           const pin = constrain(fluidBorderPin[idx], 0, 1);
-          const force = RAKE_STRENGTH * falloff * lerp(1, BORDER_VELOCITY_SCALE, pin);
+          const force = profile.strength * falloff * lerp(1, BORDER_VELOCITY_SCALE, pin);
           if (force <= 0.01) continue;
           const jitter = (stableNoise(gx + toothIndex * 19, gy - toothIndex * 23, 4219) - 0.5) * 0.42;
           fluidVx[idx] += ux * force + nx * force * jitter;
           fluidVy[idx] += uy * force + ny * force * jitter;
+          const signed = (cx - nearest.x) * nx + (cy - nearest.y) * ny;
+          const centerLane = Math.exp(-(signed * signed) / (2 * COMB_CENTER_LANE_RADIUS * COMB_CENTER_LANE_RADIUS));
+          const ridgeA = Math.exp(-((signed - COMB_RIDGE_OFFSET) * (signed - COMB_RIDGE_OFFSET)) / (2 * COMB_RIDGE_WIDTH * COMB_RIDGE_WIDTH));
+          const ridgeB = Math.exp(-((signed + COMB_RIDGE_OFFSET) * (signed + COMB_RIDGE_OFFSET)) / (2 * COMB_RIDGE_WIDTH * COMB_RIDGE_WIDTH));
+          const ridge = max(ridgeA, ridgeB);
+          const lane = centerLane;
+          const stamp = falloff * lerp(1, 0.18, pin) * profile.lineMultiplier;
+          fluidLine[idx] = constrain(fluidLine[idx] + ridge * COMB_LINE_STRENGTH * stamp - lane * COMB_LINE_STRENGTH * stamp, -1.4, 1.8);
+          fluidRidge[idx] = constrain(fluidRidge[idx] + ridge * COMB_RIDGE_STRENGTH * stamp, 0, 2.0);
+          fluidStretch[idx] = constrain(fluidStretch[idx] + lane * COMB_STRETCH_STRENGTH * stamp, 0, 2.0);
+          fluidLineAge[idx] = min(1, fluidLineAge[idx] + 0.65 * stamp);
+          fluidLineDirX[idx] = lerp(fluidLineDirX[idx] || ux, ux, COMB_DIRECTION_BLEND * stamp);
+          fluidLineDirY[idx] = lerp(fluidLineDirY[idx] || uy, uy, COMB_DIRECTION_BLEND * stamp);
+          const deposit = ridge * 0.08 * stamp;
+          const thin = lane * 0.055 * stamp;
+          fluidDensity[idx] = constrain(fluidDensity[idx] + deposit - thin, 0.03, MAX_DENSITY_VISUAL * 1.25);
           touched = true;
         }
       }
@@ -1126,6 +1251,49 @@
         }
       }
       [fluidDensity, fluidDensityNext] = [fluidDensityNext, fluidDensity];
+    }
+
+    function advectCombFieldsSemiLagrangian() {
+      for (let gy = 0; gy < fieldRows; gy++) {
+        for (let gx = 0; gx < fieldCols; gx++) {
+          const idx = gx + gy * fieldCols;
+          const owner = fluidOwners[idx];
+          if (owner < 0 || fluidMask[idx] <= 0) {
+            fluidLineNext[idx] = 0;
+            fluidLineAgeNext[idx] = 0;
+            fluidRidgeNext[idx] = 0;
+            fluidStretchNext[idx] = 0;
+            continue;
+          }
+          const sx = gx - fluidVx[idx] * FLUID_DT;
+          const sy = gy - fluidVy[idx] * FLUID_DT;
+          fluidLineNext[idx] = sampleFluidScalar(fluidLine, owner, sx, sy, fluidLine[idx]);
+          fluidLineAgeNext[idx] = sampleFluidScalar(fluidLineAge, owner, sx, sy, fluidLineAge[idx]);
+          fluidRidgeNext[idx] = sampleFluidScalar(fluidRidge, owner, sx, sy, fluidRidge[idx]);
+          fluidStretchNext[idx] = sampleFluidScalar(fluidStretch, owner, sx, sy, fluidStretch[idx]);
+        }
+      }
+      [fluidLine, fluidLineNext] = [fluidLineNext, fluidLine];
+      [fluidLineAge, fluidLineAgeNext] = [fluidLineAgeNext, fluidLineAge];
+      [fluidRidge, fluidRidgeNext] = [fluidRidgeNext, fluidRidge];
+      [fluidStretch, fluidStretchNext] = [fluidStretchNext, fluidStretch];
+    }
+
+    function dampCombFields() {
+      for (let i = 0; i < fluidOwners.length; i++) {
+        if (fluidOwners[i] < 0 || fluidMask[i] <= 0) continue;
+        const pin = constrain(fluidBorderPin[i], 0, 1);
+        fluidLine[i] *= COMB_LINE_DECAY;
+        fluidLineAge[i] *= COMB_AGE_DECAY;
+        fluidRidge[i] *= 0.992;
+        fluidStretch[i] *= 0.990;
+        const borderNeutral = pin * 0.25;
+        if (borderNeutral > 0) {
+          fluidLine[i] = lerp(fluidLine[i], 0, borderNeutral);
+          fluidStretch[i] = lerp(fluidStretch[i], 0, borderNeutral);
+          fluidRidge[i] = lerp(fluidRidge[i], 0, borderNeutral * 0.7);
+        }
+      }
     }
 
     function sampleFluidScalar(buffer, owner, x, y, fallback) {
@@ -1410,8 +1578,8 @@
 
     function updateHint() {
       const el = document.getElementById('hint');
-      const toolLabel = activeTool === 'rake' ? 'Prototype D fluid: drag to inject velocity' : 'Prototype D fluid: hold/tap to add finite density';
-      el.textContent = `${toolLabel} · bunched=darker stretched=paler · Shift/two-finger rake · P palette · R reset · ${PALETTES[paletteIndex].name}`;
+      const toolLabel = activeTool === 'rake' ? 'Prototype D fluid: drag comb/rake tines' : 'Prototype D fluid: hold/tap to add finite density';
+      el.textContent = `${toolLabel} · pale lanes + dark ridges · Alt=fine rake · Shift/two-finger rake · P palette · R reset · ${PALETTES[paletteIndex].name}`;
       updateToolbarState();
     }
 
