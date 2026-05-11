@@ -29,6 +29,8 @@ You can also open `index.html` directly in a browser, but the static server path
 - Hold: increase paint amount and target footprint.
 - Release: finalize the pigment pool; it keeps growing slowly until settled.
 - `P`: cycle palette for future pools.
+- Shift-drag with mouse: rake settled pigment by writing raster-space displacement into the field grid.
+- Two-finger drag on touch: rake without conflicting with one-finger hold-to-drop.
 - `R` or `Escape`: reset.
 - Touch/mobile fallback: tap top-left corner to cycle palette; hold top-right corner for about 750 ms to reset.
 
@@ -51,6 +53,8 @@ Each user-created pigment is a `PigmentPool` with one pigment identity/color and
 Child lobes grow from tiny radii toward target radii. Same-pool child lobes are summed as one implicit field, so they merge into an organic continuous pigment pool.
 
 The sketch renders a low-resolution field into an offscreen pigment layer, then composites that over a stable cream paper-grain layer. Round two replaced the fixed 4 px field with adaptive tiers: high uses 4 px cells, medium uses 6 px cells, and low uses 8 px cells for mobile/crowded/slow frames.
+
+The raking spike adds two persistent raster-space displacement arrays, `rakeDx[]` and `rakeDy[]`, parallel to the field grid. Shift-drag/two-finger drag writes offsets into interior cells near the stroke. The next field solve samples each metaball pool at the displaced coordinates, giving a first-pass "metaball turns into raster-deformable substrate" behavior without changing lobe geometry. Border cells and owner seams receive much weaker rake force so silhouettes remain more recognizable.
 
 ## Hold mapping
 
