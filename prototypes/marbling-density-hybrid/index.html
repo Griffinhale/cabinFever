@@ -1,0 +1,1441 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+  <title>Prototype C · Hybrid Density Marbling</title>
+  <script src="https://cdn.jsdelivr.net/npm/p5@1.11.3/lib/p5.min.js"></script>
+  <script>window.p5 && (p5.disableFriendlyErrors = true);</script>
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: #f4eddf;
+      touch-action: none;
+      overscroll-behavior: none;
+      -webkit-user-select: none;
+      user-select: none;
+    }
+    canvas { display: block; touch-action: none; }
+    #hint {
+      position: fixed;
+      left: 10px;
+      bottom: 8px;
+      z-index: 10;
+      color: rgba(45, 35, 25, 0.46);
+      font: 11px/1.35 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      letter-spacing: 0.02em;
+      pointer-events: none;
+      text-shadow: 0 1px 0 rgba(255,255,255,0.35);
+    }
+    #cornerActions {
+      position: fixed;
+      right: 8px;
+      bottom: 8px;
+      z-index: 11;
+      color: rgba(45, 35, 25, 0.34);
+      font: 10px/1.35 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      pointer-events: none;
+      text-align: right;
+    }
+    #topToolbar {
+      position: fixed;
+      left: 50%;
+      top: 10px;
+      z-index: 20;
+      display: flex;
+      gap: 6px;
+      padding: 6px;
+      border: 1px solid rgba(75, 55, 38, 0.20);
+      border-radius: 999px;
+      background: rgba(246, 236, 215, 0.76);
+      box-shadow: 0 8px 28px rgba(48, 35, 22, 0.12);
+      backdrop-filter: blur(8px);
+      transform: translateX(-50%);
+      touch-action: manipulation;
+    }
+    .toolButton {
+      appearance: none;
+      border: 1px solid rgba(65, 46, 31, 0.18);
+      border-radius: 999px;
+      background: rgba(255, 250, 238, 0.66);
+      color: rgba(45, 35, 25, 0.72);
+      font: 11px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      letter-spacing: 0.03em;
+      padding: 8px 10px;
+      min-width: 54px;
+    }
+    .toolButton.active {
+      background: rgba(47, 36, 24, 0.82);
+      border-color: rgba(47, 36, 24, 0.26);
+      color: rgba(255, 248, 232, 0.94);
+    }
+    .toolButton:active {
+      transform: translateY(1px);
+    }
+  </style>
+</head>
+<body>
+  <div id="hint">Prototype C hybrid density · hold to drop · rake redistributes density · P palette · R reset</div>
+  <div id="topToolbar" aria-label="marbling tools">
+    <button id="dropTool" class="toolButton active" type="button">drop</button>
+    <button id="rakeTool" class="toolButton" type="button">rake</button>
+    <button id="paletteTool" class="toolButton" type="button">palette</button>
+    <button id="resetTool" class="toolButton" type="button">reset</button>
+  </div>
+  <div id="cornerActions">tap top-left: palette<br>hold top-right: reset</div>
+  <script>
+    /*
+      Prototype C / hybrid density marbling.
+
+      Standalone p5 sketch that preserves the metaball ownership/border solver
+      from the base prototype, then overlays a persistent finite-ish density map.
+      Raking no longer hard-paints or cuts the field; the comb redistributes per
+      cell density so stretched lanes go pale while bunched pigment gets darker.
+    */
+
+    const DEBUG_PERF = false;
+    const QUALITY_TIERS = [
+      { name: 'high', cellSize: 4, slowMs: 18, fastMs: 10, maxCellsPerPass: 36000 },
+      { name: 'medium', cellSize: 6, slowMs: 15, fastMs: 8, maxCellsPerPass: 24000 },
+      { name: 'low', cellSize: 8, slowMs: 13, fastMs: 7, maxCellsPerPass: 16000 }
+    ];
+    const FIELD_THRESHOLD = 0.92;
+    const FIELD_RIM_BAND = 0.42;
+    const FIELD_INFLUENCE_FACTOR = 2.35;
+    const DIRTY_PADDING_CELLS = 3;
+    const FULL_REDRAW_COVERAGE = 0.52;
+    const MAX_HOLD_MS = 2100;
+    const MIN_HOLD_MS = 80;
+    const TAP_TO_HOLD_MS = 190;
+    const TAP_MOVE_TOLERANCE = 9;
+    const SPLATTER_MIN_DROPS = 3;
+    const SPLATTER_MAX_DROPS = 5;
+    const SPLATTER_RADIUS = 34;
+    const RESET_HOLD_MS = 750;
+    const CORNER_ACTION_SIZE = 72;
+    const SETTLE_EPSILON = 0.985;
+    const RAKE_RADIUS = 13;
+    const RAKE_TOOTH_COUNT = 5;
+    const RAKE_TOOTH_SPACING = 15;
+    const RAKE_STEP = 5;
+    const RAKE_SMOOTHING = 0.42;
+    const RAKE_STRENGTH = 0.96;
+    const RAKE_MAX_OFFSET = 92;
+    const RAKE_MIN_MOVE = 3;
+    const DENSITY_BASE = 1.0;
+    const DENSITY_MIN = 0.04;
+    const DENSITY_MAX = 2.75;
+    const DENSITY_LANE_PULL = 0.32;
+    const DENSITY_BUNCH_GAIN = 0.56;
+    const DENSITY_ADVECT_STEPS = 2;
+    const DENSITY_DT = 0.74;
+    const DENSITY_VELOCITY_DAMPING = 0.76;
+    const DENSITY_BORDER_DAMPING = 0.16;
+    const DENSITY_BORDER_RESTORE = 0.18;
+    const DENSITY_BUNCH_OFFSET = 1.75;
+
+    const PALETTES = [
+      {
+        name: 'traditional marbling',
+        surface: '#f3ead8',
+        grain: '#d8c6a8',
+        shadow: '#3a2a21',
+        pigments: [
+          { base: '#173b62', rim: '#0b2138', wash: '#6f8fb0' },
+          { base: '#7d2630', rim: '#42121a', wash: '#b96f68' },
+          { base: '#c18a2f', rim: '#765119', wash: '#dfbd71' },
+          { base: '#53673a', rim: '#2c381f', wash: '#9aa574' },
+          { base: '#d9c8a4', rim: '#8f7650', wash: '#f2e6c9' }
+        ]
+      },
+      {
+        name: 'bright playful',
+        surface: '#fbf2df',
+        grain: '#e1cfaa',
+        shadow: '#24212b',
+        pigments: [
+          { base: '#f0645f', rim: '#9e2d32', wash: '#ffaaa0' },
+          { base: '#17a6a5', rim: '#08666d', wash: '#8bdad2' },
+          { base: '#f3cf38', rim: '#a77c0d', wash: '#ffe988' },
+          { base: '#8066c8', rim: '#46337d', wash: '#b9a6ed' },
+          { base: '#2351c6', rim: '#142a77', wash: '#7e9dea' }
+        ]
+      },
+      {
+        name: 'portfolio subdued',
+        surface: '#f1eadc',
+        grain: '#d0c2aa',
+        shadow: '#2b2925',
+        pigments: [
+          { base: '#29313a', rim: '#11161b', wash: '#737b83' },
+          { base: '#a85f47', rim: '#653225', wash: '#d7a18b' },
+          { base: '#4f827f', rim: '#294a49', wash: '#9abcb7' },
+          { base: '#d8c6a0', rim: '#856f49', wash: '#f0e4c4' },
+          { base: '#b8733b', rim: '#70401f', wash: '#d6a06b' }
+        ]
+      },
+      {
+        name: 'monochrome ink',
+        surface: '#f5f1e8',
+        grain: '#cbc2b1',
+        shadow: '#171a20',
+        pigments: [
+          { base: '#101b2a', rim: '#05090f', wash: '#657287' },
+          { base: '#3e4855', rim: '#1b2129', wash: '#8b95a1' },
+          { base: '#777a76', rim: '#3d403f', wash: '#babcb3' },
+          { base: '#b6b7aa', rim: '#74786d', wash: '#deded2' }
+        ]
+      }
+    ];
+
+    let pools = [];
+    let activePress = null;
+    let activeTool = 'drop';
+    let paletteIndex = 0;
+    let pigmentIndex = 0;
+    let poolId = 1;
+    let dirty = true;
+    let settled = true;
+    let qualityIndex = 0;
+    let quality = QUALITY_TIERS[qualityIndex];
+    let fieldCols = 0;
+    let fieldRows = 0;
+    let field = [];
+    let density = [];
+    let densityNext = [];
+    let densityVelX = [];
+    let densityVelY = [];
+    let densityOwnerId = [];
+    let densityPinned = [];
+    let densityRaked = false;
+    let raking = false;
+    let lastRakePoint = null;
+    let lastRakeRawPoint = null;
+    let rakeDirection = null;
+    let activeRakeSourceId = 0;
+    let dirtyRects = [];
+    let fullFieldDirty = true;
+    let paperLayer;
+    let pigmentLayer;
+    let lastDrawHadMotion = false;
+    let pendingReset = null;
+    let lastRenderMs = 0;
+    let slowFrameStreak = 0;
+    let fastFrameStreak = 0;
+    let lastPreviewRect = null;
+
+    function setup() {
+      pixelDensity(1);
+      createCanvas(windowWidth, windowHeight);
+      chooseInitialQuality();
+      rebuildSurfaces();
+      bindToolbar();
+      updateHint();
+    }
+
+    function draw() {
+      let moving = false;
+      if (activePress) moving = true;
+
+      for (const pool of pools) {
+        if (pool.update()) moving = true;
+      }
+
+      markActivePreviewDirty();
+
+      // Static-settle detection: when no press preview exists and every pool has
+      // reached its target radii, stop mutating lobe offsets/noise and stop
+      // recomputing the expensive field until new input/resizes/reset occurs.
+      settled = !activePress && pools.every(pool => pool.settled);
+      if (moving || dirty || lastDrawHadMotion) {
+        adaptQuality(moving || !!activePress);
+        renderScene();
+        dirty = false;
+      } else {
+        image(paperLayer, 0, 0);
+        image(pigmentLayer, 0, 0);
+      }
+      lastDrawHadMotion = moving;
+    }
+
+    function rebuildSurfaces() {
+      fieldCols = Math.ceil(width / quality.cellSize);
+      fieldRows = Math.ceil(height / quality.cellSize);
+      field = new Array(fieldCols * fieldRows);
+      resetRakeGrid();
+      paperLayer = createGraphics(width, height);
+      pigmentLayer = createGraphics(width, height);
+      pigmentLayer.pixelDensity(1);
+      paperLayer.pixelDensity(1);
+      renderPaper();
+      for (const pool of pools) pool.updateGeometry();
+      lastPreviewRect = null;
+      markFullFieldDirty();
+    }
+
+    function renderPaper() {
+      const palette = PALETTES[paletteIndex];
+      paperLayer.background(palette.surface);
+      paperLayer.noStroke();
+      paperLayer.randomSeed(4887);
+      const grainColor = color(palette.grain);
+      for (let i = 0; i < (width * height) / 46; i++) {
+        const x = paperLayer.random(width);
+        const y = paperLayer.random(height);
+        const a = paperLayer.random(5, 18);
+        const r = paperLayer.random(0.35, 1.6);
+        paperLayer.fill(red(grainColor), green(grainColor), blue(grainColor), a);
+        paperLayer.circle(x, y, r);
+      }
+      for (let y = 0; y < height; y += 3) {
+        const a = 4 + 3 * noise(y * 0.008, 17.3);
+        paperLayer.stroke(255, 248, 232, a);
+        paperLayer.line(0, y, width, y);
+      }
+    }
+
+    function renderScene() {
+      image(paperLayer, 0, 0);
+      renderPigmentField();
+      image(pigmentLayer, 0, 0);
+      renderPressPreview();
+    }
+
+    function renderPigmentField() {
+      const startedAt = performance.now();
+      const showPreview = activePress && shouldRenderHoldPreview(activePress);
+      const renderPools = showPreview ? pools.concat([previewPoolFromPress(activePress)]) : pools;
+      const rects = consumeDirtyRects();
+      clearPigmentRects(rects);
+      evaluateField(renderPools, rects);
+
+      pigmentLayer.noStroke();
+      for (const rect of rects) {
+        for (let gy = rect.y0; gy < rect.y1; gy++) {
+          for (let gx = rect.x0; gx < rect.x1; gx++) {
+            const cell = field[gx + gy * fieldCols];
+            if (!cell || cell.owner < 0) continue;
+            const pool = renderPools[cell.owner];
+            if (!pool) continue;
+            const neighborRim = hasDifferentNeighbor(gx, gy, cell.owner);
+            drawPigmentCell(gx, gy, cell, pool, neighborRim);
+          }
+        }
+      }
+
+      lastRenderMs = performance.now() - startedAt;
+      if (DEBUG_PERF) {
+        const cells = rects.reduce((sum, rect) => sum + rectArea(rect), 0);
+        console.log(`[metaballs] ${quality.name} ${quality.cellSize}px ${cells}/${fieldCols * fieldRows} cells ${renderPools.length} pools ${totalLobeCount(renderPools)} lobes ${lastRenderMs.toFixed(1)}ms`);
+      }
+    }
+
+    // Metaball field evaluation: child lobes inside a pool sum their smooth
+    // influence so a single pigment identity merges organically. We deliberately
+    // evaluate each pool separately instead of one global field.
+    function evaluateField(renderPools, rects) {
+      const cellSize = quality.cellSize;
+      for (const rect of rects) {
+        const candidates = poolsForRect(renderPools, rect);
+        for (let gy = rect.y0; gy < rect.y1; gy++) {
+          for (let gx = rect.x0; gx < rect.x1; gx++) {
+            const idx = gx + gy * fieldCols;
+            const x = gx * cellSize + cellSize * 0.5;
+            const y = gy * cellSize + cellSize * 0.5;
+            const sampled = solveFieldAt(renderPools, candidates, x, y);
+            field[idx] = sampled.bestField >= FIELD_THRESHOLD
+              ? { owner: sampled.best, strength: sampled.bestField, margin: sampled.bestField - sampled.secondField }
+              : { owner: -1, strength: sampled.bestField, margin: 0 };
+          }
+        }
+      }
+      syncDensityForRects(renderPools, rects);
+    }
+
+    function solveFieldAt(renderPools, candidates, x, y) {
+      let best = -1;
+      let bestField = 0;
+      let bestAge = -1;
+      let secondField = 0;
+      for (const i of candidates) {
+        const pool = renderPools[i];
+        if (!pool.containsPoint(x, y)) continue;
+        const f = pool.fieldAt(x, y);
+        if (f > secondField) secondField = f;
+        // Ownership/clipping strategy: each cell can have exactly one owner.
+        // Strongest normalized pool field wins above threshold; near-ties go
+        // to the newer pool, making fresh pigment read as sitting on top while
+        // preventing different pigment identities from summing into one blob.
+        const newerTie = Math.abs(f - bestField) < 0.045 && pool.createdAt > bestAge;
+        if (f > bestField || (f > FIELD_THRESHOLD && newerTie)) {
+          secondField = bestField;
+          bestField = f;
+          best = i;
+          bestAge = pool.createdAt;
+        }
+      }
+      return { best, bestField, bestAge, secondField };
+    }
+
+    function solveFreshFieldAt(renderPools, candidates, x, y, stamp) {
+      let best = -1;
+      let bestField = 0;
+      let bestAge = -1;
+      let secondField = 0;
+      for (const i of candidates) {
+        const pool = renderPools[i];
+        if (pool.createdAt < stamp || !pool.containsPoint(x, y)) continue;
+        const f = pool.fieldAt(x, y);
+        if (f < FIELD_THRESHOLD) continue;
+        if (f > secondField) secondField = f;
+        const newerTie = Math.abs(f - bestField) < 0.045 && pool.createdAt > bestAge;
+        if (f > bestField || newerTie) {
+          secondField = bestField;
+          bestField = f;
+          best = i;
+          bestAge = pool.createdAt;
+        }
+      }
+      return { best, bestField, bestAge, secondField };
+    }
+
+    function hasDifferentNeighbor(gx, gy, owner) {
+      const checks = [[1,0],[-1,0],[0,1],[0,-1]];
+      for (const [dx, dy] of checks) {
+        const nx = gx + dx;
+        const ny = gy + dy;
+        if (nx < 0 || ny < 0 || nx >= fieldCols || ny >= fieldRows) return true;
+        const n = field[nx + ny * fieldCols];
+        if (!n || n.owner !== owner) return true;
+      }
+      return false;
+    }
+
+    // Contour/rim rendering: threshold bands darken the outer edge and neighbor
+    // changes darken pigment-pigment seams, so clipping boundaries read as
+    // intentional marbling contours instead of accidental field overlap.
+    function drawPigmentCell(gx, gy, cell, pool, neighborRim) {
+      const cellSize = quality.cellSize;
+      const x = gx * cellSize;
+      const y = gy * cellSize;
+      const idx = gx + gy * fieldCols;
+      const materialDensity = constrain(density[idx] || DENSITY_BASE, DENSITY_MIN, DENSITY_MAX);
+      const n = stableNoise(gx, gy, pool.seed);
+      const edgeT = constrain((cell.strength - FIELD_THRESHOLD) / FIELD_RIM_BAND, 0, 1);
+      const paleT = constrain((1.0 - materialDensity) / 0.92, 0, 1);
+      const bunchT = constrain((materialDensity - 1.0) / (DENSITY_MAX - 1.0), 0, 1);
+      const alpha = (54 + 88 * constrain(edgeT, 0, 1)) * lerp(0.34, 1.42, constrain(materialDensity, 0, 1.7) / 1.7);
+      const rimT = neighborRim ? 0.72 : Math.max(0, 1 - edgeT) * 0.62;
+      const washT = constrain((cell.strength - 1.5) / 3.2, 0, 0.48);
+      const washed = mixRgb(pool.rgb.base, pool.rgb.wash, max(washT, paleT * 0.82));
+      const saturated = mixRgb(washed, pool.rgb.rim, bunchT * 0.46);
+      const c = mixRgb(saturated, pool.rgb.rim, rimT);
+      const jitter = (n - 0.5) * (12 + 18 * paleT);
+      pigmentLayer.fill(
+        constrain(c.r + jitter, 0, 255),
+        constrain(c.g + jitter, 0, 255),
+        constrain(c.b + jitter, 0, 255),
+        neighborRim ? 166 : constrain(alpha, 18, 216)
+      );
+      pigmentLayer.rect(x, y, cellSize + 0.8, cellSize + 0.8);
+
+      if (bunchT > 0.08 && !neighborRim) {
+        pigmentLayer.fill(pool.rgb.base.r, pool.rgb.base.g, pool.rgb.base.b, 38 * bunchT);
+        pigmentLayer.rect(x, y, cellSize + 0.8, cellSize + 0.8);
+      }
+
+      if (neighborRim && (gx + gy) % 2 === 0) {
+        pigmentLayer.fill(pool.rgb.rim.r, pool.rgb.rim.g, pool.rgb.rim.b, 46);
+        pigmentLayer.rect(x, y, cellSize + 0.8, cellSize + 0.8);
+      }
+    }
+
+    function chooseInitialQuality() {
+      const viewportCellsAtHigh = Math.ceil(width / QUALITY_TIERS[0].cellSize) * Math.ceil(height / QUALITY_TIERS[0].cellSize);
+      const mobileHint = window.matchMedia && window.matchMedia('(pointer: coarse)').matches;
+      qualityIndex = mobileHint || viewportCellsAtHigh > 90000 ? 1 : 0;
+      quality = QUALITY_TIERS[qualityIndex];
+    }
+
+    function adaptQuality(interacting) {
+      if (fullFieldDirty && dirtyRects.length === 0) return;
+      const totalLobes = totalLobeCount(pools);
+      const crowded = pools.length > 14 || totalLobes > 92;
+      const slow = lastRenderMs > quality.slowMs || (interacting && crowded && qualityIndex === 0);
+      const fast = settled && lastRenderMs > 0 && lastRenderMs < quality.fastMs && pools.length < 12 && totalLobes < 70;
+
+      slowFrameStreak = slow ? slowFrameStreak + 1 : 0;
+      fastFrameStreak = fast ? fastFrameStreak + 1 : 0;
+
+      if (slowFrameStreak >= 3 && qualityIndex < QUALITY_TIERS.length - 1) {
+        setQuality(qualityIndex + 1);
+        slowFrameStreak = 0;
+        fastFrameStreak = 0;
+      } else if (fastFrameStreak >= 90 && qualityIndex > 0) {
+        setQuality(qualityIndex - 1);
+        slowFrameStreak = 0;
+        fastFrameStreak = 0;
+      }
+    }
+
+    function setQuality(nextIndex) {
+      if (nextIndex === qualityIndex) return;
+      const previousGrid = captureRakeGrid();
+      qualityIndex = nextIndex;
+      quality = QUALITY_TIERS[qualityIndex];
+      fieldCols = Math.ceil(width / quality.cellSize);
+      fieldRows = Math.ceil(height / quality.cellSize);
+      field = new Array(fieldCols * fieldRows);
+      restoreRakeGrid(previousGrid);
+      finishRake();
+      for (const pool of pools) pool.updateGeometry();
+      if (activePress) lastPreviewRect = null;
+      markFullFieldDirty();
+    }
+
+    function captureRakeGrid() {
+      return {
+        cols: fieldCols,
+        rows: fieldRows,
+        cellSize: quality.cellSize,
+        density,
+        densityVelX,
+        densityVelY,
+        densityOwnerId,
+        densityPinned,
+        densityRaked
+      };
+    }
+
+    function restoreRakeGrid(previous) {
+      allocateDensityGrid();
+      if (!previous || !previous.cols || !previous.rows || !previous.density) return;
+
+      for (let gy = 0; gy < fieldRows; gy++) {
+        const py = gy * quality.cellSize + quality.cellSize * 0.5;
+        const oldGy = constrain(floor(py / previous.cellSize), 0, previous.rows - 1);
+        for (let gx = 0; gx < fieldCols; gx++) {
+          const px = gx * quality.cellSize + quality.cellSize * 0.5;
+          const oldGx = constrain(floor(px / previous.cellSize), 0, previous.cols - 1);
+          const oldIdx = oldGx + oldGy * previous.cols;
+          const idx = gx + gy * fieldCols;
+          density[idx] = previous.density[oldIdx] || DENSITY_BASE;
+          densityVelX[idx] = previous.densityVelX ? previous.densityVelX[oldIdx] || 0 : 0;
+          densityVelY[idx] = previous.densityVelY ? previous.densityVelY[oldIdx] || 0 : 0;
+          densityOwnerId[idx] = previous.densityOwnerId ? previous.densityOwnerId[oldIdx] || 0 : 0;
+          densityPinned[idx] = previous.densityPinned ? previous.densityPinned[oldIdx] || 0 : 0;
+        }
+      }
+      densityRaked = !!previous.densityRaked;
+    }
+
+    function resetRakeGrid() {
+      allocateDensityGrid();
+      raking = false;
+      lastRakePoint = null;
+      lastRakeRawPoint = null;
+      rakeDirection = null;
+      activeRakeSourceId = 0;
+    }
+
+    function allocateDensityGrid() {
+      const len = Math.max(0, fieldCols * fieldRows);
+      density = new Array(len).fill(DENSITY_BASE);
+      densityNext = new Array(len).fill(DENSITY_BASE);
+      densityVelX = new Array(len).fill(0);
+      densityVelY = new Array(len).fill(0);
+      densityOwnerId = new Array(len).fill(0);
+      densityPinned = new Array(len).fill(0);
+      densityRaked = false;
+    }
+
+    function syncDensityForRects(renderPools, rects) {
+      for (const rect of rects) {
+        for (let gy = rect.y0; gy < rect.y1; gy++) {
+          for (let gx = rect.x0; gx < rect.x1; gx++) {
+            const idx = gx + gy * fieldCols;
+            const cell = field[idx];
+            const pool = cell && cell.owner >= 0 ? renderPools[cell.owner] : null;
+            const ownerId = pool && !pool.preview ? pool.id : 0;
+            if (!ownerId) {
+              densityOwnerId[idx] = 0;
+              density[idx] = DENSITY_BASE;
+              densityVelX[idx] = 0;
+              densityVelY[idx] = 0;
+              densityPinned[idx] = 0;
+              continue;
+            }
+            const neighborRim = hasDifferentNeighbor(gx, gy, cell.owner);
+            const edgeT = constrain((cell.strength - FIELD_THRESHOLD) / FIELD_RIM_BAND, 0, 1);
+            const pin = neighborRim ? 1 : constrain((1 - edgeT) * 0.82, 0, 1);
+            densityPinned[idx] = pin;
+            if (densityOwnerId[idx] !== ownerId) {
+              densityOwnerId[idx] = ownerId;
+              density[idx] = DENSITY_BASE + (stableNoise(gx, gy, pool.seed + 44) - 0.5) * 0.08;
+              densityVelX[idx] = 0;
+              densityVelY[idx] = 0;
+            } else if (!densityRaked) {
+              density[idx] = lerp(density[idx] || DENSITY_BASE, DENSITY_BASE, 0.18);
+            }
+          }
+        }
+      }
+    }
+
+    function markFullFieldDirty() {
+      fullFieldDirty = true;
+      dirtyRects = [];
+      dirty = true;
+    }
+
+    function markDirtyRect(rect) {
+      if (!rect || fullFieldDirty) {
+        dirty = true;
+        return;
+      }
+      const clamped = clampRect(expandRect(rect, DIRTY_PADDING_CELLS));
+      if (!clamped) return;
+      dirtyRects.push(clamped);
+      dirty = true;
+    }
+
+    function consumeDirtyRects() {
+      if (fullFieldDirty || dirtyRects.length === 0) {
+        fullFieldDirty = false;
+        dirtyRects = [];
+        return [{ x0: 0, y0: 0, x1: fieldCols, y1: fieldRows }];
+      }
+      const rect = dirtyRects.reduce((merged, next) => unionRects(merged, next));
+      dirtyRects = [];
+      const coverage = rectArea(rect) / Math.max(1, fieldCols * fieldRows);
+      if (coverage > FULL_REDRAW_COVERAGE) {
+        return [{ x0: 0, y0: 0, x1: fieldCols, y1: fieldRows }];
+      }
+      return [rect];
+    }
+
+    function clearPigmentRects(rects) {
+      const cellSize = quality.cellSize;
+      for (const rect of rects) {
+        const px = rect.x0 * cellSize;
+        const py = rect.y0 * cellSize;
+        const pw = (rect.x1 - rect.x0) * cellSize + cellSize;
+        const ph = (rect.y1 - rect.y0) * cellSize + cellSize;
+        pigmentLayer.drawingContext.clearRect(px, py, pw, ph);
+      }
+    }
+
+    function poolsForRect(renderPools, rect) {
+      const candidates = [];
+      for (let i = 0; i < renderPools.length; i++) {
+        const pool = renderPools[i];
+        if (pool.fieldRect && rectsOverlap(pool.fieldRect, rect)) candidates.push(i);
+      }
+      return candidates;
+    }
+
+    function markActivePreviewDirty() {
+      if (!activePress || !shouldRenderHoldPreview(activePress)) {
+        if (lastPreviewRect) markDirtyRect(lastPreviewRect);
+        lastPreviewRect = null;
+        return;
+      }
+      const preview = previewPoolFromPress(activePress);
+      if (lastPreviewRect) markDirtyRect(lastPreviewRect);
+      markDirtyRect(preview.fieldRect);
+      lastPreviewRect = preview.fieldRect;
+    }
+
+    function unionRects(a, b) {
+      return {
+        x0: Math.min(a.x0, b.x0),
+        y0: Math.min(a.y0, b.y0),
+        x1: Math.max(a.x1, b.x1),
+        y1: Math.max(a.y1, b.y1)
+      };
+    }
+
+    function expandRect(rect, cells) {
+      return { x0: rect.x0 - cells, y0: rect.y0 - cells, x1: rect.x1 + cells, y1: rect.y1 + cells };
+    }
+
+    function clampRect(rect) {
+      const clamped = {
+        x0: constrain(floor(rect.x0), 0, fieldCols),
+        y0: constrain(floor(rect.y0), 0, fieldRows),
+        x1: constrain(ceil(rect.x1), 0, fieldCols),
+        y1: constrain(ceil(rect.y1), 0, fieldRows)
+      };
+      if (clamped.x1 <= clamped.x0 || clamped.y1 <= clamped.y0) return null;
+      return clamped;
+    }
+
+    function rectsOverlap(a, b) {
+      return a.x0 < b.x1 && a.x1 > b.x0 && a.y0 < b.y1 && a.y1 > b.y0;
+    }
+
+    function rectArea(rect) {
+      return Math.max(0, rect.x1 - rect.x0) * Math.max(0, rect.y1 - rect.y0);
+    }
+
+    function totalLobeCount(list) {
+      return list.reduce((sum, pool) => sum + pool.lobes.length, 0);
+    }
+
+    function parseHexRgb(hex) {
+      const raw = hex.replace('#', '');
+      return {
+        r: parseInt(raw.slice(0, 2), 16),
+        g: parseInt(raw.slice(2, 4), 16),
+        b: parseInt(raw.slice(4, 6), 16)
+      };
+    }
+
+    function mixRgb(a, b, t) {
+      return {
+        r: a.r + (b.r - a.r) * t,
+        g: a.g + (b.g - a.g) * t,
+        b: a.b + (b.b - a.b) * t
+      };
+    }
+
+    function renderPressPreview() {
+      if (!activePress || !shouldRenderHoldPreview(activePress)) return;
+      const held = millis() - activePress.startedAt;
+      const t = holdToUnit(held);
+      noFill();
+      stroke(35, 25, 18, 34 + 28 * t);
+      strokeWeight(1);
+      const r = sqrt(holdToMass(held) / PI) * 1.15;
+      circle(activePress.x, activePress.y, r * 2);
+      stroke(255, 250, 238, 60);
+      circle(activePress.x, activePress.y, max(8, r * 0.6));
+    }
+
+    function shouldRenderHoldPreview(press) {
+      return press && millis() - press.startedAt >= TAP_TO_HOLD_MS;
+    }
+
+    function startPress(x, y) {
+      const corner = handleCornerActionStart(x, y);
+      if (corner) return;
+      activePress = {
+        x: constrain(x, 0, width),
+        y: constrain(y, 0, height),
+        startX: constrain(x, 0, width),
+        startY: constrain(y, 0, height),
+        moved: false,
+        startedAt: millis(),
+        color: choosePigment(),
+        seed: random(1000000)
+      };
+      lastPreviewRect = null;
+      markActivePreviewDirty();
+    }
+
+    function endPress() {
+      if (!activePress) return;
+      const press = activePress;
+      const held = millis() - press.startedAt;
+      if (lastPreviewRect) markDirtyRect(lastPreviewRect);
+      lastPreviewRect = null;
+      activePress = null;
+
+      if (held < TAP_TO_HOLD_MS && !press.moved) {
+        addSplatter(press.x, press.y, press.color, press.seed);
+        return;
+      }
+
+      const pool = createPool(press.x, press.y, held, press.color, press.seed, false);
+      pools.push(pool);
+      markDirtyRect(pool.fieldRect);
+    }
+
+    function addSplatter(x, y, pigment, seed) {
+      randomSeed(floor(seed));
+      const count = floor(random(SPLATTER_MIN_DROPS, SPLATTER_MAX_DROPS + 0.99));
+      const affected = [];
+      for (let i = 0; i < count; i++) {
+        const angle = random(TWO_PI);
+        const radius = sqrt(random()) * SPLATTER_RADIUS;
+        const sx = constrain(x + cos(angle) * radius, 0, width);
+        const sy = constrain(y + sin(angle) * radius, 0, height);
+        const mass = random(180, 620) * (i === 0 ? 1.15 : 1);
+        const lobes = floor(random(1, 3.99));
+        const pool = createPoolFromMass(sx, sy, mass, lobes, pigment, seed + 97 * (i + 1), false);
+        pools.push(pool);
+        affected.push(pool.fieldRect);
+      }
+      for (const rect of affected) markDirtyRect(rect);
+    }
+
+    function handleCornerActionStart(x, y) {
+      if (isTopLeftAction(x, y)) {
+        nextPalette();
+        return true;
+      }
+      if (isTopRightAction(x, y)) {
+        startResetHold(x, y);
+        return true;
+      }
+      return false;
+    }
+
+    function isTopLeftAction(x, y) {
+      return x < CORNER_ACTION_SIZE && y < CORNER_ACTION_SIZE;
+    }
+
+    function isTopRightAction(x, y) {
+      return x > width - CORNER_ACTION_SIZE && y < CORNER_ACTION_SIZE;
+    }
+
+    function startResetHold(x, y) {
+      cancelResetHold();
+      pendingReset = {
+        x,
+        y,
+        completed: false,
+        timer: window.setTimeout(() => {
+          if (!pendingReset) return;
+          pendingReset.completed = true;
+          resetAll();
+        }, RESET_HOLD_MS)
+      };
+      dirty = true;
+    }
+
+    function cancelResetHold() {
+      if (!pendingReset) return;
+      window.clearTimeout(pendingReset.timer);
+      pendingReset = null;
+      dirty = true;
+    }
+
+    function updateCornerActionHold(x, y) {
+      if (pendingReset && !pendingReset.completed && !isTopRightAction(x, y)) {
+        cancelResetHold();
+      }
+    }
+
+    function finishCornerActionHold() {
+      if (pendingReset && !pendingReset.completed) {
+        cancelResetHold();
+        return true;
+      }
+      if (pendingReset && pendingReset.completed) {
+        pendingReset = null;
+        return true;
+      }
+      return false;
+    }
+
+    function handlePointerMove(x, y) {
+      updateCornerActionHold(x, y);
+      if (!activePress) return;
+      const dx = x - activePress.startX;
+      const dy = y - activePress.startY;
+      if (sqrt(dx * dx + dy * dy) > TAP_MOVE_TOLERANCE) activePress.moved = true;
+    }
+
+    function touchCentroid() {
+      if (!touches || touches.length === 0) return { x: mouseX, y: mouseY };
+      let x = 0;
+      let y = 0;
+      for (const t of touches) {
+        x += t.x;
+        y += t.y;
+      }
+      return { x: x / touches.length, y: y / touches.length };
+    }
+
+    function beginRake(x, y) {
+      cancelResetHold();
+      activePress = null;
+      if (dirty || fullFieldDirty || dirtyRects.length) renderScene();
+      raking = true;
+      const point = { x: constrain(x, 0, width), y: constrain(y, 0, height) };
+      activeRakeSourceId = samplePoolIdAt(point.x, point.y);
+      lastRakePoint = point;
+      lastRakeRawPoint = point;
+      rakeDirection = null;
+    }
+
+    function finishRake() {
+      if (!raking) return false;
+      raking = false;
+      lastRakePoint = null;
+      lastRakeRawPoint = null;
+      rakeDirection = null;
+      activeRakeSourceId = 0;
+      dirty = true;
+      return true;
+    }
+
+    function samplePoolIdAt(x, y) {
+      const gx = constrain(floor(x / quality.cellSize), 0, fieldCols - 1);
+      const gy = constrain(floor(y / quality.cellSize), 0, fieldRows - 1);
+      const cell = field[gx + gy * fieldCols];
+      if (!cell || cell.owner < 0) return 0;
+      const pool = pools[cell.owner];
+      return pool ? pool.id : 0;
+    }
+
+    function updateRake(x, y) {
+      if (!raking || !lastRakePoint) return;
+      const raw = { x: constrain(x, 0, width), y: constrain(y, 0, height) };
+      const smooth = smoothRakePoint(raw);
+      const dx = smooth.x - lastRakePoint.x;
+      const dy = smooth.y - lastRakePoint.y;
+      const len = sqrt(dx * dx + dy * dy);
+      if (len < RAKE_MIN_MOVE) return;
+
+      updateRakeDirection(dx, dy, len);
+      const steps = max(1, ceil(len / RAKE_STEP));
+      let from = lastRakePoint;
+      for (let i = 1; i <= steps; i++) {
+        const t = i / steps;
+        const to = {
+          x: lerp(lastRakePoint.x, smooth.x, t),
+          y: lerp(lastRakePoint.y, smooth.y, t)
+        };
+        applyRasterRake(from.x, from.y, to.x, to.y, rakeDirection);
+        from = to;
+      }
+      lastRakePoint = smooth;
+      lastRakeRawPoint = raw;
+    }
+
+    function smoothRakePoint(raw) {
+      if (!lastRakeRawPoint || !lastRakePoint) return raw;
+      return {
+        x: lerp(lastRakePoint.x, raw.x, RAKE_SMOOTHING),
+        y: lerp(lastRakePoint.y, raw.y, RAKE_SMOOTHING)
+      };
+    }
+
+    function updateRakeDirection(dx, dy, len) {
+      const ux = dx / len;
+      const uy = dy / len;
+      if (!rakeDirection) {
+        rakeDirection = { x: ux, y: uy };
+        return;
+      }
+      const blendedX = lerp(rakeDirection.x, ux, 0.28);
+      const blendedY = lerp(rakeDirection.y, uy, 0.28);
+      const blendedLen = sqrt(blendedX * blendedX + blendedY * blendedY) || 1;
+      rakeDirection = { x: blendedX / blendedLen, y: blendedY / blendedLen };
+    }
+
+    // Hybrid density rake: the metaball field still owns the silhouette and seams.
+    // The comb only edits finite-looking density and velocity layered over those
+    // owners, producing pale stretched lanes plus saturated bunches.
+    function applyRasterRake(x0, y0, x1, y1, direction) {
+      const dx = x1 - x0;
+      const dy = y1 - y0;
+      const len = sqrt(dx * dx + dy * dy);
+      if (len < 0.25 || fieldCols <= 0 || fieldRows <= 0) return;
+
+      const ux = direction ? direction.x : dx / len;
+      const uy = direction ? direction.y : dy / len;
+      const nx = -uy;
+      const ny = ux;
+      const start = -(RAKE_TOOTH_COUNT - 1) * 0.5;
+      let editedRect = null;
+      for (let i = 0; i < RAKE_TOOTH_COUNT; i++) {
+        const offset = (start + i) * RAKE_TOOTH_SPACING;
+        const rect = applyDensityRakeTooth(
+          x0 + nx * offset,
+          y0 + ny * offset,
+          x1 + nx * offset,
+          y1 + ny * offset,
+          max(len, RAKE_STEP),
+          ux,
+          uy,
+          nx,
+          ny,
+          i
+        );
+        if (rect) editedRect = editedRect ? unionRects(editedRect, rect) : rect;
+      }
+      if (!editedRect) return;
+      for (let i = 0; i < DENSITY_ADVECT_STEPS; i++) advectDensity(editedRect);
+      markDirtyRect(expandRect(editedRect, ceil((RAKE_RADIUS + RAKE_MAX_OFFSET * 0.35) / quality.cellSize)));
+      densityRaked = true;
+    }
+
+    function applyDensityRakeTooth(x0, y0, x1, y1, len, ux, uy, nx, ny, toothIndex) {
+      const cellSize = quality.cellSize;
+      const editPad = RAKE_RADIUS + RAKE_MAX_OFFSET * 0.42 + cellSize * 2;
+      const rect = clampRect({
+        x0: floor((min(x0, x1) - editPad) / cellSize),
+        y0: floor((min(y0, y1) - editPad) / cellSize),
+        x1: ceil((max(x0, x1) + editPad) / cellSize),
+        y1: ceil((max(y0, y1) + editPad) / cellSize)
+      });
+      if (!rect) return null;
+
+      let touched = false;
+      const pushCells = max(1, floor(min(RAKE_MAX_OFFSET * 0.34, len * DENSITY_BUNCH_OFFSET) / cellSize));
+      const sideSign = toothIndex % 2 === 0 ? 1 : -1;
+      for (let gy = rect.y0; gy < rect.y1; gy++) {
+        const cy = gy * cellSize + cellSize * 0.5;
+        for (let gx = rect.x0; gx < rect.x1; gx++) {
+          const cx = gx * cellSize + cellSize * 0.5;
+          const nearest = closestPointOnSegment(cx, cy, x0, y0, x1, y1);
+          const ddx = cx - nearest.x;
+          const ddy = cy - nearest.y;
+          const dist = sqrt(ddx * ddx + ddy * ddy);
+          if (dist > RAKE_RADIUS) continue;
+
+          const idx = gx + gy * fieldCols;
+          const cell = field[idx];
+          if (!cell || cell.owner < 0) continue;
+          const ownerId = densityOwnerId[idx];
+          if (!ownerId) continue;
+          const pin = constrain(densityPinned[idx] || 0, 0, 1);
+          const falloff = smoothFalloff(1 - dist / RAKE_RADIUS);
+          const movable = falloff * lerp(1, DENSITY_BORDER_DAMPING, pin);
+          if (movable <= 0.015) continue;
+
+          const sourceDensity = density[idx] || DENSITY_BASE;
+          const moved = min(sourceDensity - DENSITY_MIN, DENSITY_LANE_PULL * movable);
+          if (moved > 0) density[idx] = constrain(sourceDensity - moved, DENSITY_MIN, DENSITY_MAX);
+          densityVelX[idx] = (densityVelX[idx] || 0) + ux * RAKE_STRENGTH * movable * 2.9;
+          densityVelY[idx] = (densityVelY[idx] || 0) + uy * RAKE_STRENGTH * movable * 2.9;
+
+          const bunchGx = constrain(gx + round(ux * pushCells + nx * sideSign * 0.75), 0, fieldCols - 1);
+          const bunchGy = constrain(gy + round(uy * pushCells + ny * sideSign * 0.75), 0, fieldRows - 1);
+          const bunchIdx = bunchGx + bunchGy * fieldCols;
+          const bunchCell = field[bunchIdx];
+          if (bunchCell && bunchCell.owner === cell.owner && densityOwnerId[bunchIdx] === ownerId) {
+            const bunchPin = constrain(densityPinned[bunchIdx] || 0, 0, 1);
+            const gain = (moved * DENSITY_BUNCH_GAIN + 0.045 * movable) * lerp(1, 0.28, bunchPin);
+            density[bunchIdx] = constrain((density[bunchIdx] || DENSITY_BASE) + gain, DENSITY_MIN, DENSITY_MAX);
+            densityVelX[bunchIdx] = (densityVelX[bunchIdx] || 0) + ux * RAKE_STRENGTH * movable;
+            densityVelY[bunchIdx] = (densityVelY[bunchIdx] || 0) + uy * RAKE_STRENGTH * movable;
+          }
+          touched = true;
+        }
+      }
+      return touched ? rect : null;
+    }
+
+    function advectDensity(rect) {
+      const expanded = clampRect(expandRect(rect, ceil(RAKE_MAX_OFFSET * 0.45 / quality.cellSize) + 2));
+      if (!expanded) return;
+      for (let gy = expanded.y0; gy < expanded.y1; gy++) {
+        for (let gx = expanded.x0; gx < expanded.x1; gx++) {
+          const idx = gx + gy * fieldCols;
+          const ownerId = densityOwnerId[idx];
+          if (!ownerId) {
+            densityNext[idx] = DENSITY_BASE;
+            continue;
+          }
+          const pin = constrain(densityPinned[idx] || 0, 0, 1);
+          const backX = gx - (densityVelX[idx] || 0) * DENSITY_DT;
+          const backY = gy - (densityVelY[idx] || 0) * DENSITY_DT;
+          const sampled = sampleDensityForOwner(backX, backY, ownerId, density[idx] || DENSITY_BASE);
+          const restored = lerp(sampled, DENSITY_BASE, pin * DENSITY_BORDER_RESTORE);
+          densityNext[idx] = constrain(restored, DENSITY_MIN, DENSITY_MAX);
+        }
+      }
+      for (let gy = expanded.y0; gy < expanded.y1; gy++) {
+        for (let gx = expanded.x0; gx < expanded.x1; gx++) {
+          const idx = gx + gy * fieldCols;
+          density[idx] = densityNext[idx];
+          const pin = constrain(densityPinned[idx] || 0, 0, 1);
+          const damp = DENSITY_VELOCITY_DAMPING * lerp(1, DENSITY_BORDER_DAMPING, pin);
+          densityVelX[idx] = (densityVelX[idx] || 0) * damp;
+          densityVelY[idx] = (densityVelY[idx] || 0) * damp;
+        }
+      }
+    }
+
+    function sampleDensityForOwner(x, y, ownerId, fallback) {
+      const x0 = floor(x);
+      const y0 = floor(y);
+      const tx = constrain(x - x0, 0, 1);
+      const ty = constrain(y - y0, 0, 1);
+      let sum = 0;
+      let weight = 0;
+      for (let oy = 0; oy <= 1; oy++) {
+        const gy = y0 + oy;
+        if (gy < 0 || gy >= fieldRows) continue;
+        const wy = oy ? ty : 1 - ty;
+        for (let ox = 0; ox <= 1; ox++) {
+          const gx = x0 + ox;
+          if (gx < 0 || gx >= fieldCols) continue;
+          const wx = ox ? tx : 1 - tx;
+          const idx = gx + gy * fieldCols;
+          if (densityOwnerId[idx] !== ownerId) continue;
+          const w = wx * wy;
+          sum += (density[idx] || DENSITY_BASE) * w;
+          weight += w;
+        }
+      }
+      return weight > 0 ? sum / weight : fallback;
+    }
+
+    function smoothFalloff(t) {
+      const clamped = constrain(t, 0, 1);
+      return clamped * clamped * (3 - 2 * clamped);
+    }
+
+    function closestPointOnSegment(px, py, x0, y0, x1, y1) {
+      const sx = x1 - x0;
+      const sy = y1 - y0;
+      const l2 = sx * sx + sy * sy;
+      if (l2 <= 0.0001) return { x: x0, y: y0 };
+      const t = constrain(((px - x0) * sx + (py - y0) * sy) / l2, 0, 1);
+      return { x: x0 + sx * t, y: y0 + sy * t };
+    }
+
+    // Hold mapping: duration is clamped, eased, converted to target area/mass,
+    // then split across a performance-capped 3-8/9 child lobes. This makes quick taps visibly small
+    // while long holds create broader footprints with richer asymmetric edges.
+    function holdToUnit(ms) {
+      const clamped = constrain(ms, MIN_HOLD_MS, MAX_HOLD_MS);
+      const t = (clamped - MIN_HOLD_MS) / (MAX_HOLD_MS - MIN_HOLD_MS);
+      return t * t * (3 - 2 * t);
+    }
+
+    function holdToMass(ms) {
+      const minArea = 1600;
+      const maxArea = min(width * height * 0.105, 36000);
+      return lerp(minArea, maxArea, holdToUnit(ms));
+    }
+
+    function choosePigment() {
+      const palette = PALETTES[paletteIndex];
+      const pigment = palette.pigments[pigmentIndex % palette.pigments.length];
+      pigmentIndex++;
+      return pigment;
+    }
+
+    function createPool(x, y, holdMs, pigment, seed, preview) {
+      const mass = holdToMass(holdMs);
+      const t = holdToUnit(holdMs);
+      const lowComplexity = pools.length < 8 && totalLobeCount(pools) < 46 && qualityIndex === 0;
+      const maxLobes = lowComplexity ? 9 : 8;
+      const lobeCount = floor(lerp(3, maxLobes + 0.99, t));
+      return createPoolFromMass(x, y, mass, lobeCount, pigment, seed, preview);
+    }
+
+    function createPoolFromMass(x, y, mass, lobeCount, pigment, seed, preview) {
+      const id = preview ? -1 : poolId++;
+      return new PigmentPool(id, x, y, mass, lobeCount, pigment, seed, preview);
+    }
+
+    function previewPoolFromPress(press) {
+      const p = createPool(press.x, press.y, millis() - press.startedAt, press.color, press.seed, true);
+      p.currentMass = p.targetMass * 0.38;
+      for (const lobe of p.lobes) {
+        lobe.radius = lobe.targetRadius * 0.42;
+        lobe.offsetNow = lobe.offsetTarget * 0.45;
+      }
+      p.updateGeometry();
+      return p;
+    }
+
+    class PigmentPool {
+      constructor(id, x, y, mass, lobeCount, colorValue, seed, preview) {
+        this.id = id;
+        this.center = { x, y };
+        this.createdAt = preview ? millis() + 999999 : millis();
+        this.color = colorValue;
+        this.rgb = {
+          base: parseHexRgb(colorValue.base),
+          rim: parseHexRgb(colorValue.rim),
+          wash: parseHexRgb(colorValue.wash)
+        };
+        this.targetMass = mass;
+        this.currentMass = preview ? mass * 0.35 : 32;
+        this.growthRate = random(0.010, 0.018);
+        this.seed = seed;
+        this.settled = false;
+        this.preview = preview;
+        this.lobes = [];
+        this.sampleLobes = [];
+        this.pixelBounds = null;
+        this.fieldRect = null;
+        this.makeLobes(lobeCount);
+        this.updateGeometry();
+      }
+
+      makeLobes(count) {
+        randomSeed(floor(this.seed));
+        const baseRadius = sqrt(this.targetMass / PI);
+        let weights = [];
+        let total = 0;
+        for (let i = 0; i < count; i++) {
+          const w = random(0.55, 1.45);
+          weights.push(w);
+          total += w;
+        }
+        for (let i = 0; i < count; i++) {
+          const angle = (TWO_PI * i / count) + random(-0.55, 0.55);
+          const offsetTarget = i === 0 ? 0 : random(baseRadius * 0.12, baseRadius * 0.64);
+          const lobeMass = this.targetMass * weights[i] / total * random(0.88, 1.22);
+          const targetRadius = sqrt(lobeMass / PI) * random(1.55, 2.12);
+          this.lobes.push({
+            angle,
+            offsetTarget,
+            offsetNow: 0,
+            radius: 2 + random(0, 2),
+            targetRadius,
+            growthVariation: random(0.72, 1.22),
+            phase: random(1000)
+          });
+        }
+      }
+
+      update() {
+        if (this.preview || this.settled) return false;
+        const previousRect = this.fieldRect;
+        const before = this.currentMass;
+        this.currentMass = lerp(this.currentMass, this.targetMass, this.growthRate);
+        const progress = constrain(this.currentMass / this.targetMass, 0, 1);
+        let moving = Math.abs(this.currentMass - before) > 0.2;
+        for (const lobe of this.lobes) {
+          const targetR = lobe.targetRadius * sqrt(progress);
+          const nextR = lerp(lobe.radius, targetR, 0.045 * lobe.growthVariation);
+          const nextOffset = lerp(lobe.offsetNow, lobe.offsetTarget, 0.032 * lobe.growthVariation);
+          if (Math.abs(nextR - lobe.radius) > 0.05 || Math.abs(nextOffset - lobe.offsetNow) > 0.04) moving = true;
+          lobe.radius = nextR;
+          // Drift is only during growth; once settled these offsets freeze.
+          const drift = (noise(this.seed * 0.001, lobe.phase, progress * 1.7) - 0.5) * 4 * (1 - progress);
+          lobe.offsetNow = nextOffset + drift;
+        }
+        if (progress >= SETTLE_EPSILON && !moving) this.settled = true;
+        if (progress >= 0.998) {
+          this.currentMass = this.targetMass;
+          for (const lobe of this.lobes) {
+            lobe.radius = lobe.targetRadius;
+            lobe.offsetNow = lobe.offsetTarget;
+          }
+          this.settled = true;
+          moving = true;
+        }
+        this.updateGeometry();
+        if (moving) {
+          markDirtyRect(previousRect);
+          markDirtyRect(this.fieldRect);
+        }
+        return moving;
+      }
+
+      updateGeometry() {
+        const cellSize = quality.cellSize;
+        this.sampleLobes = [];
+        let x0 = Infinity;
+        let y0 = Infinity;
+        let x1 = -Infinity;
+        let y1 = -Infinity;
+        for (const lobe of this.lobes) {
+          const lx = this.center.x + cos(lobe.angle) * lobe.offsetNow;
+          const ly = this.center.y + sin(lobe.angle) * lobe.offsetNow;
+          const influenceRadius = Math.max(8, lobe.radius * FIELD_INFLUENCE_FACTOR + 10);
+          const warpRadius = lobe.radius * 0.18;
+          this.sampleLobes.push({
+            x: lx,
+            y: ly,
+            radius: lobe.radius,
+            radius2: lobe.radius * lobe.radius,
+            influence2: (influenceRadius + warpRadius) * (influenceRadius + warpRadius),
+            phase: lobe.phase,
+            phaseCos: cos(lobe.phase),
+            phaseSin: sin(lobe.phase)
+          });
+          x0 = Math.min(x0, lx - influenceRadius - warpRadius);
+          y0 = Math.min(y0, ly - influenceRadius - warpRadius);
+          x1 = Math.max(x1, lx + influenceRadius + warpRadius);
+          y1 = Math.max(y1, ly + influenceRadius + warpRadius);
+        }
+        this.pixelBounds = { x0, y0, x1, y1 };
+        this.fieldRect = clampRect({
+          x0: floor(x0 / cellSize) - 1,
+          y0: floor(y0 / cellSize) - 1,
+          x1: ceil(x1 / cellSize) + 1,
+          y1: ceil(y1 / cellSize) + 1
+        });
+      }
+
+      containsPoint(x, y) {
+        const b = this.pixelBounds;
+        return !!b && x >= b.x0 && x <= b.x1 && y >= b.y0 && y <= b.y1;
+      }
+
+      fieldAt(x, y) {
+        let sum = 0;
+        for (const lobe of this.sampleLobes) {
+          const roughDx = x - lobe.x;
+          const roughDy = y - lobe.y;
+          if (roughDx * roughDx + roughDy * roughDy > lobe.influence2) continue;
+          const warp = (stableNoise(floor(x * 0.025), floor(y * 0.025), this.seed + lobe.phase) - 0.5) * lobe.radius * 0.18;
+          const dx = roughDx + lobe.phaseCos * warp;
+          const dy = roughDy + lobe.phaseSin * warp;
+          const d2 = dx * dx + dy * dy + 18;
+          sum += lobe.radius2 / d2;
+        }
+        return sum;
+      }
+    }
+
+    function stableNoise(x, y, seed) {
+      return noise(x * 0.13 + seed * 0.0007, y * 0.13 - seed * 0.0003);
+    }
+
+    function nextPalette() {
+      paletteIndex = (paletteIndex + 1) % PALETTES.length;
+      pigmentIndex = 0;
+      renderPaper();
+      updateHint();
+      markFullFieldDirty();
+    }
+
+    function resetAll() {
+      if (pendingReset) {
+        window.clearTimeout(pendingReset.timer);
+        pendingReset = null;
+      }
+      pools = [];
+      activePress = null;
+      resetRakeGrid();
+      lastPreviewRect = null;
+      pigmentLayer.clear();
+      renderPaper();
+      markFullFieldDirty();
+      settled = true;
+    }
+
+    function updateHint() {
+      const el = document.getElementById('hint');
+      const toolLabel = activeTool === 'rake' ? 'rake mode: drag to comb' : 'drop mode: hold to drop';
+      el.textContent = `Prototype C hybrid density · ${toolLabel} · pale stretch / saturated bunching · Shift-drag/two-finger rake · P palette · R reset · ${PALETTES[paletteIndex].name}`;
+      updateToolbarState();
+    }
+
+    function bindToolbar() {
+      const toolbar = document.getElementById('topToolbar');
+      if (!toolbar || toolbar.dataset.bound === 'true') return;
+      toolbar.dataset.bound = 'true';
+      toolbar.addEventListener('pointerdown', event => event.stopPropagation());
+      toolbar.addEventListener('touchstart', event => event.stopPropagation(), { passive: false });
+      document.getElementById('dropTool').addEventListener('click', event => {
+        event.preventDefault();
+        setActiveTool('drop');
+      });
+      document.getElementById('rakeTool').addEventListener('click', event => {
+        event.preventDefault();
+        setActiveTool('rake');
+      });
+      document.getElementById('paletteTool').addEventListener('click', event => {
+        event.preventDefault();
+        nextPalette();
+      });
+      document.getElementById('resetTool').addEventListener('click', event => {
+        event.preventDefault();
+        resetAll();
+      });
+      updateToolbarState();
+    }
+
+    function setActiveTool(tool) {
+      activeTool = tool;
+      finishRake();
+      activePress = null;
+      updateHint();
+    }
+
+    function updateToolbarState() {
+      const drop = document.getElementById('dropTool');
+      const rake = document.getElementById('rakeTool');
+      if (!drop || !rake) return;
+      drop.classList.toggle('active', activeTool === 'drop');
+      rake.classList.toggle('active', activeTool === 'rake');
+    }
+
+    function keyPressed() {
+      if (key === 'p' || key === 'P') nextPalette();
+      if (key === 'r' || key === 'R' || keyCode === ESCAPE) resetAll();
+    }
+
+    function mousePressed() {
+      if (touches && touches.length) return false;
+      if (activeTool === 'rake' || keyIsDown(SHIFT)) {
+        beginRake(mouseX, mouseY);
+        return false;
+      }
+      startPress(mouseX, mouseY);
+      return false;
+    }
+
+    function mouseReleased() {
+      if (touches && touches.length) return false;
+      if (finishRake()) return false;
+      if (finishCornerActionHold()) return false;
+      endPress();
+      return false;
+    }
+
+    function mouseDragged() {
+      if (touches && touches.length) return false;
+      if (raking) {
+        updateRake(mouseX, mouseY);
+        return false;
+      }
+      handlePointerMove(mouseX, mouseY);
+      return false;
+    }
+
+    function touchStarted() {
+      if (touches && touches.length >= 2) {
+        const p = touchCentroid();
+        beginRake(p.x, p.y);
+        return false;
+      }
+      if (activeTool === 'rake') {
+        beginRake(mouseX, mouseY);
+        return false;
+      }
+      const t = touches && touches.length ? touches[0] : { x: mouseX, y: mouseY };
+      startPress(t.x, t.y);
+      return false;
+    }
+
+    function touchMoved() {
+      if (raking) {
+        const p = touches && touches.length ? touchCentroid() : { x: mouseX, y: mouseY };
+        updateRake(p.x, p.y);
+        return false;
+      }
+      const t = touches && touches.length ? touches[0] : { x: mouseX, y: mouseY };
+      handlePointerMove(t.x, t.y);
+      return false;
+    }
+
+    function touchEnded() {
+      if (raking) {
+        finishRake();
+        return false;
+      }
+      if (finishCornerActionHold()) return false;
+      endPress();
+      return false;
+    }
+
+    function windowResized() {
+      resizeCanvas(windowWidth, windowHeight);
+      chooseInitialQuality();
+      rebuildSurfaces();
+    }
+
+    document.addEventListener('gesturestart', event => event.preventDefault());
+    document.addEventListener('touchmove', event => event.preventDefault(), { passive: false });
+  </script>
+</body>
+</html>
