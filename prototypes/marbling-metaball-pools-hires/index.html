@@ -1,0 +1,2239 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+  <title>Marbling Metaball Pools — Hi-Res</title>
+  <script src="https://cdn.jsdelivr.net/npm/p5@1.11.3/lib/p5.min.js"></script>
+  <script>window.p5 && (p5.disableFriendlyErrors = true);</script>
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: #f4eddf;
+      touch-action: none;
+      overscroll-behavior: none;
+      -webkit-user-select: none;
+      user-select: none;
+    }
+    canvas { display: block; touch-action: none; }
+    #hint {
+      position: fixed;
+      left: 10px;
+      bottom: 8px;
+      z-index: 10;
+      color: rgba(45, 35, 25, 0.46);
+      font: 11px/1.35 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      letter-spacing: 0.02em;
+      pointer-events: none;
+      text-shadow: 0 1px 0 rgba(255,255,255,0.35);
+    }
+    #cornerActions {
+      position: fixed;
+      right: 8px;
+      bottom: 8px;
+      z-index: 11;
+      color: rgba(45, 35, 25, 0.34);
+      font: 10px/1.35 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      pointer-events: none;
+      text-align: right;
+    }
+    #toolbar {
+      position: fixed;
+      top: 8px;
+      left: 50%;
+      transform: translateX(-50%);
+      z-index: 12;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 10px;
+      background: rgba(244, 237, 223, 0.86);
+      border: 1px solid rgba(45, 35, 25, 0.18);
+      border-radius: 16px;
+      box-shadow: 0 1px 4px rgba(45, 35, 25, 0.10);
+      backdrop-filter: blur(4px);
+      -webkit-backdrop-filter: blur(4px);
+      pointer-events: auto;
+      font: 11px/1.2 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      color: rgba(45, 35, 25, 0.78);
+      user-select: none;
+    }
+    .tool-btn {
+      appearance: none;
+      border: 1px solid rgba(45, 35, 25, 0.25);
+      background: rgba(255, 250, 238, 0.65);
+      color: rgba(45, 35, 25, 0.78);
+      font: inherit;
+      letter-spacing: 0.04em;
+      padding: 4px 10px;
+      border-radius: 12px;
+      cursor: pointer;
+      touch-action: manipulation;
+    }
+    .tool-btn[data-active="true"] {
+      background: rgba(45, 35, 25, 0.82);
+      color: rgba(244, 237, 223, 0.95);
+      border-color: rgba(45, 35, 25, 0.82);
+    }
+    #swatches {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .swatch {
+      appearance: none;
+      width: 22px;
+      height: 22px;
+      border-radius: 50%;
+      border: 1.5px solid rgba(45, 35, 25, 0.22);
+      cursor: pointer;
+      padding: 0;
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.18);
+      transition: transform 80ms ease;
+      touch-action: manipulation;
+    }
+    .swatch[data-active="true"] {
+      transform: scale(1.18);
+      border-color: rgba(45, 35, 25, 0.85);
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.28), 0 0 0 2px rgba(244, 237, 223, 0.85);
+    }
+    .palette-name {
+      letter-spacing: 0.05em;
+      font-size: 10px;
+      opacity: 0.7;
+      padding: 0 4px;
+      max-width: 140px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+  </style>
+</head>
+<body>
+  <div id="hint">pick swatch · drop / drag / rake / comb · P palette · R reset</div>
+  <div id="cornerActions">tap top-left: palette<br>hold top-right: reset</div>
+  <div id="toolbar">
+    <button class="tool-btn" data-tool="drop" data-active="true">drop</button>
+    <button class="tool-btn" data-tool="drag">drag</button>
+    <button class="tool-btn" data-tool="rake">rake</button>
+    <button class="tool-btn" data-tool="comb">comb</button>
+    <span class="palette-name" id="paletteName"></span>
+    <div id="swatches"></div>
+  </div>
+  <script>
+    /*
+      Marbling metaballs / implicit pigment pools prototype.
+
+      Standalone p5 sketch that tests whether same-pigment metaball lobes plus
+      strongest-owner clipping can make soft marbled pools without collapsing
+      all colors into one global lava-lamp blob. Kept self-contained for quick
+      comparison with sibling architecture prototypes.
+    */
+
+    const DEBUG_PERF = false;
+    // Hi-Res variant. Field eval uses a finer grid AND the cell write does
+    // bilinear interpolation of field strength across the cellSize×cellSize
+    // pixel block — so rim alpha and rim-darken vary per pixel instead of
+    // stepping at each cell boundary. Net effect: rims read as smoothly
+    // antialiased even at cellSize=3, comparable to ~cellSize=1 nearest-
+    // neighbor at a fraction of the field-eval cost. Tiers shifted down
+    // from {4,6,8} so even the fallback tier renders finer than the refined
+    // baseline's "high." slowMs budget bumped because the bilerp adds
+    // per-pixel arithmetic; the adaptor still backs off if a slower machine
+    // can't keep up.
+    const QUALITY_TIERS = [
+      { name: 'high', cellSize: 2, slowMs: 22, fastMs: 12, maxCellsPerPass: 90000 },
+      { name: 'medium', cellSize: 3, slowMs: 20, fastMs: 11, maxCellsPerPass: 60000 },
+      { name: 'low', cellSize: 4, slowMs: 18, fastMs: 10, maxCellsPerPass: 36000 }
+    ];
+    const FIELD_THRESHOLD = 0.92;
+    const FIELD_RIM_BAND = 0.42;
+    // Hi-res only: span BELOW the iso-threshold over which alpha ramps from
+    // 0 → ~base. The baseline renderer had a hard alpha cliff (transparent
+    // paper one pixel, solid pigment the next), which after bilerp left a
+    // visible 1-pixel step at the contour. Fading across this band turns
+    // the contour into a soft, sub-pixel-antialiased edge — the dominant
+    // perceptual difference between this variant and the refined baseline.
+    const FIELD_FADE_BAND = 0.20;
+    const FIELD_INFLUENCE_FACTOR = 2.35;
+    const DIRTY_PADDING_CELLS = 3;
+    // R3 — coordinate-space domain warp budget. The whole pool's sample point
+    // is displaced by up to ±DOMAIN_WARP_PX before lobe accumulation, so blob
+    // edges read as fluid instead of algorithmically smooth. Bounds /
+    // influence-radius checks grow by this amount so the warp can never push
+    // a sample outside its candidate pool's culling rect.
+    const DOMAIN_WARP_PX = 14;
+    // R2 — two-pigment seam blend. When the bestField - secondField margin
+    // is below SEAM_BAND, the owning pigment LERPs toward the runner-up's
+    // pigment (capped at SEAM_BLEND_MAX so the owner stays identifiable).
+    // Same idea Spike A applied to the SDF; transplants here unchanged.
+    const SEAM_BAND = 0.55;
+    const SEAM_BLEND_MAX = 0.42;
+    // D1 — volume-conserving displacement on drop creation. When a new pool
+    // appears, surrounding pools' lobes get pushed outward following an
+    // incompressible-shell formula: a particle at radius r outside the new
+    // pool of radius R ends up at sqrt(r²+R²), so its displacement is
+    // approximately R²/(2r) for r >> R. Capped to DISPLACEMENT_MAX_PX so a
+    // close lobe doesn't get launched off-screen, and only applied if it
+    // exceeds DISPLACEMENT_MIN_PX (cheap noise floor).
+    const DISPLACEMENT_MAX_PX = 92;
+    const DISPLACEMENT_MIN_PX = 0.6;
+    const DISPLACEMENT_RAMP = 0.085;        // per-frame lerp toward target
+    const DISPLACEMENT_INSIDE_BOOST = 0.55; // extra eject if lobe is inside new pool radius
+    // D2 — inner sub-lobes per pool ("metaball within metaball"). Each pool
+    // generates a small set of interior metaballs that contribute to a
+    // secondary field used purely for color modulation: where the inner
+    // field is high, pigment tints toward `wash` (lighter); where low, it
+    // tints toward `rim` (darker). This is what gives each pool internal
+    // fluid swirls instead of a uniform color body.
+    const INNER_LOBE_MIN = 4;
+    const INNER_LOBE_MAX = 8;
+    const INNER_TINT_STRENGTH = 0.34;
+    // D3 — anisotropic boundary noise. Domain warp is decomposed into radial
+    // and tangential components relative to the pool center; radial is
+    // amplified, tangential is dampened. Plus a coarser "tendril noise" that
+    // contributes only at low frequency, creating Saffman-Taylor-style
+    // fingering at the outer edge.
+    const RADIAL_WARP_BOOST = 1.85;
+    const TANGENTIAL_WARP_DAMP = 0.45;
+    const TENDRIL_WARP_PX = 9;
+    // D4 — satellite spawning at contact zones. When a new pool engulfs or
+    // closely overlaps an existing pool's lobe, eject a small "fleck" of the
+    // existing pool's pigment outside the new pool's radius. Kept
+    // conservative so the field doesn't drown in tiny lobes after a long
+    // session.
+    const SATELLITES_PER_EVENT = 2;
+    const MAX_SATELLITES_PER_POOL = 8;
+    const SATELLITE_PROXIMITY_FACTOR = 1.35; // d < Rnew * this triggers eject
+    // Mid-press preview displacement: while a hold is active, existing
+    // pools' lobes animate toward where they'd land if released now. The
+    // user sees how big the drop will be by how much it deforms neighbours.
+    // Set just under 1.0 so commit feels like a small settling push, not a
+    // jolt back from preview to committed state.
+    const PREVIEW_DISPLACEMENT_FACTOR = 0.78;
+    const FULL_REDRAW_COVERAGE = 0.52;
+    const MAX_HOLD_MS = 2100;
+    const MIN_HOLD_MS = 80;
+    const RESET_HOLD_MS = 750;
+    const CORNER_ACTION_SIZE = 72;
+    const SETTLE_EPSILON = 0.985;
+    // Roundness envelope. Each lobe's effective offsetTarget = baseOffsetTarget
+    // * (BASE_ROUNDNESS + (1 - BASE_ROUNDNESS) * contactT) where contactT is a
+    // 0..1 measure of how strongly that lobe's outward direction faces a
+    // nearby pool. Solitary pools sit at BASE_ROUNDNESS of their assigned
+    // angular spread → soft disks. Lobes facing a neighbor's center pull out
+    // toward full asymmetry, deforming the pool only along contact axes.
+    const BASE_ROUNDNESS = 0.22;
+    const CONTACT_RANGE_FACTOR = 1.35; // (R_self + R_other) * this = engagement range
+    const CONTACT_LERP = 0.06;          // smoothing on contactT each frame
+    // D3 attenuation. Radial / tendril warp scale by max-contactT, so isolated
+    // pools get muted boundary fingering and only contacted ones unleash full
+    // Saffman-Taylor edges.
+    const ROUND_RADIAL_WARP_FLOOR = 0.55;
+    const ROUND_TENDRIL_FLOOR = 0.30;
+    // Rake tool — time-on-contact per-lobe advection. Each frame, for
+    // every lobe inside the rake kernel, accumulate displacement along
+    // the current stroke direction by (push-rate × seconds-since-last-
+    // impulse × radial falloff). This decouples carving from cursor
+    // velocity: a slow drag spends more time over each lobe and carves
+    // more; a fast drag spends less time and carves less, matching the
+    // physical intuition of dragging a tool through paint.
+    //
+    // The previous design impulsed by velocity (target += vx * k), which
+    // tied total displacement to stroke length and gave a "soft brush"
+    // feel — wide radius + low strength so the whole pool wouldn't drag.
+    // We've flipped that knob: smaller radius, higher push-rate, so the
+    // rake reads as a "fine pen" carving a groove through 1–2 lobes at
+    // a time. Surrounding lobes stay put; the carve is localized.
+    //
+    // RAKE_PERP_FRACTION still adds a sideways component that flips sign
+    // by which side of the stroke axis a lobe sits on — gives stroke
+    // ends a slight curl/swirl instead of a pure straight tug.
+    const RAKE_RADIUS = 36;            // tight kernel — 1–2 lobes per frame
+    const RAKE_PUSH_PER_SECOND = 60;   // px of displacement per s of contact
+    const RAKE_FALLOFF_POWER = 1.8;
+    const RAKE_PERP_FRACTION = 0.30;   // less sideways wobble than before
+    const MAX_RAKE_DISPLACEMENT = 95;
+    const RAKE_MAX_DT = 0.1;           // clamp first-frame and stutter bursts
+    // Comb tool — pixel-smudge post-process for non-pareil patterns.
+    //
+    // The metaball-pool / lobe-follow approach physically cannot produce
+    // non-pareil: there are ~9 lobes per pool, and non-pareil needs
+    // dozens of fine parallel ripples — strictly sub-lobe resolution.
+    // We move the comb out of the field abstraction entirely. Each
+    // tine is now a small clipped region on pigmentLayer; per frame,
+    // pigmentLayer is drawn onto itself with the cursor's (vx, vy)
+    // offset, clipped to that disk, with partial alpha. Within the
+    // disk every pixel adopts the value that was at (px - vx, py - vy)
+    // a frame earlier, blended against what's already there. Over a
+    // stroke that disk "drags" pigment forward along the tine path.
+    //
+    // For multi-color pools this produces the classic non-pareil
+    // banded effect — color stripes pulled laterally into hundreds
+    // of fine ripples. For a single-color pool the smudge is
+    // effectively invisible (same color in, same color out), which
+    // matches the physical reality: real non-pareil combs over a
+    // single-color slab also produce no visible pattern.
+    //
+    // Tine geometry tuned tight: 36 fine tines at 6 px pitch, 2 px
+    // radius. Total bar ≈ 216 px wide. Disk diameter (4 px) plus 2 px
+    // gap between tines gives a clean alternating-band pattern.
+    const COMB_TINE_COUNT = 36;
+    const COMB_TINE_SPACING = 6;
+    const COMB_TINE_RADIUS = 2;
+    // Per-frame smudge blend factor. Each tine's disk on pigmentLayer
+    // becomes (alpha × source-shifted + (1-alpha) × destination), so
+    // ~0.6 gives a strong forward drag while still letting some of
+    // the original pigment under the tine show through. Lower values
+    // produce a more delicate smudge; higher values approach a hard
+    // "stamp" of the previous frame's pigment.
+    const COMB_SMUDGE_ALPHA = 0.6;
+    // Max length of (vx, vy) per smudge "step." If the cursor moves
+    // faster than this per frame, the path is subdivided so the disk
+    // overlaps from one step to the next — otherwise fast strokes
+    // would leave visible gaps between non-overlapping smudge stamps.
+    const COMB_SMUDGE_MAX_STEP = 2;
+    // Optional subtle paper-color bleed at the tine path — fakes the
+    // "pigment pushed aside leaves a visible channel" effect that
+    // real combs produce even on single-color slabs. 0 disables.
+    const COMB_PAPER_BLEED_ALPHA = 0.06;
+    // --- Legacy infrastructure retained but dormant ---
+    // The scar/field-warp + lobe-follow approach is no longer wired
+    // into the comb. scarDispl is still allocated and resetAll still
+    // clears it, but applyCombImpulse no longer writes it and fieldAt
+    // / applyScarFollow ignore it. Constants kept so the diagnostic
+    // handle continues to expose them; can be removed once the new
+    // pixel-smudge approach is locked in.
+    const SCAR_CELL_SIZE = 5;
+    const MAX_SCAR_PER_CELL = 55;
+    // Drag tool — picks up a single pool by its footprint and translates its
+    // center as the cursor moves. Whole-pool motion (not per-lobe), so the
+    // bubble is rearranged without distorting it. Grab zone uses the union
+    // of lobe disks (lobe radius * DRAG_GRAB_LOBE_FACTOR + buffer) so the
+    // hit-test matches the *visible* pool, including outer lobes — not just
+    // the center disk.
+    const DRAG_GRAB_LOBE_FACTOR = 1.45;
+    const DRAG_GRAB_BUFFER_PX = 16;
+
+    const PALETTES = [
+      {
+        name: 'traditional marbling',
+        surface: '#f3ead8',
+        grain: '#d8c6a8',
+        shadow: '#3a2a21',
+        pigments: [
+          { base: '#173b62', rim: '#0b2138', wash: '#6f8fb0' },
+          { base: '#7d2630', rim: '#42121a', wash: '#b96f68' },
+          { base: '#c18a2f', rim: '#765119', wash: '#dfbd71' },
+          { base: '#53673a', rim: '#2c381f', wash: '#9aa574' },
+          { base: '#d9c8a4', rim: '#8f7650', wash: '#f2e6c9' }
+        ]
+      },
+      {
+        name: 'bright playful',
+        surface: '#fbf2df',
+        grain: '#e1cfaa',
+        shadow: '#24212b',
+        pigments: [
+          { base: '#f0645f', rim: '#9e2d32', wash: '#ffaaa0' },
+          { base: '#17a6a5', rim: '#08666d', wash: '#8bdad2' },
+          { base: '#f3cf38', rim: '#a77c0d', wash: '#ffe988' },
+          { base: '#8066c8', rim: '#46337d', wash: '#b9a6ed' },
+          { base: '#2351c6', rim: '#142a77', wash: '#7e9dea' }
+        ]
+      },
+      {
+        name: 'portfolio subdued',
+        surface: '#f1eadc',
+        grain: '#d0c2aa',
+        shadow: '#2b2925',
+        pigments: [
+          { base: '#29313a', rim: '#11161b', wash: '#737b83' },
+          { base: '#a85f47', rim: '#653225', wash: '#d7a18b' },
+          { base: '#4f827f', rim: '#294a49', wash: '#9abcb7' },
+          { base: '#d8c6a0', rim: '#856f49', wash: '#f0e4c4' },
+          { base: '#b8733b', rim: '#70401f', wash: '#d6a06b' }
+        ]
+      },
+      {
+        name: 'monochrome ink',
+        surface: '#f5f1e8',
+        grain: '#cbc2b1',
+        shadow: '#171a20',
+        pigments: [
+          { base: '#101b2a', rim: '#05090f', wash: '#657287' },
+          { base: '#3e4855', rim: '#1b2129', wash: '#8b95a1' },
+          { base: '#777a76', rim: '#3d403f', wash: '#babcb3' },
+          { base: '#b6b7aa', rim: '#74786d', wash: '#deded2' }
+        ]
+      }
+    ];
+
+    let pools = [];
+    let activePress = null;
+    let paletteIndex = 0;
+    let selectedPigmentIndex = 0;
+    let toolMode = 'drop'; // 'drop' | 'drag' | 'rake' | 'comb'
+    let dragSession = null; // drag = translate a captured pool
+    let rakeSession = null; // rake = broad per-lobe advection through pools
+    let combSession = null; // comb = multi-tine localized advection (striations)
+    let poolId = 1;
+    let dirty = true;
+    let settled = true;
+    let qualityIndex = 0;
+    let quality = QUALITY_TIERS[qualityIndex];
+    let fieldCols = 0;
+    let fieldRows = 0;
+    let field = [];
+    let dirtyRects = [];
+    let fullFieldDirty = true;
+    // Comb scar field — Float32Array of (dx, dy) pairs over a 2D grid.
+    // Persistent: scars accumulate as the comb is dragged and stay after
+    // release. fieldAt reads this grid to shift its sample point.
+    let scarDispl = null;
+    let scarCols = 0;
+    let scarRows = 0;
+    let paperLayer;
+    let pigmentLayer;
+    // Separate compositing layer for the comb's pixel smudges. Kept
+    // independent of pigmentLayer so that field re-evaluations (pool
+    // growth, drift, displacement) don't wipe combings under their
+    // dirty rect. Rendered ON TOP of pigmentLayer in renderScene.
+    let combLayer;
+    let lastDrawHadMotion = false;
+    let pendingReset = null;
+    let lastRenderMs = 0;
+    let slowFrameStreak = 0;
+    let fastFrameStreak = 0;
+    let lastPreviewRect = null;
+
+    function setup() {
+      pixelDensity(1);
+      createCanvas(windowWidth, windowHeight);
+      chooseInitialQuality();
+      rebuildSurfaces();
+      bindToolButtons();
+      buildToolbar();
+      updateHint();
+      // Diagnostic handle: paste `__marble.constants` or `__marble.toolMode`
+      // in the DevTools console to confirm which build is loaded.
+      window.__marble = {
+        version: 'hires-bilerp-v1',
+        get toolMode() { return toolMode; },
+        get dragSession() { return dragSession; },
+        get rakeSession() { return rakeSession; },
+        get combSession() { return combSession; },
+        get pools() { return pools; },
+        get scarStats() {
+          if (!scarDispl) return null;
+          let nonzero = 0, maxMag = 0;
+          for (let i = 0; i < scarDispl.length; i += 2) {
+            const m2 = scarDispl[i] * scarDispl[i] + scarDispl[i + 1] * scarDispl[i + 1];
+            if (m2 > 0.0001) nonzero++;
+            if (m2 > maxMag * maxMag) maxMag = Math.sqrt(m2);
+          }
+          return { nonzeroCells: nonzero, totalCells: scarDispl.length / 2, maxMagnitude: maxMag };
+        },
+        get constants() {
+          return {
+            RAKE_PUSH_PER_SECOND, RAKE_RADIUS, MAX_RAKE_DISPLACEMENT,
+            RAKE_PERP_FRACTION, RAKE_FALLOFF_POWER, RAKE_MAX_DT,
+            DRAG_GRAB_LOBE_FACTOR, DRAG_GRAB_BUFFER_PX,
+            COMB_TINE_COUNT, COMB_TINE_SPACING, COMB_TINE_RADIUS,
+            COMB_SMUDGE_ALPHA, COMB_SMUDGE_MAX_STEP, COMB_PAPER_BLEED_ALPHA,
+            MAX_SCAR_PER_CELL, SCAR_CELL_SIZE
+          };
+        }
+      };
+    }
+
+    function draw() {
+      let moving = false;
+      if (activePress) moving = true;
+      if (dragSession) moving = true;
+      if (rakeSession) moving = true;
+      if (combSession) moving = true;
+
+      for (const pool of pools) {
+        if (pool.update()) moving = true;
+      }
+
+      markActivePreviewDirty();
+
+      // Static-settle detection: when no press preview exists and every pool has
+      // reached its target radii, stop mutating lobe offsets/noise and stop
+      // recomputing the expensive field until new input/resizes/reset occurs.
+      settled = !activePress && pools.every(pool => pool.settled);
+      if (moving || dirty || lastDrawHadMotion) {
+        adaptQuality(moving || !!activePress);
+        renderScene();
+        dirty = false;
+      } else {
+        image(paperLayer, 0, 0);
+        image(pigmentLayer, 0, 0);
+        if (combLayer) image(combLayer, 0, 0);
+      }
+      lastDrawHadMotion = moving;
+    }
+
+    function rebuildSurfaces() {
+      fieldCols = Math.ceil(width / quality.cellSize);
+      fieldRows = Math.ceil(height / quality.cellSize);
+      field = new Array(fieldCols * fieldRows);
+      rebuildScarField();
+      paperLayer = createGraphics(width, height);
+      pigmentLayer = createGraphics(width, height);
+      combLayer = createGraphics(width, height);
+      pigmentLayer.pixelDensity(1);
+      paperLayer.pixelDensity(1);
+      combLayer.pixelDensity(1);
+      renderPaper();
+      for (const pool of pools) pool.updateGeometry();
+      lastPreviewRect = null;
+      markFullFieldDirty();
+    }
+
+    function rebuildScarField() {
+      scarCols = Math.ceil(width / SCAR_CELL_SIZE) + 2;
+      scarRows = Math.ceil(height / SCAR_CELL_SIZE) + 2;
+      scarDispl = new Float32Array(scarCols * scarRows * 2);
+    }
+
+    function clearScarField() {
+      if (scarDispl) scarDispl.fill(0);
+    }
+
+    // Reusable two-element buffer for scarLookupAt's output. Allocating
+    // once here keeps the hot paths (fieldAt per-cell, applyScarFollow
+    // per-lobe) from generating GC pressure.
+    const __scarOut = new Float32Array(2);
+
+    // Bilinear sample of the persistent scar displacement grid at screen
+    // coords (x, y). Writes the result into __scarOut and returns it; out-
+    // of-bounds samples return (0, 0). Both fieldAt (sample-point warp)
+    // and PigmentPool.applyScarFollow (per-lobe target nudge) share this.
+    function scarLookupAt(x, y) {
+      __scarOut[0] = 0;
+      __scarOut[1] = 0;
+      if (!scarDispl) return __scarOut;
+      const sfx = x / SCAR_CELL_SIZE;
+      const sfy = y / SCAR_CELL_SIZE;
+      const sgx0 = sfx | 0;
+      const sgy0 = sfy | 0;
+      if (sgx0 < 0 || sgy0 < 0 || sgx0 + 1 >= scarCols || sgy0 + 1 >= scarRows) {
+        return __scarOut;
+      }
+      const stx = sfx - sgx0;
+      const sty = sfy - sgy0;
+      const si00 = (sgx0 + sgy0 * scarCols) * 2;
+      const si10 = si00 + 2;
+      const si01 = si00 + scarCols * 2;
+      const si11 = si01 + 2;
+      const a00 = (1 - stx) * (1 - sty);
+      const a10 = stx * (1 - sty);
+      const a01 = (1 - stx) * sty;
+      const a11 = stx * sty;
+      __scarOut[0] = scarDispl[si00]     * a00 + scarDispl[si10]     * a10 +
+                     scarDispl[si01]     * a01 + scarDispl[si11]     * a11;
+      __scarOut[1] = scarDispl[si00 + 1] * a00 + scarDispl[si10 + 1] * a10 +
+                     scarDispl[si01 + 1] * a01 + scarDispl[si11 + 1] * a11;
+      return __scarOut;
+    }
+
+    function renderPaper() {
+      const palette = PALETTES[paletteIndex];
+      paperLayer.background(palette.surface);
+      paperLayer.noStroke();
+      paperLayer.randomSeed(4887);
+      const grainColor = color(palette.grain);
+      for (let i = 0; i < (width * height) / 46; i++) {
+        const x = paperLayer.random(width);
+        const y = paperLayer.random(height);
+        const a = paperLayer.random(5, 18);
+        const r = paperLayer.random(0.35, 1.6);
+        paperLayer.fill(red(grainColor), green(grainColor), blue(grainColor), a);
+        paperLayer.circle(x, y, r);
+      }
+      for (let y = 0; y < height; y += 3) {
+        const a = 4 + 3 * noise(y * 0.008, 17.3);
+        paperLayer.stroke(255, 248, 232, a);
+        paperLayer.line(0, y, width, y);
+      }
+    }
+
+    function renderScene() {
+      image(paperLayer, 0, 0);
+      renderPigmentField();
+      image(pigmentLayer, 0, 0);
+      if (combLayer) image(combLayer, 0, 0);
+      renderPressPreview();
+      renderDragCursor();
+    }
+
+    function renderPigmentField() {
+      // Early-out — when nothing has actually dirtied the field, skip
+      // the whole pipeline. Without this guard, consumeDirtyRects's
+      // empty-list fallback returns the FULL FIELD as a single rect,
+      // which then clears and re-evaluates all of pigmentLayer. That
+      // path runs every frame the comb sets dirty=true (since the
+      // comb deliberately doesn't markDirtyRect — its smudges live on
+      // combLayer). Skipping this preserves pigmentLayer when only
+      // the comb has signaled "please blit."
+      if (!fullFieldDirty && dirtyRects.length === 0) return;
+      const startedAt = performance.now();
+      const renderPools = activePress ? pools.concat([previewPoolFromPress(activePress)]) : pools;
+      const rects = consumeDirtyRects();
+      clearPigmentRects(rects);
+      evaluateField(renderPools, rects);
+
+      // R1 — direct pixel writes. The previous loop did pigmentLayer.fill()
+      // + .rect() per owned cell. In Canvas2D, every fillStyle change flushes
+      // the previous batch, so 30k cells = 30k flushes; that was the dominant
+      // cost driving the "laggy" feel. Now we loadPixels() once, write
+      // cellSize*cellSize blocks of bytes per cell into the typed array, and
+      // updatePixels() once at the end. About 5-10x faster on warm cache.
+      pigmentLayer.loadPixels();
+      const pix = pigmentLayer.pixels;
+      const layerW = pigmentLayer.width;
+      const layerH = pigmentLayer.height;
+      const cellSize = quality.cellSize;
+
+      for (const rect of rects) {
+        for (let gy = rect.y0; gy < rect.y1; gy++) {
+          for (let gx = rect.x0; gx < rect.x1; gx++) {
+            const cell = field[gx + gy * fieldCols];
+            if (!cell || cell.owner < 0) continue;
+            const pool = renderPools[cell.owner];
+            if (!pool) continue;
+            const second = cell.secondOwner >= 0 ? renderPools[cell.secondOwner] : null;
+            const neighborRim = hasDifferentNeighbor(gx, gy, cell.owner);
+            writePigmentCell(pix, layerW, layerH, cellSize, gx, gy, cell, pool, second, neighborRim);
+          }
+        }
+      }
+
+      pigmentLayer.updatePixels();
+
+      lastRenderMs = performance.now() - startedAt;
+      if (DEBUG_PERF) {
+        const cells = rects.reduce((sum, rect) => sum + rectArea(rect), 0);
+        console.log(`[metaballs] ${quality.name} ${quality.cellSize}px ${cells}/${fieldCols * fieldRows} cells ${renderPools.length} pools ${totalLobeCount(renderPools)} lobes ${lastRenderMs.toFixed(1)}ms`);
+      }
+    }
+
+    // Metaball field evaluation: child lobes inside a pool sum their smooth
+    // influence so a single pigment identity merges organically. We deliberately
+    // evaluate each pool separately instead of one global field. R2 also tracks
+    // the runner-up owner so the renderer can blend pigment colors at seams.
+    function evaluateField(renderPools, rects) {
+      const cellSize = quality.cellSize;
+      for (const rect of rects) {
+        const candidates = poolsForRect(renderPools, rect);
+        for (let gy = rect.y0; gy < rect.y1; gy++) {
+          const y = gy * cellSize + cellSize * 0.5;
+          for (let gx = rect.x0; gx < rect.x1; gx++) {
+            const x = gx * cellSize + cellSize * 0.5;
+            let best = -1;
+            let bestField = 0;
+            let bestAge = -1;
+            let second = -1;
+            let secondField = 0;
+            for (const i of candidates) {
+              const pool = renderPools[i];
+              if (!pool.containsPoint(x, y)) continue;
+              const f = pool.fieldAt(x, y);
+              // Ownership/clipping strategy: each cell can have exactly one owner.
+              // Strongest normalized pool field wins above threshold; near-ties go
+              // to the newer pool, making fresh pigment read as sitting on top while
+              // preventing different pigment identities from summing into one blob.
+              const newerTie = Math.abs(f - bestField) < 0.045 && pool.createdAt > bestAge;
+              if (f > bestField || (f > FIELD_THRESHOLD && newerTie)) {
+                second = best;
+                secondField = bestField;
+                best = i;
+                bestField = f;
+                bestAge = pool.createdAt;
+              } else if (f > secondField) {
+                second = i;
+                secondField = f;
+              }
+            }
+            const idx = gx + gy * fieldCols;
+            field[idx] = bestField >= FIELD_THRESHOLD
+              ? { owner: best, secondOwner: second, strength: bestField, margin: bestField - secondField }
+              : { owner: -1, secondOwner: -1, strength: bestField, margin: 0 };
+          }
+        }
+      }
+    }
+
+    function hasDifferentNeighbor(gx, gy, owner) {
+      const checks = [[1,0],[-1,0],[0,1],[0,-1]];
+      for (const [dx, dy] of checks) {
+        const nx = gx + dx;
+        const ny = gy + dy;
+        if (nx < 0 || ny < 0 || nx >= fieldCols || ny >= fieldRows) return true;
+        const n = field[nx + ny * fieldCols];
+        if (!n || n.owner !== owner) return true;
+      }
+      return false;
+    }
+
+    // Contour/rim/seam rendering with per-pixel bilinear strength sampling.
+    //
+    // The baseline writePigmentCell stamps one solid color across the whole
+    // cellSize×cellSize block — that's the source of the visible "pixelation"
+    // because rim alpha and rim-darken step at every cell boundary. Here we
+    // bilinearly interpolate the field strength across the block using the
+    // current cell's strength plus three neighbors (right, down, diagonal),
+    // then recompute edgeT / alpha / rim / wash / inner-tint / seam-blend per
+    // pixel. The metaball field is already smooth; this just recovers the
+    // smoothness in the *sampling*.
+    //
+    // Neighbor handling — three cases:
+    //   1. Neighbor shares owner with us → use its strength. Smooth interior
+    //      gradient across cell boundaries; no visible cell line.
+    //   2. Neighbor is unowned (cell.owner < 0) → use its strength too. Its
+    //      strength is bestField at that cell (below threshold). Bilerp
+    //      across our rim → some sub-pixel positions fall below threshold →
+    //      go transparent → smooth alpha fadeout against paper.
+    //   3. Neighbor owned by a DIFFERENT pool → fall back to our s00. Flat
+    //      bilerp on that side preserves the ownership-clipping behaviour
+    //      (sharp seam line); the two-pigment seam blend, applied per pixel
+    //      below, supplies the muddy band that softens the color jump.
+    function writePigmentCell(pix, layerW, layerH, cellSize, gx, gy, cell, pool, second, neighborRim) {
+      const x0 = gx * cellSize;
+      const y0 = gy * cellSize;
+      const cx = x0 + cellSize * 0.5;
+      const cy = y0 + cellSize * 0.5;
+      const n = stableNoise(gx, gy, pool.seed);
+      const noiseShift = (n - 0.5) * 10;
+      const owner = cell.owner;
+
+      const s00 = cell.strength;
+      const right = (gx + 1 < fieldCols) ? field[(gx + 1) + gy * fieldCols] : null;
+      const down = (gy + 1 < fieldRows) ? field[gx + (gy + 1) * fieldCols] : null;
+      const diag = (gx + 1 < fieldCols && gy + 1 < fieldRows)
+        ? field[(gx + 1) + (gy + 1) * fieldCols] : null;
+      const s10 = neighborStrength(right, owner, s00);
+      const s01 = neighborStrength(down, owner, s00);
+      const s11 = neighborStrength(diag, owner, s00);
+
+      // Inner sub-metaball tint sampled once per cell. Per-pixel sampling
+      // would multiply the lobe sums for every pixel; the inner field is
+      // intentionally coarse and slowly-varying so cell-center sampling
+      // here is good enough.
+      const innerField = pool.innerFieldAt(cx, cy);
+      const seamMargin = cell.margin;
+      const inv = cellSize > 0 ? 1 / cellSize : 0;
+
+      for (let py = 0; py < cellSize; py++) {
+        const yy = y0 + py;
+        if (yy < 0 || yy >= layerH) continue;
+        const v = (py + 0.5) * inv;
+        const sLeft = s00 * (1 - v) + s01 * v;
+        const sRight = s10 * (1 - v) + s11 * v;
+        let off = (yy * layerW + x0) * 4;
+        for (let px = 0; px < cellSize; px++) {
+          const xx = x0 + px;
+          if (xx < 0 || xx >= layerW) {
+            off += 4;
+            continue;
+          }
+          const u = (px + 0.5) * inv;
+          const strength = sLeft * (1 - u) + sRight * u;
+
+          if (strength < FIELD_THRESHOLD - FIELD_FADE_BAND) {
+            // Sub-pixel deep outside the pool — alpha 0, paper shows through.
+            off += 4;
+            continue;
+          }
+
+          if (strength < FIELD_THRESHOLD) {
+            // Soft-fade zone *outside* the iso-contour: alpha ramps 0 → 82
+            // in the rim color, so the pool's edge against paper antialias-
+            // es smoothly instead of cliffing at one pixel. Inner field
+            // tint and seam blend are intentionally skipped here — this
+            // sliver is just the contour's anti-aliasing.
+            const fadeT = (strength - (FIELD_THRESHOLD - FIELD_FADE_BAND)) / FIELD_FADE_BAND;
+            const a = (82 * fadeT) | 0;
+            if (a > 0) {
+              const rc = pool.rgb.rim;
+              pix[off]     = clampByte(rc.r + noiseShift);
+              pix[off + 1] = clampByte(rc.g + noiseShift);
+              pix[off + 2] = clampByte(rc.b + noiseShift);
+              pix[off + 3] = a;
+            }
+            off += 4;
+            continue;
+          }
+
+          const edgeT = (strength - FIELD_THRESHOLD) / FIELD_RIM_BAND;
+          const edgeTc = edgeT < 0 ? 0 : edgeT > 1 ? 1 : edgeT;
+          const alphaBase = 82 + 72 * edgeTc;
+          const rimT = neighborRim ? 0.72 : (1 - edgeTc) * 0.62;
+          const washT = (strength - 1.5) / 3.2;
+          const washTc = washT < 0 ? 0 : washT > 0.48 ? 0.48 : washT;
+          const washed = mixRgb(pool.rgb.base, pool.rgb.wash, washTc);
+          let c = mixRgb(washed, pool.rgb.rim, rimT);
+
+          if (innerField !== 0) {
+            const interiorT = 1 - edgeTc;
+            const tintMag = Math.min(1, Math.abs(innerField)) * INNER_TINT_STRENGTH * interiorT;
+            if (tintMag > 0.005) {
+              const tintColor = innerField > 0 ? pool.rgb.wash : pool.rgb.rim;
+              c = mixRgb(c, tintColor, tintMag);
+            }
+          }
+
+          if (second && seamMargin >= 0) {
+            const seamT = (1 - smoothstep(0, SEAM_BAND, seamMargin)) * SEAM_BLEND_MAX;
+            if (seamT > 0.001) {
+              const partner = mixRgb(second.rgb.base, second.rgb.wash, washTc);
+              c = mixRgb(c, partner, seamT);
+            }
+          }
+
+          const r = clampByte(c.r + noiseShift);
+          const g = clampByte(c.g + noiseShift);
+          const b = clampByte(c.b + noiseShift);
+          const a = neighborRim ? 166 : (alphaBase | 0);
+          pix[off]     = r;
+          pix[off + 1] = g;
+          pix[off + 2] = b;
+          pix[off + 3] = a;
+          off += 4;
+        }
+      }
+    }
+
+    function neighborStrength(neighbor, owner, fallback) {
+      if (!neighbor) return fallback;
+      // Same owner: smooth interior. Unowned (-1): smooth rim fadeout to
+      // paper. Different owner: keep ownership-seam sharp by clamping flat.
+      if (neighbor.owner === owner || neighbor.owner < 0) return neighbor.strength;
+      return fallback;
+    }
+
+    function clampByte(v) {
+      return v < 0 ? 0 : v > 255 ? 255 : v | 0;
+    }
+
+    function smoothstep(edge0, edge1, x) {
+      const t = (edge1 === edge0) ? 0 : (x - edge0) / (edge1 - edge0);
+      const ct = t < 0 ? 0 : t > 1 ? 1 : t;
+      return ct * ct * (3 - 2 * ct);
+    }
+
+    function chooseInitialQuality() {
+      const viewportCellsAtHigh = Math.ceil(width / QUALITY_TIERS[0].cellSize) * Math.ceil(height / QUALITY_TIERS[0].cellSize);
+      const mobileHint = window.matchMedia && window.matchMedia('(pointer: coarse)').matches;
+      qualityIndex = mobileHint || viewportCellsAtHigh > 90000 ? 1 : 0;
+      quality = QUALITY_TIERS[qualityIndex];
+    }
+
+    function adaptQuality(interacting) {
+      if (fullFieldDirty && dirtyRects.length === 0) return;
+      // Interactive-tool quality lock — while the user is actively driving
+      // a session, the adaptor's "average frame is slow → drop a tier"
+      // policy is exactly wrong: the tools (especially comb) need fine
+      // cells to render visible sub-tine carving, and a few slow frames
+      // during a stroke shouldn't trade away resolution that's load-
+      // bearing for the tool's legibility. Reset streaks and return so
+      // the pool quality stays wherever it was when the session began.
+      if (rakeSession || combSession || dragSession || activePress) {
+        slowFrameStreak = 0;
+        fastFrameStreak = 0;
+        return;
+      }
+      const totalLobes = totalLobeCount(pools);
+      const crowded = pools.length > 14 || totalLobes > 92;
+      const slow = lastRenderMs > quality.slowMs || (interacting && crowded && qualityIndex === 0);
+      const fast = settled && lastRenderMs > 0 && lastRenderMs < quality.fastMs && pools.length < 12 && totalLobes < 70;
+
+      slowFrameStreak = slow ? slowFrameStreak + 1 : 0;
+      fastFrameStreak = fast ? fastFrameStreak + 1 : 0;
+
+      if (slowFrameStreak >= 3 && qualityIndex < QUALITY_TIERS.length - 1) {
+        setQuality(qualityIndex + 1);
+        slowFrameStreak = 0;
+        fastFrameStreak = 0;
+      } else if (fastFrameStreak >= 90 && qualityIndex > 0) {
+        setQuality(qualityIndex - 1);
+        slowFrameStreak = 0;
+        fastFrameStreak = 0;
+      }
+    }
+
+    function setQuality(nextIndex) {
+      if (nextIndex === qualityIndex) return;
+      qualityIndex = nextIndex;
+      quality = QUALITY_TIERS[qualityIndex];
+      fieldCols = Math.ceil(width / quality.cellSize);
+      fieldRows = Math.ceil(height / quality.cellSize);
+      field = new Array(fieldCols * fieldRows);
+      for (const pool of pools) pool.updateGeometry();
+      if (activePress) lastPreviewRect = null;
+      markFullFieldDirty();
+    }
+
+    function markFullFieldDirty() {
+      fullFieldDirty = true;
+      dirtyRects = [];
+      dirty = true;
+    }
+
+    function markDirtyRect(rect) {
+      if (!rect || fullFieldDirty) {
+        dirty = true;
+        return;
+      }
+      const clamped = clampRect(expandRect(rect, DIRTY_PADDING_CELLS));
+      if (!clamped) return;
+      dirtyRects.push(clamped);
+      dirty = true;
+    }
+
+    function consumeDirtyRects() {
+      if (fullFieldDirty || dirtyRects.length === 0) {
+        fullFieldDirty = false;
+        dirtyRects = [];
+        return [{ x0: 0, y0: 0, x1: fieldCols, y1: fieldRows }];
+      }
+      const rect = dirtyRects.reduce((merged, next) => unionRects(merged, next));
+      dirtyRects = [];
+      const coverage = rectArea(rect) / Math.max(1, fieldCols * fieldRows);
+      if (coverage > FULL_REDRAW_COVERAGE) {
+        return [{ x0: 0, y0: 0, x1: fieldCols, y1: fieldRows }];
+      }
+      return [rect];
+    }
+
+    function clearPigmentRects(rects) {
+      const cellSize = quality.cellSize;
+      for (const rect of rects) {
+        const px = rect.x0 * cellSize;
+        const py = rect.y0 * cellSize;
+        const pw = (rect.x1 - rect.x0) * cellSize + cellSize;
+        const ph = (rect.y1 - rect.y0) * cellSize + cellSize;
+        pigmentLayer.drawingContext.clearRect(px, py, pw, ph);
+      }
+    }
+
+    function poolsForRect(renderPools, rect) {
+      const candidates = [];
+      for (let i = 0; i < renderPools.length; i++) {
+        const pool = renderPools[i];
+        if (pool.fieldRect && rectsOverlap(pool.fieldRect, rect)) candidates.push(i);
+      }
+      return candidates;
+    }
+
+    function markActivePreviewDirty() {
+      if (!activePress) {
+        lastPreviewRect = null;
+        return;
+      }
+      // Drive mid-press preview displacement on every frame the press is
+      // active. Cheap (per-pool, per-lobe) and keeps the lerp targets
+      // current as the user holds longer.
+      applyPreviewDisplacement();
+      const preview = previewPoolFromPress(activePress);
+      if (lastPreviewRect) markDirtyRect(lastPreviewRect);
+      markDirtyRect(preview.fieldRect);
+      lastPreviewRect = preview.fieldRect;
+    }
+
+    function unionRects(a, b) {
+      return {
+        x0: Math.min(a.x0, b.x0),
+        y0: Math.min(a.y0, b.y0),
+        x1: Math.max(a.x1, b.x1),
+        y1: Math.max(a.y1, b.y1)
+      };
+    }
+
+    function expandRect(rect, cells) {
+      return { x0: rect.x0 - cells, y0: rect.y0 - cells, x1: rect.x1 + cells, y1: rect.y1 + cells };
+    }
+
+    function clampRect(rect) {
+      const clamped = {
+        x0: constrain(floor(rect.x0), 0, fieldCols),
+        y0: constrain(floor(rect.y0), 0, fieldRows),
+        x1: constrain(ceil(rect.x1), 0, fieldCols),
+        y1: constrain(ceil(rect.y1), 0, fieldRows)
+      };
+      if (clamped.x1 <= clamped.x0 || clamped.y1 <= clamped.y0) return null;
+      return clamped;
+    }
+
+    function rectsOverlap(a, b) {
+      return a.x0 < b.x1 && a.x1 > b.x0 && a.y0 < b.y1 && a.y1 > b.y0;
+    }
+
+    function rectArea(rect) {
+      return Math.max(0, rect.x1 - rect.x0) * Math.max(0, rect.y1 - rect.y0);
+    }
+
+    function totalLobeCount(list) {
+      return list.reduce((sum, pool) => sum + pool.lobes.length, 0);
+    }
+
+    function parseHexRgb(hex) {
+      const raw = hex.replace('#', '');
+      return {
+        r: parseInt(raw.slice(0, 2), 16),
+        g: parseInt(raw.slice(2, 4), 16),
+        b: parseInt(raw.slice(4, 6), 16)
+      };
+    }
+
+    function mixRgb(a, b, t) {
+      return {
+        r: a.r + (b.r - a.r) * t,
+        g: a.g + (b.g - a.g) * t,
+        b: a.b + (b.b - a.b) * t
+      };
+    }
+
+    function renderPressPreview() {
+      if (!activePress) return;
+      const held = millis() - activePress.startedAt;
+      const t = holdToUnit(held);
+      noFill();
+      stroke(35, 25, 18, 34 + 28 * t);
+      strokeWeight(1);
+      const r = sqrt(holdToMass(held) / PI) * 1.15;
+      circle(activePress.x, activePress.y, r * 2);
+      stroke(255, 250, 238, 60);
+      circle(activePress.x, activePress.y, max(8, r * 0.6));
+    }
+
+    function startPress(x, y) {
+      const corner = handleCornerActionStart(x, y);
+      if (corner) return;
+      if (toolMode === 'drag') {
+        startDragSession(x, y);
+        return;
+      }
+      if (toolMode === 'rake') {
+        startRakeSession(x, y);
+        return;
+      }
+      if (toolMode === 'comb') {
+        startCombSession(x, y);
+        return;
+      }
+      activePress = {
+        x: constrain(x, 0, width),
+        y: constrain(y, 0, height),
+        startedAt: millis(),
+        color: choosePigment(),
+        seed: random(1000000)
+      };
+      lastPreviewRect = null;
+      markActivePreviewDirty();
+    }
+
+    function endPress() {
+      if (dragSession) {
+        dragSession = null;
+        dirty = true;
+        return;
+      }
+      if (rakeSession) {
+        rakeSession = null;
+        dirty = true;
+        return;
+      }
+      if (combSession) {
+        combSession = null;
+        dirty = true;
+        return;
+      }
+      if (!activePress) return;
+      const held = millis() - activePress.startedAt;
+      const pool = createPool(activePress.x, activePress.y, held, activePress.color, activePress.seed, false);
+      // Clear preview push first so applyDisplacement adds onto a clean
+      // committed target. Otherwise the preview push would get baked in
+      // *and* applyDisplacement would re-add it.
+      clearPreviewDisplacement();
+      // D1 — push surrounding pools out of the way before adding the new one
+      // to the list, so applyDisplacement only walks pre-existing pools.
+      applyDisplacement(pool);
+      pools.push(pool);
+      // Snap-init contact pressure for everyone now that the new pool exists,
+      // so deformation toward (and from) the new pool is visible immediately
+      // instead of lerping in over ~30 frames.
+      for (const p of pools) {
+        p.settled = false;
+        if (typeof p.refreshContactPressure === 'function') p.refreshContactPressure(true);
+      }
+      if (lastPreviewRect) markDirtyRect(lastPreviewRect);
+      markDirtyRect(pool.fieldRect);
+      lastPreviewRect = null;
+      activePress = null;
+    }
+
+    // Drag tool — pool translation. On press, find the topmost pool whose
+    // footprint contains the cursor; subsequent moves shift that pool's
+    // center by the same delta. Whole-pool motion: no per-lobe deformation,
+    // but the resulting change in pool-center distances drives neighbors'
+    // contact-pressure (and therefore their boundary asymmetry) live as the
+    // pool slides past them.
+    function startDragSession(x, y) {
+      let captured = null;
+      let topCreated = -Infinity;
+      for (const pool of pools) {
+        if (pool.preview) continue;
+        let inside = false;
+        // (a) Inside any lobe's grab disk → strong hit on visible shape.
+        for (const sl of pool.sampleLobes) {
+          const dx = x - sl.x;
+          const dy = y - sl.y;
+          const reach = sl.radius * DRAG_GRAB_LOBE_FACTOR + DRAG_GRAB_BUFFER_PX;
+          if (dx * dx + dy * dy <= reach * reach) { inside = true; break; }
+        }
+        // (b) Fallback: inside the pool's pixel bounding box. Forgives clicks
+        // that land between visible lobes but clearly inside the pool's body.
+        if (!inside) {
+          const pb = pool.pixelBounds;
+          if (pb && x >= pb.x0 && x <= pb.x1 && y >= pb.y0 && y <= pb.y1) {
+            inside = true;
+          }
+        }
+        // (c) Last-resort: within an idealized disk around the center. Covers
+        // newborn pools whose lobes haven't grown out yet.
+        if (!inside) {
+          const dx = pool.center.x - x;
+          const dy = pool.center.y - y;
+          const baseR = Math.sqrt(pool.targetMass / Math.PI);
+          const ideal = baseR * 1.4 + DRAG_GRAB_BUFFER_PX;
+          if (dx * dx + dy * dy <= ideal * ideal) inside = true;
+        }
+        if (!inside) continue;
+        if (pool.createdAt > topCreated) {
+          captured = pool;
+          topCreated = pool.createdAt;
+        }
+      }
+      if (!captured) return; // empty click; no session
+      dragSession = {
+        x: constrain(x, 0, width),
+        y: constrain(y, 0, height),
+        pool: captured,
+        startedAt: millis()
+      };
+      dirty = true;
+    }
+
+    function updateDragSession(x, y) {
+      if (!dragSession) return;
+      const cx = constrain(x, 0, width);
+      const cy = constrain(y, 0, height);
+      const dx = cx - dragSession.x;
+      const dy = cy - dragSession.y;
+      if (dx * dx + dy * dy < 0.04) return;
+      applyDragTranslate(dragSession.pool, dx, dy);
+      dragSession.x = cx;
+      dragSession.y = cy;
+    }
+
+    function applyDragTranslate(pool, dx, dy) {
+      const prevRect = pool.fieldRect;
+      pool.center.x = constrain(pool.center.x + dx, 0, width);
+      pool.center.y = constrain(pool.center.y + dy, 0, height);
+      pool.settled = false;
+      pool.updateGeometry();
+      if (prevRect) markDirtyRect(prevRect);
+      markDirtyRect(pool.fieldRect);
+      // Center moved → contact relationships with every other pool may have
+      // changed. Wake everyone so their contactT lerps catch up.
+      for (const p of pools) {
+        if (p === pool) continue;
+        p.settled = false;
+      }
+      dirty = true;
+    }
+
+    // Rake tool — non-pigment-dropping per-lobe advection. Records the
+    // cursor between moves and applies a velocity-aligned impulse to nearby
+    // lobes. The impulse decays smoothly with distance and is capped per-lobe
+    // so a long stroke can't fling a lobe off the canvas.
+    function startRakeSession(x, y) {
+      const now = millis();
+      rakeSession = {
+        x: constrain(x, 0, width),
+        y: constrain(y, 0, height),
+        startedAt: now,
+        // For time-on-contact integration. Updated each applyRakeImpulse
+        // call so the first impulse after a pause doesn't accumulate the
+        // whole pause duration (RAKE_MAX_DT also clamps that).
+        lastImpulseAt: now
+      };
+      dirty = true;
+    }
+
+    function updateRakeSession(x, y) {
+      if (!rakeSession) return;
+      const cx = constrain(x, 0, width);
+      const cy = constrain(y, 0, height);
+      const dx = cx - rakeSession.x;
+      const dy = cy - rakeSession.y;
+      // Skip sub-pixel jitter so still-cursor doesn't accumulate noise.
+      if (dx * dx + dy * dy < 0.25) {
+        rakeSession.x = cx;
+        rakeSession.y = cy;
+        return;
+      }
+      applyRakeImpulse(cx, cy, dx, dy);
+      rakeSession.x = cx;
+      rakeSession.y = cy;
+    }
+
+    function applyRakeImpulse(x, y, vx, vy) {
+      if (!rakeSession) return;
+      const radius = RAKE_RADIUS;
+      const radius2 = radius * radius;
+      const maxOffset2 = MAX_RAKE_DISPLACEMENT * MAX_RAKE_DISPLACEMENT;
+      // Normalize the per-frame motion to a unit stroke direction. The
+      // magnitude of (vx, vy) no longer participates in the impulse — it
+      // only tells us *which way* the user is dragging. Net displacement
+      // comes from how long a lobe stays inside the kernel, not how fast
+      // the cursor crossed it.
+      const speed = Math.hypot(vx, vy);
+      if (speed < 0.01) return;
+      const dirX = vx / speed;
+      const dirY = vy / speed;
+      // Perpendicular shear axis (90° CCW from stroke direction).
+      const perpX = -dirY;
+      const perpY = dirX;
+      // Time on contact — clamp dt so a paused-then-resumed stroke (or
+      // a frame skipped by the browser) doesn't dump a huge accumulated
+      // delta on the first frame back.
+      const now = millis();
+      const dt = Math.min(RAKE_MAX_DT, (now - rakeSession.lastImpulseAt) / 1000);
+      rakeSession.lastImpulseAt = now;
+      const pushBase = RAKE_PUSH_PER_SECOND * dt;
+      const perpBase = pushBase * RAKE_PERP_FRACTION;
+      let touchedAny = false;
+      for (const pool of pools) {
+        if (pool.preview) continue;
+        let touched = false;
+        for (const lobe of pool.lobes) {
+          const lx = pool.center.x + Math.cos(lobe.angle) * lobe.offsetNow + lobe.displaceX;
+          const ly = pool.center.y + Math.sin(lobe.angle) * lobe.offsetNow + lobe.displaceY;
+          const rx = lx - x;
+          const ry = ly - y;
+          const r2 = rx * rx + ry * ry;
+          if (r2 > radius2) continue;
+          const r = Math.sqrt(r2);
+          // Smooth power falloff: 1 at the cursor, 0 at the edge of radius.
+          const f = Math.pow(1 - r / radius, RAKE_FALLOFF_POWER);
+          const push = pushBase * f;
+          lobe.displaceTargetX += dirX * push;
+          lobe.displaceTargetY += dirY * push;
+          // Perpendicular shear: signed by which side of the stroke axis
+          // the lobe sits on. `side` is the projection of (rx, ry) onto
+          // the perp axis, normalized by the kernel radius so it lives
+          // in [-1, 1] regardless of cursor speed. Lobes near the
+          // stroke center get ~0 perp; off-axis lobes get a tangential
+          // nudge — this is what produces the slight swirl at stroke
+          // ends rather than a pure straight tug.
+          const side = (rx * perpX + ry * perpY) / radius;
+          const sk = perpBase * f * side;
+          lobe.displaceTargetX += perpX * sk;
+          lobe.displaceTargetY += perpY * sk;
+          const dist2 = lobe.displaceTargetX * lobe.displaceTargetX +
+                        lobe.displaceTargetY * lobe.displaceTargetY;
+          if (dist2 > maxOffset2) {
+            const scale = MAX_RAKE_DISPLACEMENT / Math.sqrt(dist2);
+            lobe.displaceTargetX *= scale;
+            lobe.displaceTargetY *= scale;
+          }
+          touched = true;
+        }
+        if (touched) {
+          pool.settled = false;
+          pool.updateGeometry();
+          markDirtyRect(pool.fieldRect);
+          touchedAny = true;
+        }
+      }
+      if (touchedAny) dirty = true;
+    }
+
+    // Comb tool — multi-tine striations. Tines sit along a line perpendicular
+    // to the stroke direction; each tine applies a small forward impulse to
+    // lobes within its narrow radius. Pigment between tines is undisturbed,
+    // so a stroke leaves N parallel furrows. The classic marbling combs that
+    // produce peacock, nonpareil, and get-gel patterns work exactly this way
+    // — many tines pulled through a layer of pigment in a single direction.
+    function startCombSession(x, y) {
+      combSession = {
+        x: constrain(x, 0, width),
+        y: constrain(y, 0, height),
+        // Default orientation until the user moves: tines along x-axis, so
+        // the (invisible) comb bar runs horizontally and is held vertically.
+        dirX: 1,
+        dirY: 0,
+        startedAt: millis()
+      };
+      dirty = true;
+    }
+
+    function updateCombSession(x, y) {
+      if (!combSession) return;
+      const cx = constrain(x, 0, width);
+      const cy = constrain(y, 0, height);
+      const dx = cx - combSession.x;
+      const dy = cy - combSession.y;
+      if (dx * dx + dy * dy < 0.25) {
+        combSession.x = cx;
+        combSession.y = cy;
+        return;
+      }
+      const mag = Math.sqrt(dx * dx + dy * dy);
+      combSession.dirX = dx / mag;
+      combSession.dirY = dy / mag;
+      applyCombImpulse(cx, cy, dx, dy, combSession.dirX, combSession.dirY);
+      combSession.x = cx;
+      combSession.y = cy;
+    }
+
+    // Comb impulse — pixel-smudge along each tine path. Writes to
+    // combLayer (a separate compositing layer) rather than pigmentLayer
+    // so the field re-eval can't wipe the marks. Two stamps per tine
+    // per step:
+    //   1. Pick-up — sample pigmentLayer at the tine's previous
+    //      position and deposit at the current position. This is what
+    //      makes color information get carried forward at all (combLayer
+    //      starts empty; without this pass, drawing combLayer onto
+    //      itself would have nothing to drag).
+    //   2. Propagate — draw combLayer onto itself, shifted by the
+    //      per-step motion. This drags whatever color has accumulated
+    //      in combLayer forward, so successive frames of the same
+    //      stroke build up a continuous trail rather than disconnected
+    //      stamps.
+    // Path subdivision keeps fast strokes from leaving gaps.
+    function applyCombImpulse(x, y, vx, vy, dirX, dirY) {
+      if (!combLayer || !pigmentLayer) return;
+      const perpX = -dirY;
+      const perpY = dirX;
+      const half = (COMB_TINE_COUNT - 1) / 2;
+      const tineR = COMB_TINE_RADIUS;
+      const motionLen = Math.sqrt(vx * vx + vy * vy);
+      const stepCount = Math.max(1, Math.ceil(motionLen / Math.max(0.5, COMB_SMUDGE_MAX_STEP)));
+      const stepVx = vx / stepCount;
+      const stepVy = vy / stepCount;
+      const startX = x - vx;
+      const startY = y - vy;
+      const ctx = combLayer.drawingContext;
+      const TWO_PI_LOCAL = Math.PI * 2;
+      const paper = PALETTES[paletteIndex].surface;
+      ctx.save();
+      for (let step = 1; step <= stepCount; step++) {
+        const sx = startX + stepVx * step;
+        const sy = startY + stepVy * step;
+        for (let i = 0; i < COMB_TINE_COUNT; i++) {
+          const offset = (i - half) * COMB_TINE_SPACING;
+          const tx = sx + perpX * offset;
+          const ty = sy + perpY * offset;
+          if (tx < -tineR || tx > width + tineR || ty < -tineR || ty > height + tineR) continue;
+          ctx.save();
+          ctx.beginPath();
+          ctx.arc(tx, ty, tineR, 0, TWO_PI_LOCAL);
+          ctx.clip();
+          // Stamp 1 — pick up pigment from pigmentLayer at the tine's
+          // previous position and deposit at the current position.
+          // drawImage(src, stepVx, stepVy) places src[0,0] at dest[stepVx,
+          // stepVy], which is equivalent to dest[x, y] := src[x-stepVx,
+          // y-stepVy]. Inside our clip at (tx, ty) that reads
+          // pigmentLayer at (tx-stepVx, ty-stepVy) = previous tine pos.
+          ctx.globalAlpha = COMB_SMUDGE_ALPHA;
+          ctx.drawImage(pigmentLayer.canvas, stepVx, stepVy);
+          // Stamp 2 — propagate any accumulated combLayer pigment
+          // forward. On the first frame of a stroke combLayer is empty
+          // here, so this is a no-op; on subsequent frames it carries
+          // the trail of the prior frames forward by one step.
+          ctx.globalAlpha = COMB_SMUDGE_ALPHA * 0.7;
+          ctx.drawImage(combLayer.canvas, stepVx, stepVy);
+          // Optional paper-color bleed — makes the tine path readable
+          // even when combing through a single-color region. Drawn
+          // last so it sits on top of the smudge in this tine disk.
+          if (COMB_PAPER_BLEED_ALPHA > 0) {
+            ctx.globalAlpha = COMB_PAPER_BLEED_ALPHA;
+            ctx.fillStyle = paper;
+            ctx.fillRect(tx - tineR, ty - tineR, tineR * 2, tineR * 2);
+          }
+          ctx.restore();
+        }
+      }
+      ctx.restore();
+      dirty = true;
+    }
+
+    // Legacy scar-impulse writer — retained as a no-op so nothing
+    // breaks if some other tool/test still calls it. The smudge-based
+    // comb (applyCombImpulse above) no longer needs scarDispl. Safe
+    // to delete entirely once the smudge approach is locked in.
+    function writeScarImpulse(_tx, _ty, _vx, _vy) {
+      return;
+    }
+
+    // Cursor affordances. Rake shows its influence radius (since that's the
+    // brush size the user is operating with). Drag shows a dashed outline
+    // around the grabbed pool so it's obvious which one is being moved.
+    // Comb shows the tine row + a connecting bar so the user can see the
+    // orientation of the comb relative to their stroke direction.
+    function renderDragCursor() {
+      if (rakeSession) {
+        noFill();
+        stroke(35, 25, 18, 110);
+        strokeWeight(1);
+        circle(rakeSession.x, rakeSession.y, RAKE_RADIUS * 2);
+        stroke(255, 250, 238, 80);
+        circle(rakeSession.x, rakeSession.y, RAKE_RADIUS * 0.6);
+      }
+      if (combSession) {
+        const perpX = -combSession.dirY;
+        const perpY = combSession.dirX;
+        const half = (COMB_TINE_COUNT - 1) / 2;
+        const halfBar = half * COMB_TINE_SPACING;
+        stroke(35, 25, 18, 90);
+        strokeWeight(1);
+        line(
+          combSession.x - perpX * halfBar, combSession.y - perpY * halfBar,
+          combSession.x + perpX * halfBar, combSession.y + perpY * halfBar
+        );
+        noFill();
+        stroke(35, 25, 18, 150);
+        for (let i = 0; i < COMB_TINE_COUNT; i++) {
+          const offset = (i - half) * COMB_TINE_SPACING;
+          const tx = combSession.x + perpX * offset;
+          const ty = combSession.y + perpY * offset;
+          circle(tx, ty, COMB_TINE_RADIUS * 2);
+        }
+      }
+      if (dragSession && dragSession.pool) {
+        const pool = dragSession.pool;
+        // Use pool.pixelBounds for the highlight rect — matches the actual
+        // grab zone (union of lobes) more honestly than a centered disk.
+        const pb = pool.pixelBounds;
+        if (pb) {
+          noFill();
+          stroke(35, 25, 18, 170);
+          strokeWeight(1.25);
+          drawingContext.setLineDash([6, 4]);
+          const w = pb.x1 - pb.x0;
+          const h = pb.y1 - pb.y0;
+          rect(pb.x0, pb.y0, w, h, 12);
+          drawingContext.setLineDash([]);
+        }
+      }
+    }
+
+    // D1 — incompressible-shell-style displacement of existing pools when a
+    // new pool is created. For each existing lobe at distance r from the new
+    // pool's center, push it outward by approximately R²/(2·max(r, R/2)),
+    // capped to DISPLACEMENT_MAX_PX. Lobes that fall *inside* the new pool's
+    // radius get an extra eject (DISPLACEMENT_INSIDE_BOOST × penetration) so
+    // they aren't rendered underneath the new pigment.
+    //
+    // D4 — also detects engulf/contact events and spawns a small number of
+    // satellite "fleck" lobes for the existing pool just outside the new
+    // pool's radius, in the eject direction. This is how real marbling
+    // shows pigment squeezed sideways when a new drop lands on it.
+    function applyDisplacement(newPool) {
+      const cx = newPool.center.x;
+      const cy = newPool.center.y;
+      const Rnew = Math.sqrt(newPool.targetMass / Math.PI);
+      const R2 = Rnew * Rnew;
+      for (const pool of pools) {
+        if (pool.preview) continue;
+        let touched = false;
+        let satellitesSpawnedThisEvent = 0;
+        const pendingSatellites = [];
+        // Satellite cap math: only count non-satellite lobes when computing
+        // remaining headroom, so satellites don't crowd out their own slot.
+        const existingSatelliteCount = pool.lobes.reduce(
+          (n, l) => n + (l.isSatellite ? 1 : 0), 0);
+        const satelliteRoom = Math.max(0,
+          MAX_SATELLITES_PER_POOL - existingSatelliteCount);
+
+        for (const lobe of pool.lobes) {
+          if (lobe.isSatellite) continue; // don't push satellites recursively
+          const lx = pool.center.x + Math.cos(lobe.angle) * lobe.offsetNow + lobe.displaceX;
+          const ly = pool.center.y + Math.sin(lobe.angle) * lobe.offsetNow + lobe.displaceY;
+          const dx = lx - cx;
+          const dy = ly - cy;
+          const d = Math.sqrt(dx * dx + dy * dy);
+          if (d < 0.5) continue;
+          const safeR = Math.max(d, Rnew * 0.5);
+          let push = R2 / (2 * safeR);
+          if (d < Rnew) push += (Rnew - d) * DISPLACEMENT_INSIDE_BOOST;
+          if (push < DISPLACEMENT_MIN_PX) continue;
+          if (push > DISPLACEMENT_MAX_PX) push = DISPLACEMENT_MAX_PX;
+          const ux = dx / d;
+          const uy = dy / d;
+          lobe.displaceTargetX += ux * push;
+          lobe.displaceTargetY += uy * push;
+          touched = true;
+
+          // D4 — satellite eject for lobes near or inside the new pool.
+          // Stop adding once we've hit per-event or per-pool caps.
+          if (satellitesSpawnedThisEvent < SATELLITES_PER_EVENT &&
+              satellitesSpawnedThisEvent < satelliteRoom &&
+              d < Rnew * SATELLITE_PROXIMITY_FACTOR) {
+            const ejectDist = Rnew + lobe.radius * 0.55 + random(8, 26);
+            const ejectX = cx + ux * ejectDist;
+            const ejectY = cy + uy * ejectDist;
+            const sxRel = ejectX - pool.center.x;
+            const syRel = ejectY - pool.center.y;
+            const sAngle = Math.atan2(syRel, sxRel);
+            const sOffset = Math.sqrt(sxRel * sxRel + syRel * syRel);
+            const sRadius = Math.max(4, lobe.radius * random(0.18, 0.34));
+            pendingSatellites.push({
+              angle: sAngle,
+              // Satellites bypass the roundness envelope (skipped in
+              // refreshContactPressure) but we keep these fields populated
+              // for shape consistency with regular lobes.
+              baseOffsetTarget: sOffset,
+              contactT: 0,
+              offsetTarget: sOffset,
+              offsetNow: sOffset,             // appears instantly
+              radius: sRadius,
+              targetRadius: sRadius,
+              growthVariation: 1.6,           // fast settle if anything bumps it
+              phase: random(1000),
+              displaceX: 0,
+              displaceY: 0,
+              displaceTargetX: 0,
+              displaceTargetY: 0,
+              previewPushX: 0,
+              previewPushY: 0,
+              isSatellite: true
+            });
+            satellitesSpawnedThisEvent++;
+          }
+        }
+        if (pendingSatellites.length) {
+          pool.lobes.push(...pendingSatellites);
+          touched = true;
+        }
+        if (touched) {
+          pool.settled = false;
+          pool.updateGeometry();
+          markDirtyRect(pool.fieldRect);
+        }
+      }
+    }
+
+    // Mid-press preview displacement. While a hold is active, compute the
+    // push that *would* be applied if the user released right now, and write
+    // it into each lobe's previewPushX/Y. The lerp in pool.update() uses
+    // (displaceTarget + previewPush) as its target, so preview shows up live.
+    // Called from markActivePreviewDirty each frame during a press.
+    function applyPreviewDisplacement() {
+      if (!activePress) return;
+      const held = millis() - activePress.startedAt;
+      const massPreview = holdToMass(held);
+      const Rnew = Math.sqrt(massPreview / Math.PI);
+      const R2 = Rnew * Rnew;
+      const cx = activePress.x;
+      const cy = activePress.y;
+      for (const pool of pools) {
+        if (pool.preview) continue;
+        let touched = false;
+        for (const lobe of pool.lobes) {
+          if (lobe.isSatellite) continue;
+          // Compute against the committed-target screen position so the
+          // preview math is stable while the lerp is mid-flight.
+          const lx = pool.center.x + Math.cos(lobe.angle) * lobe.offsetNow + lobe.displaceTargetX;
+          const ly = pool.center.y + Math.sin(lobe.angle) * lobe.offsetNow + lobe.displaceTargetY;
+          const dx = lx - cx;
+          const dy = ly - cy;
+          const d = Math.sqrt(dx * dx + dy * dy);
+          if (d < 0.5) {
+            lobe.previewPushX = 0;
+            lobe.previewPushY = 0;
+            continue;
+          }
+          const safeR = Math.max(d, Rnew * 0.5);
+          let push = R2 / (2 * safeR);
+          if (d < Rnew) push += (Rnew - d) * DISPLACEMENT_INSIDE_BOOST;
+          if (push > DISPLACEMENT_MAX_PX) push = DISPLACEMENT_MAX_PX;
+          push *= PREVIEW_DISPLACEMENT_FACTOR;
+          const ux = dx / d;
+          const uy = dy / d;
+          const newPx = ux * push;
+          const newPy = uy * push;
+          if (Math.abs(newPx - lobe.previewPushX) > 0.05 ||
+              Math.abs(newPy - lobe.previewPushY) > 0.05) {
+            lobe.previewPushX = newPx;
+            lobe.previewPushY = newPy;
+            touched = true;
+          }
+        }
+        if (touched) {
+          pool.settled = false;
+          markDirtyRect(pool.fieldRect);
+        }
+      }
+    }
+
+    // Press cancelled: zero out previewPush so the lerp returns to committed.
+    function clearPreviewDisplacement() {
+      for (const pool of pools) {
+        let touched = false;
+        for (const lobe of pool.lobes) {
+          if (lobe.previewPushX !== 0 || lobe.previewPushY !== 0) {
+            lobe.previewPushX = 0;
+            lobe.previewPushY = 0;
+            touched = true;
+          }
+        }
+        if (touched) {
+          pool.settled = false;
+          markDirtyRect(pool.fieldRect);
+        }
+      }
+    }
+
+    function handleCornerActionStart(x, y) {
+      if (isTopLeftAction(x, y)) {
+        nextPalette();
+        return true;
+      }
+      if (isTopRightAction(x, y)) {
+        startResetHold(x, y);
+        return true;
+      }
+      return false;
+    }
+
+    function isTopLeftAction(x, y) {
+      return x < CORNER_ACTION_SIZE && y < CORNER_ACTION_SIZE;
+    }
+
+    function isTopRightAction(x, y) {
+      return x > width - CORNER_ACTION_SIZE && y < CORNER_ACTION_SIZE;
+    }
+
+    function startResetHold(x, y) {
+      cancelResetHold();
+      pendingReset = {
+        x,
+        y,
+        completed: false,
+        timer: window.setTimeout(() => {
+          if (!pendingReset) return;
+          pendingReset.completed = true;
+          resetAll();
+        }, RESET_HOLD_MS)
+      };
+      dirty = true;
+    }
+
+    function cancelResetHold() {
+      if (!pendingReset) return;
+      window.clearTimeout(pendingReset.timer);
+      pendingReset = null;
+      dirty = true;
+    }
+
+    function updateCornerActionHold(x, y) {
+      if (pendingReset && !pendingReset.completed && !isTopRightAction(x, y)) {
+        cancelResetHold();
+      }
+    }
+
+    function finishCornerActionHold() {
+      if (pendingReset && !pendingReset.completed) {
+        cancelResetHold();
+        return true;
+      }
+      if (pendingReset && pendingReset.completed) {
+        pendingReset = null;
+        return true;
+      }
+      return false;
+    }
+
+    function handlePointerMove(x, y) {
+      updateCornerActionHold(x, y);
+      if (dragSession) updateDragSession(x, y);
+      if (rakeSession) updateRakeSession(x, y);
+      if (combSession) updateCombSession(x, y);
+    }
+
+    // Hold mapping: duration is clamped, eased, converted to target area/mass,
+    // then split across a performance-capped 3-8/9 child lobes. This makes quick taps visibly small
+    // while long holds create broader footprints with richer asymmetric edges.
+    function holdToUnit(ms) {
+      const clamped = constrain(ms, MIN_HOLD_MS, MAX_HOLD_MS);
+      const t = (clamped - MIN_HOLD_MS) / (MAX_HOLD_MS - MIN_HOLD_MS);
+      return t * t * (3 - 2 * t);
+    }
+
+    function holdToMass(ms) {
+      const minArea = 1600;
+      const maxArea = min(width * height * 0.105, 36000);
+      return lerp(minArea, maxArea, holdToUnit(ms));
+    }
+
+    function choosePigment() {
+      const palette = PALETTES[paletteIndex];
+      const idx = ((selectedPigmentIndex % palette.pigments.length) + palette.pigments.length) % palette.pigments.length;
+      return palette.pigments[idx];
+    }
+
+    function createPool(x, y, holdMs, pigment, seed, preview) {
+      const mass = holdToMass(holdMs);
+      const t = holdToUnit(holdMs);
+      const lowComplexity = pools.length < 8 && totalLobeCount(pools) < 46 && qualityIndex === 0;
+      const maxLobes = lowComplexity ? 9 : 8;
+      const lobeCount = floor(lerp(3, maxLobes + 0.99, t));
+      const id = preview ? -1 : poolId++;
+      return new PigmentPool(id, x, y, mass, lobeCount, pigment, seed, preview);
+    }
+
+    function previewPoolFromPress(press) {
+      const p = createPool(press.x, press.y, millis() - press.startedAt, press.color, press.seed, true);
+      p.currentMass = p.targetMass * 0.38;
+      for (const lobe of p.lobes) {
+        lobe.radius = lobe.targetRadius * 0.42;
+        lobe.offsetNow = lobe.offsetTarget * 0.45;
+      }
+      p.updateGeometry();
+      return p;
+    }
+
+    class PigmentPool {
+      constructor(id, x, y, mass, lobeCount, colorValue, seed, preview) {
+        this.id = id;
+        this.center = { x, y };
+        this.createdAt = preview ? millis() + 999999 : millis();
+        this.color = colorValue;
+        this.rgb = {
+          base: parseHexRgb(colorValue.base),
+          rim: parseHexRgb(colorValue.rim),
+          wash: parseHexRgb(colorValue.wash)
+        };
+        this.targetMass = mass;
+        this.currentMass = preview ? mass * 0.35 : 32;
+        this.growthRate = random(0.010, 0.018);
+        this.seed = seed;
+        this.settled = false;
+        this.preview = preview;
+        this.lobes = [];
+        this.innerLobes = []; // D2 — sub-metaballs for interior color modulation
+        this.sampleLobes = [];
+        this.pixelBounds = null;
+        this.fieldRect = null;
+        this.makeLobes(lobeCount);
+        this.makeInnerLobes();
+        this.updateGeometry();
+      }
+
+      makeLobes(count) {
+        randomSeed(floor(this.seed));
+        const baseRadius = sqrt(this.targetMass / PI);
+        let weights = [];
+        let total = 0;
+        for (let i = 0; i < count; i++) {
+          const w = random(0.65, 1.35);
+          weights.push(w);
+          total += w;
+        }
+        for (let i = 0; i < count; i++) {
+          // Tighter angular jitter so isolated pools start with a clean
+          // disk-like ring of lobes rather than a lumpy ring.
+          const angle = (TWO_PI * i / count) + random(-0.32, 0.32);
+          // Slightly tighter base radial spread; the roundness envelope below
+          // will scale this further toward 0 for solitary pools.
+          const baseOffset = i === 0 ? 0 : random(baseRadius * 0.14, baseRadius * 0.58);
+          const lobeMass = this.targetMass * weights[i] / total * random(0.92, 1.14);
+          const targetRadius = sqrt(lobeMass / PI) * random(1.55, 2.12);
+          this.lobes.push({
+            angle,
+            // Roundness envelope: baseOffsetTarget is the *full-asymmetry*
+            // angular displacement assigned at creation. Effective
+            // offsetTarget = baseOffsetTarget * (BASE_ROUNDNESS +
+            // (1-BASE_ROUNDNESS) * contactT) and is recomputed each frame in
+            // refreshContactPressure(). Solitary pools sit near
+            // BASE_ROUNDNESS so they read as soft disks; pools whose lobes
+            // face a neighbor pull out toward full asymmetry along the
+            // contact axis.
+            baseOffsetTarget: baseOffset,
+            contactT: 0,
+            offsetTarget: baseOffset * BASE_ROUNDNESS,
+            offsetNow: 0,
+            radius: 2 + random(0, 2),
+            targetRadius,
+            growthVariation: random(0.72, 1.22),
+            phase: random(1000),
+            // D1 — displacement state. displaceX/Y is the live position offset
+            // in screen coords; displaceTargetX/Y is the *committed* target.
+            // previewPushX/Y is a transient push from the in-progress press
+            // (added on top of displaceTargetX during the lerp); cleared on
+            // commit (folded into displaceTargetX) or on cancel.
+            displaceX: 0,
+            displaceY: 0,
+            displaceTargetX: 0,
+            displaceTargetY: 0,
+            previewPushX: 0,
+            previewPushY: 0,
+            isSatellite: false
+          });
+        }
+        this.deformScalar = 0;
+      }
+
+      // D2 — generate interior sub-metaballs. Their offsets are sampled inside
+      // the pool's effective radius; their `intensity` (∈ [-1, 1]) encodes
+      // which way they tint pigment (negative → toward rim, positive → toward
+      // wash). Stored in pool-local coords; renderer transforms to screen.
+      makeInnerLobes() {
+        randomSeed(floor(this.seed) ^ 0x5a17);
+        const baseRadius = sqrt(this.targetMass / PI);
+        const count = floor(lerp(INNER_LOBE_MIN, INNER_LOBE_MAX + 0.99,
+          constrain(this.targetMass / 18000, 0, 1)));
+        for (let i = 0; i < count; i++) {
+          const angle = random(0, TWO_PI);
+          const offset = random(0, baseRadius * 0.62);
+          this.innerLobes.push({
+            dx: cos(angle) * offset,
+            dy: sin(angle) * offset,
+            radius: random(baseRadius * 0.18, baseRadius * 0.42),
+            intensity: random(-0.95, 0.95)
+          });
+        }
+      }
+
+      // Roundness envelope. For each non-satellite lobe, scan other pools and
+      // record the maximum (alignment * proximity) — alignment is the dot of
+      // the lobe's outward unit vector with the unit vector toward the
+      // neighbor's center; proximity is 1 at touching, 0 at the engagement
+      // range edge. The result is a 0..1 contactT per lobe, smoothed with
+      // CONTACT_LERP unless forceInit is true (used on creation/commit so the
+      // new pool's deformation is visible immediately). Sets this.deformScalar
+      // = max contactT, used by fieldAt to scale radial/tendril warp.
+      refreshContactPressure(forceInit) {
+        if (this.preview) return;
+        const myR = Math.sqrt(this.targetMass / Math.PI);
+        let maxContact = 0;
+        for (const lobe of this.lobes) {
+          if (lobe.isSatellite) continue;
+          if (!lobe.baseOffsetTarget && lobe.baseOffsetTarget !== 0) {
+            lobe.baseOffsetTarget = lobe.offsetTarget;
+          }
+          const lx = Math.cos(lobe.angle);
+          const ly = Math.sin(lobe.angle);
+          let pressure = 0;
+          for (const other of pools) {
+            if (other === this || other.preview) continue;
+            const dx = other.center.x - this.center.x;
+            const dy = other.center.y - this.center.y;
+            const d = Math.sqrt(dx * dx + dy * dy);
+            if (d < 0.5) continue;
+            const otherR = Math.sqrt(other.targetMass / Math.PI);
+            const range = (myR + otherR) * CONTACT_RANGE_FACTOR;
+            if (d > range) continue;
+            const ux = dx / d;
+            const uy = dy / d;
+            const align = lx * ux + ly * uy;
+            if (align <= 0) continue;
+            const proximity = 1 - d / range;
+            const p = align * proximity;
+            if (p > pressure) pressure = p;
+          }
+          if (forceInit) {
+            lobe.contactT = pressure;
+          } else {
+            lobe.contactT += (pressure - lobe.contactT) * CONTACT_LERP;
+          }
+          lobe.offsetTarget = lobe.baseOffsetTarget *
+            (BASE_ROUNDNESS + (1 - BASE_ROUNDNESS) * lobe.contactT);
+          if (lobe.contactT > maxContact) maxContact = lobe.contactT;
+        }
+        this.deformScalar = maxContact;
+      }
+
+      // (removed) Comb's per-lobe scar follow. The comb is now a pixel
+      // smudge that operates on pigmentLayer; lobes are no longer
+      // touched by combing. See applyCombImpulse for the new flow.
+
+      update() {
+        if (this.preview) return false;
+        // Comb tool — formerly applied per-lobe scar follow here. The
+        // comb has been re-architected as a pixel smudge that writes
+        // directly to pigmentLayer (see applyCombImpulse). It no longer
+        // touches lobes, so this site is intentionally a no-op.
+        // applyScarFollow is still defined for diagnostic poking but
+        // is never called by the main loop.
+        // Pools that are otherwise settled but still have un-played
+        // displacement (a new drop pushed them) need to keep updating until
+        // the lerp catches up. Compute once whether any lobe still owes a
+        // displacement step.
+        const hasPendingDisplacement = this.lobes.some(l =>
+          Math.abs((l.displaceTargetX + l.previewPushX) - l.displaceX) > 0.05 ||
+          Math.abs((l.displaceTargetY + l.previewPushY) - l.displaceY) > 0.05
+        );
+        if (this.settled && !hasPendingDisplacement) return false;
+        // Refresh contact pressure each frame the pool is alive. Cheap
+        // (O(pools * lobes)); contactT smoothly tracks neighbor presence so
+        // the asymmetry envelope eases in/out as drops land or get dragged.
+        this.refreshContactPressure(false);
+
+        const previousRect = this.fieldRect;
+        const before = this.currentMass;
+        if (this.currentMass < this.targetMass) {
+          this.currentMass = lerp(this.currentMass, this.targetMass, this.growthRate);
+        }
+        const progress = constrain(this.currentMass / this.targetMass, 0, 1);
+        let moving = Math.abs(this.currentMass - before) > 0.2;
+        // Interactive-tool snap-ramp — DISPLACEMENT_RAMP (0.085) gives a
+        // soft, half-second drift that's right for drop-displacement
+        // settling, but it makes rake/comb feel like the lobes are
+        // wading through molasses (the cursor moves faster than the
+        // lerp can ever catch up). While the user is driving a session,
+        // bump the per-frame catch-up to a much larger fraction so the
+        // tool reads as responsive. On release the lerp returns to the
+        // soft ramp and ambient settling looks unchanged.
+        const interactive = rakeSession || combSession;
+        const displaceRamp = interactive ? 0.55 : DISPLACEMENT_RAMP;
+        for (const lobe of this.lobes) {
+          if (progress < 0.998) {
+            const targetR = lobe.targetRadius * sqrt(progress);
+            const nextR = lerp(lobe.radius, targetR, 0.045 * lobe.growthVariation);
+            const nextOffset = lerp(lobe.offsetNow, lobe.offsetTarget, 0.032 * lobe.growthVariation);
+            if (Math.abs(nextR - lobe.radius) > 0.05 || Math.abs(nextOffset - lobe.offsetNow) > 0.04) moving = true;
+            lobe.radius = nextR;
+            // Drift is only during growth; once settled these offsets freeze.
+            const drift = (noise(this.seed * 0.001, lobe.phase, progress * 1.7) - 0.5) * 4 * (1 - progress);
+            lobe.offsetNow = nextOffset + drift;
+          }
+          // D1 — displacement lerp. Always runs (even when growth is done) so
+          // a settled pool can still play out a push from a new neighbour.
+          // The lerp target combines the committed displaceTarget with the
+          // (transient) previewPush so the user sees mid-press feedback.
+          const tgtX = lobe.displaceTargetX + lobe.previewPushX;
+          const tgtY = lobe.displaceTargetY + lobe.previewPushY;
+          const dxRem = tgtX - lobe.displaceX;
+          const dyRem = tgtY - lobe.displaceY;
+          if (Math.abs(dxRem) > 0.05 || Math.abs(dyRem) > 0.05) {
+            lobe.displaceX += dxRem * displaceRamp;
+            lobe.displaceY += dyRem * displaceRamp;
+            moving = true;
+          }
+        }
+        if (progress >= SETTLE_EPSILON && !moving) this.settled = true;
+        if (progress >= 0.998 && !hasPendingDisplacement) {
+          this.currentMass = this.targetMass;
+          for (const lobe of this.lobes) {
+            lobe.radius = lobe.targetRadius;
+            lobe.offsetNow = lobe.offsetTarget;
+          }
+          this.settled = true;
+          moving = true;
+        }
+        this.updateGeometry();
+        if (moving) {
+          markDirtyRect(previousRect);
+          markDirtyRect(this.fieldRect);
+        }
+        return moving;
+      }
+
+      updateGeometry() {
+        const cellSize = quality.cellSize;
+        this.sampleLobes = [];
+        let x0 = Infinity;
+        let y0 = Infinity;
+        let x1 = -Infinity;
+        let y1 = -Infinity;
+        for (const lobe of this.lobes) {
+          // D1 — displacement is added in screen coordinates after the
+          // angular offset, so pools deform asymmetrically when neighbours
+          // push them: lobes closer to the new drop get pushed harder, so
+          // the pool stretches away.
+          const lx = this.center.x + cos(lobe.angle) * lobe.offsetNow + lobe.displaceX;
+          const ly = this.center.y + sin(lobe.angle) * lobe.offsetNow + lobe.displaceY;
+          const influenceRadius = Math.max(8, lobe.radius * FIELD_INFLUENCE_FACTOR + 10);
+          const warpRadius = lobe.radius * 0.18;
+          // Per-lobe directional warp budget + global coord-space warp budget
+          // + comb scar budget. Bounds must include all three so the culling
+          // rect can never reject a sample that would have been displaced
+          // into the lobe's footprint by any of the warp sources.
+          const totalWarp = warpRadius + DOMAIN_WARP_PX + MAX_SCAR_PER_CELL;
+          this.sampleLobes.push({
+            x: lx,
+            y: ly,
+            radius: lobe.radius,
+            radius2: lobe.radius * lobe.radius,
+            influence2: (influenceRadius + totalWarp) * (influenceRadius + totalWarp),
+            phase: lobe.phase,
+            phaseCos: cos(lobe.phase),
+            phaseSin: sin(lobe.phase)
+          });
+          x0 = Math.min(x0, lx - influenceRadius - totalWarp);
+          y0 = Math.min(y0, ly - influenceRadius - totalWarp);
+          x1 = Math.max(x1, lx + influenceRadius + totalWarp);
+          y1 = Math.max(y1, ly + influenceRadius + totalWarp);
+        }
+        this.pixelBounds = { x0, y0, x1, y1 };
+        this.fieldRect = clampRect({
+          x0: floor(x0 / cellSize) - 1,
+          y0: floor(y0 / cellSize) - 1,
+          x1: ceil(x1 / cellSize) + 1,
+          y1: ceil(y1 / cellSize) + 1
+        });
+      }
+
+      containsPoint(x, y) {
+        const b = this.pixelBounds;
+        return !!b && x >= b.x0 && x <= b.x1 && y >= b.y0 && y <= b.y1;
+      }
+
+      fieldAt(x, y) {
+        // R3 + D3 — coordinate-space domain warp, decomposed into radial and
+        // tangential components relative to the pool center so the boundary
+        // can finger outward instead of wobbling isotropically.
+        //
+        // 1. Sample two-channel Perlin noise to get a "raw" warp vector (wx, wy).
+        // 2. Project (wx, wy) onto the radial unit (ur) and tangential unit
+        //    (ut = perp(ur)). Boost radial, dampen tangential.
+        // 3. Add a coarser tendril noise (lower frequency, smaller amplitude)
+        //    so finger lengths are uneven and look organic, not periodic.
+        const rx = x - this.center.x;
+        const ry = y - this.center.y;
+        const r = Math.sqrt(rx * rx + ry * ry) + 0.001;
+        const urx = rx / r;
+        const ury = ry / r;
+
+        const wx = noise(x * 0.011 + this.seed * 0.001, y * 0.011 + 13.7) - 0.5;
+        const wy = noise(x * 0.011 + this.seed * 0.001 + 31.7, y * 0.011 - 5.1) - 0.5;
+        // Radial / tangential decomposition. utx = -ury, uty = urx.
+        const wRadial = wx * urx + wy * ury;
+        const wTan = wx * (-ury) + wy * urx;
+        // Roundness — solitary pools (deformScalar near 0) get a muted radial
+        // boost and reduced tendril contribution, so their boundary reads as
+        // a soft disk. Pools touching neighbors lerp up to full Saffman-Taylor
+        // fingering along the contact axes.
+        const dScale = this.deformScalar || 0;
+        const radialBoost = ROUND_RADIAL_WARP_FLOOR + (RADIAL_WARP_BOOST - ROUND_RADIAL_WARP_FLOOR) * dScale;
+        const tendrilPx = (ROUND_TENDRIL_FLOOR + (1 - ROUND_TENDRIL_FLOOR) * dScale) * TENDRIL_WARP_PX;
+        const wxAnis = (radialBoost * wRadial * urx) + (TANGENTIAL_WARP_DAMP * wTan * (-ury));
+        const wyAnis = (radialBoost * wRadial * ury) + (TANGENTIAL_WARP_DAMP * wTan * urx);
+
+        const tendX = noise(x * 0.0042 + this.seed * 0.0007, y * 0.0042 + 7.7) - 0.5;
+        const tendY = noise(x * 0.0042 - this.seed * 0.0007, y * 0.0042 + 11.3) - 0.5;
+
+        // Comb scar sample-point warp removed. The comb is now a
+        // pixel smudge applied directly to pigmentLayer (see
+        // applyCombImpulse); fieldAt no longer participates in the
+        // comb's visual effect, so we simply omit the subtraction.
+        const sx = x + wxAnis * (DOMAIN_WARP_PX * 2) + tendX * (tendrilPx * 2);
+        const sy = y + wyAnis * (DOMAIN_WARP_PX * 2) + tendY * (tendrilPx * 2);
+
+        let sum = 0;
+        for (const lobe of this.sampleLobes) {
+          const roughDx = sx - lobe.x;
+          const roughDy = sy - lobe.y;
+          if (roughDx * roughDx + roughDy * roughDy > lobe.influence2) continue;
+          // Smaller per-lobe warp retained for sub-blob asymmetry: the global
+          // coord warp gives fluid pool edges, this gives lobe-internal break-up.
+          const warp = (stableNoise(floor(sx * 0.025), floor(sy * 0.025), this.seed + lobe.phase) - 0.5) * lobe.radius * 0.10;
+          const dx = roughDx + lobe.phaseCos * warp;
+          const dy = roughDy + lobe.phaseSin * warp;
+          const d2 = dx * dx + dy * dy + 18;
+          sum += lobe.radius2 / d2;
+        }
+        return sum;
+      }
+
+      // D2 — evaluate the inner sub-metaball field at (x, y). Returns a
+      // signed scalar in roughly [-1, 1] used to tint the cell color.
+      // Cheap: a handful of inverse-square-distance lookups inside the
+      // pool's footprint. Called once per owned cell during render.
+      innerFieldAt(x, y) {
+        let sum = 0;
+        for (const il of this.innerLobes) {
+          const dx = x - (this.center.x + il.dx);
+          const dy = y - (this.center.y + il.dy);
+          const d2 = dx * dx + dy * dy;
+          // Effective culling radius (3x lobe radius). Beyond it the field
+          // is too small to matter visually, and we save the divide.
+          const cutoff = il.radius * il.radius * 9;
+          if (d2 > cutoff) continue;
+          const f = (il.radius * il.radius) / (d2 + 4);
+          sum += f * il.intensity;
+        }
+        return sum;
+      }
+    }
+
+    function stableNoise(x, y, seed) {
+      return noise(x * 0.13 + seed * 0.0007, y * 0.13 - seed * 0.0003);
+    }
+
+    function nextPalette() {
+      paletteIndex = (paletteIndex + 1) % PALETTES.length;
+      selectedPigmentIndex = 0;
+      renderPaper();
+      buildToolbar();
+      updateHint();
+      markFullFieldDirty();
+    }
+
+    // Toolbar — color picker swatches and drop/drag tool toggle. Built from
+    // the active palette so swatch order maps 1:1 to pigment order. Bound
+    // once via bindToolButtons; rebuilt on palette change to swap colors.
+    function buildToolbar() {
+      const palette = PALETTES[paletteIndex];
+      const nameEl = document.getElementById('paletteName');
+      if (nameEl) nameEl.textContent = palette.name;
+      const swatchHost = document.getElementById('swatches');
+      if (!swatchHost) return;
+      swatchHost.replaceChildren();
+      palette.pigments.forEach((pigment, idx) => {
+        const btn = document.createElement('button');
+        btn.className = 'swatch';
+        btn.dataset.active = String(idx === selectedPigmentIndex);
+        btn.style.background = pigment.base;
+        btn.title = pigment.base;
+        const select = e => {
+          e.preventDefault();
+          e.stopPropagation();
+          selectedPigmentIndex = idx;
+          updateToolbarActive();
+        };
+        btn.addEventListener('mousedown', select);
+        btn.addEventListener('touchstart', select, { passive: false });
+        swatchHost.appendChild(btn);
+      });
+      updateToolbarActive();
+    }
+
+    function updateToolbarActive() {
+      document.querySelectorAll('#swatches .swatch').forEach((el, idx) => {
+        el.dataset.active = String(idx === selectedPigmentIndex);
+      });
+      document.querySelectorAll('#toolbar .tool-btn').forEach(el => {
+        el.dataset.active = String(el.dataset.tool === toolMode);
+      });
+    }
+
+    function bindToolButtons() {
+      document.querySelectorAll('#toolbar .tool-btn').forEach(btn => {
+        const handler = e => {
+          e.preventDefault();
+          e.stopPropagation();
+          setToolMode(btn.dataset.tool);
+        };
+        btn.addEventListener('mousedown', handler);
+        btn.addEventListener('touchstart', handler, { passive: false });
+      });
+    }
+
+    function setToolMode(mode) {
+      if (mode !== 'drop' && mode !== 'drag' && mode !== 'rake' && mode !== 'comb') return;
+      if (toolMode === mode) return;
+      toolMode = mode;
+      // Cancel any in-flight gesture so we never strand state mid-mode.
+      if (activePress) {
+        clearPreviewDisplacement();
+        if (lastPreviewRect) markDirtyRect(lastPreviewRect);
+        activePress = null;
+        lastPreviewRect = null;
+      }
+      dragSession = null;
+      rakeSession = null;
+      combSession = null;
+      updateToolbarActive();
+      dirty = true;
+    }
+
+    function resetAll() {
+      if (pendingReset) {
+        window.clearTimeout(pendingReset.timer);
+        pendingReset = null;
+      }
+      pools = [];
+      activePress = null;
+      dragSession = null;
+      rakeSession = null;
+      combSession = null;
+      lastPreviewRect = null;
+      clearScarField();
+      pigmentLayer.clear();
+      if (combLayer) combLayer.clear();
+      renderPaper();
+      markFullFieldDirty();
+      settled = true;
+    }
+
+    function updateHint() {
+      const el = document.getElementById('hint');
+      el.textContent = `pick swatch · drop / drag / rake / comb · P palette · R reset`;
+    }
+
+    function keyPressed() {
+      if (key === 'p' || key === 'P') nextPalette();
+      if (key === 'r' || key === 'R' || keyCode === ESCAPE) resetAll();
+    }
+
+    function mousePressed() {
+      if (touches && touches.length) return false;
+      startPress(mouseX, mouseY);
+      return false;
+    }
+
+    function mouseReleased() {
+      if (touches && touches.length) return false;
+      if (finishCornerActionHold()) return false;
+      endPress();
+      return false;
+    }
+
+    function mouseDragged() {
+      if (touches && touches.length) return false;
+      handlePointerMove(mouseX, mouseY);
+      return false;
+    }
+
+    function touchStarted() {
+      const t = touches && touches.length ? touches[0] : { x: mouseX, y: mouseY };
+      startPress(t.x, t.y);
+      return false;
+    }
+
+    function touchMoved() {
+      const t = touches && touches.length ? touches[0] : { x: mouseX, y: mouseY };
+      handlePointerMove(t.x, t.y);
+      return false;
+    }
+
+    function touchEnded() {
+      if (finishCornerActionHold()) return false;
+      endPress();
+      return false;
+    }
+
+    function windowResized() {
+      resizeCanvas(windowWidth, windowHeight);
+      chooseInitialQuality();
+      rebuildSurfaces();
+    }
+
+    document.addEventListener('gesturestart', event => event.preventDefault());
+    document.addEventListener('touchmove', event => event.preventDefault(), { passive: false });
+  </script>
+</body>
+</html>

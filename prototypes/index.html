@@ -287,6 +287,25 @@
           Compare back-to-back against the frozen baseline below.
         </div>
       </li>
+      <li>
+        <a class="row" href="./marbling-metaball-pools-hires/">
+          <span class="name">Metaball pools — hi-res</span>
+          <span class="tag spike">refine</span>
+        </a>
+        <div class="desc">
+          Same simulation as the refined variant, but the cell write does
+          <strong>bilinear interpolation</strong> of field strength across
+          each cellSize&times;cellSize block instead of stamping a solid
+          color. Rim alpha, rim-darken, wash, and seam blend recompute per
+          pixel from the interpolated strength &mdash; rims read smoothly
+          antialiased against paper, interior gradients no longer step at
+          cell boundaries. Field grid is also finer (tiers
+          <code>{2,3,4}</code> instead of <code>{4,6,8}</code>). Sharp
+          ownership seam between two pools preserved by clamping bilerp on
+          different-owner neighbors. Same tools, same physics; compare
+          rim sharpness side-by-side against the refined variant above.
+        </div>
+      </li>
     </ul>
 
     <h2>Frozen baselines (do not edit)</h2>
