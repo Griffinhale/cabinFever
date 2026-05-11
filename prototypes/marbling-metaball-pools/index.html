@@ -41,10 +41,51 @@
       pointer-events: none;
       text-align: right;
     }
+    #topToolbar {
+      position: fixed;
+      left: 50%;
+      top: 10px;
+      z-index: 20;
+      display: flex;
+      gap: 6px;
+      padding: 6px;
+      border: 1px solid rgba(75, 55, 38, 0.20);
+      border-radius: 999px;
+      background: rgba(246, 236, 215, 0.76);
+      box-shadow: 0 8px 28px rgba(48, 35, 22, 0.12);
+      backdrop-filter: blur(8px);
+      transform: translateX(-50%);
+      touch-action: manipulation;
+    }
+    .toolButton {
+      appearance: none;
+      border: 1px solid rgba(65, 46, 31, 0.18);
+      border-radius: 999px;
+      background: rgba(255, 250, 238, 0.66);
+      color: rgba(45, 35, 25, 0.72);
+      font: 11px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      letter-spacing: 0.03em;
+      padding: 8px 10px;
+      min-width: 54px;
+    }
+    .toolButton.active {
+      background: rgba(47, 36, 24, 0.82);
+      border-color: rgba(47, 36, 24, 0.26);
+      color: rgba(255, 248, 232, 0.94);
+    }
+    .toolButton:active {
+      transform: translateY(1px);
+    }
   </style>
 </head>
 <body>
-  <div id="hint">hold to drop · P palette · R reset</div>
+  <div id="hint">hold to drop · toolbar rake · P palette · R reset</div>
+  <div id="topToolbar" aria-label="marbling tools">
+    <button id="dropTool" class="toolButton active" type="button">drop</button>
+    <button id="rakeTool" class="toolButton" type="button">rake</button>
+    <button id="paletteTool" class="toolButton" type="button">palette</button>
+    <button id="resetTool" class="toolButton" type="button">reset</button>
+  </div>
   <div id="cornerActions">tap top-left: palette<br>hold top-right: reset</div>
   <script>
     /*
@@ -69,9 +110,23 @@
     const FULL_REDRAW_COVERAGE = 0.52;
     const MAX_HOLD_MS = 2100;
     const MIN_HOLD_MS = 80;
+    const TAP_TO_HOLD_MS = 190;
+    const TAP_MOVE_TOLERANCE = 9;
+    const SPLATTER_MIN_DROPS = 3;
+    const SPLATTER_MAX_DROPS = 5;
+    const SPLATTER_RADIUS = 34;
     const RESET_HOLD_MS = 750;
     const CORNER_ACTION_SIZE = 72;
     const SETTLE_EPSILON = 0.985;
+    const RAKE_RADIUS = 12;
+    const RAKE_TOOTH_COUNT = 4;
+    const RAKE_TOOTH_SPACING = 16;
+    const RAKE_STEP = 5;
+    const RAKE_SMOOTHING = 0.42;
+    const RAKE_STRENGTH = 0.96;
+    const RAKE_MAX_OFFSET = 92;
+    const RAKE_CUT_STRENGTH = 1.0;
+    const RAKE_MIN_MOVE = 3;
 
     const PALETTES = [
       {
@@ -129,6 +184,7 @@
 
     let pools = [];
     let activePress = null;
+    let activeTool = 'drop';
     let paletteIndex = 0;
     let pigmentIndex = 0;
     let poolId = 1;
@@ -139,6 +195,17 @@
     let fieldCols = 0;
     let fieldRows = 0;
     let field = [];
+    let rakeDx = [];
+    let rakeDy = [];
+    let rakeCut = [];
+    let rakePaintId = [];
+    let rakePaintStrength = [];
+    let rakeStamp = [];
+    let raking = false;
+    let lastRakePoint = null;
+    let lastRakeRawPoint = null;
+    let rakeDirection = null;
+    let activeRakeSourceId = 0;
     let dirtyRects = [];
     let fullFieldDirty = true;
     let paperLayer;
@@ -155,6 +222,7 @@
       createCanvas(windowWidth, windowHeight);
       chooseInitialQuality();
       rebuildSurfaces();
+      bindToolbar();
       updateHint();
     }
 
@@ -187,6 +255,7 @@
       fieldCols = Math.ceil(width / quality.cellSize);
       fieldRows = Math.ceil(height / quality.cellSize);
       field = new Array(fieldCols * fieldRows);
+      resetRakeGrid();
       paperLayer = createGraphics(width, height);
       pigmentLayer = createGraphics(width, height);
       pigmentLayer.pixelDensity(1);
@@ -227,7 +296,8 @@
 
     function renderPigmentField() {
       const startedAt = performance.now();
-      const renderPools = activePress ? pools.concat([previewPoolFromPress(activePress)]) : pools;
+      const showPreview = activePress && shouldRenderHoldPreview(activePress);
+      const renderPools = showPreview ? pools.concat([previewPoolFromPress(activePress)]) : pools;
       const rects = consumeDirtyRects();
       clearPigmentRects(rects);
       evaluateField(renderPools, rects);
@@ -258,40 +328,104 @@
     // evaluate each pool separately instead of one global field.
     function evaluateField(renderPools, rects) {
       const cellSize = quality.cellSize;
+      const rakeCellPadding = ceil(RAKE_MAX_OFFSET / cellSize) + 1;
+      const poolIndexById = new Map(renderPools.map((pool, index) => [pool.id, index]));
       for (const rect of rects) {
-        const candidates = poolsForRect(renderPools, rect);
+        const candidateRect = clampRect(expandRect(rect, rakeCellPadding)) || rect;
+        const candidates = poolsForRect(renderPools, candidateRect);
         for (let gy = rect.y0; gy < rect.y1; gy++) {
-          const y = gy * cellSize + cellSize * 0.5;
           for (let gx = rect.x0; gx < rect.x1; gx++) {
-            const x = gx * cellSize + cellSize * 0.5;
-            let best = -1;
-            let bestField = 0;
-            let bestAge = -1;
-            let secondField = 0;
-            for (const i of candidates) {
-              const pool = renderPools[i];
-              if (!pool.containsPoint(x, y)) continue;
-              const f = pool.fieldAt(x, y);
-              if (f > secondField) secondField = f;
-              // Ownership/clipping strategy: each cell can have exactly one owner.
-              // Strongest normalized pool field wins above threshold; near-ties go
-              // to the newer pool, making fresh pigment read as sitting on top while
-              // preventing different pigment identities from summing into one blob.
-              const newerTie = Math.abs(f - bestField) < 0.045 && pool.createdAt > bestAge;
-              if (f > bestField || (f > FIELD_THRESHOLD && newerTie)) {
-                secondField = bestField;
-                bestField = f;
-                best = i;
-                bestAge = pool.createdAt;
+            const idx = gx + gy * fieldCols;
+            const baseX = gx * cellSize + cellSize * 0.5;
+            const baseY = gy * cellSize + cellSize * 0.5;
+            const stamp = rakeStamp[idx] || 0;
+            const sampled = solveFieldAt(renderPools, candidates, baseX + (rakeDx[idx] || 0), baseY + (rakeDy[idx] || 0));
+            let best = sampled.best;
+            let bestField = sampled.bestField;
+            let bestAge = sampled.bestAge;
+            let secondField = sampled.secondField;
+
+            // Rake masks are edits to the material that existed when the rake was
+            // dragged. Fresh drops/previews should be able to sit on top of those
+            // edits, so if a newer pool owns this unwarped cell, bypass the old
+            // coordinate displacement / cut / paint override for this cell.
+            let rakeAffectsCell = stamp > 0;
+            if (rakeAffectsCell) {
+              const fresh = solveFreshFieldAt(renderPools, candidates, baseX, baseY, stamp);
+              if (fresh.best >= 0) {
+                best = fresh.best;
+                bestField = fresh.bestField;
+                bestAge = fresh.bestAge;
+                secondField = fresh.secondField;
+                rakeAffectsCell = false;
               }
             }
-            const idx = gx + gy * fieldCols;
+
+            if (rakeAffectsCell) {
+              const cut = rakeCut[idx] || 0;
+              if (cut > 0) bestField *= 1 - constrain(cut, 0, 0.96);
+              const paintId = rakePaintId[idx] || 0;
+              const paintIndex = paintId ? poolIndexById.get(paintId) : -1;
+              if (paintIndex >= 0) {
+                const paintStrength = constrain(rakePaintStrength[idx] || 0, 0, 1);
+                best = paintIndex;
+                bestField = FIELD_THRESHOLD + FIELD_RIM_BAND * (0.38 + 0.7 * paintStrength);
+                secondField = 0;
+              }
+            }
             field[idx] = bestField >= FIELD_THRESHOLD
               ? { owner: best, strength: bestField, margin: bestField - secondField }
               : { owner: -1, strength: bestField, margin: 0 };
           }
         }
       }
+    }
+
+    function solveFieldAt(renderPools, candidates, x, y) {
+      let best = -1;
+      let bestField = 0;
+      let bestAge = -1;
+      let secondField = 0;
+      for (const i of candidates) {
+        const pool = renderPools[i];
+        if (!pool.containsPoint(x, y)) continue;
+        const f = pool.fieldAt(x, y);
+        if (f > secondField) secondField = f;
+        // Ownership/clipping strategy: each cell can have exactly one owner.
+        // Strongest normalized pool field wins above threshold; near-ties go
+        // to the newer pool, making fresh pigment read as sitting on top while
+        // preventing different pigment identities from summing into one blob.
+        const newerTie = Math.abs(f - bestField) < 0.045 && pool.createdAt > bestAge;
+        if (f > bestField || (f > FIELD_THRESHOLD && newerTie)) {
+          secondField = bestField;
+          bestField = f;
+          best = i;
+          bestAge = pool.createdAt;
+        }
+      }
+      return { best, bestField, bestAge, secondField };
+    }
+
+    function solveFreshFieldAt(renderPools, candidates, x, y, stamp) {
+      let best = -1;
+      let bestField = 0;
+      let bestAge = -1;
+      let secondField = 0;
+      for (const i of candidates) {
+        const pool = renderPools[i];
+        if (pool.createdAt < stamp || !pool.containsPoint(x, y)) continue;
+        const f = pool.fieldAt(x, y);
+        if (f < FIELD_THRESHOLD) continue;
+        if (f > secondField) secondField = f;
+        const newerTie = Math.abs(f - bestField) < 0.045 && pool.createdAt > bestAge;
+        if (f > bestField || newerTie) {
+          secondField = bestField;
+          bestField = f;
+          best = i;
+          bestAge = pool.createdAt;
+        }
+      }
+      return { best, bestField, bestAge, secondField };
     }
 
     function hasDifferentNeighbor(gx, gy, owner) {
@@ -364,14 +498,74 @@
 
     function setQuality(nextIndex) {
       if (nextIndex === qualityIndex) return;
+      const previousGrid = captureRakeGrid();
       qualityIndex = nextIndex;
       quality = QUALITY_TIERS[qualityIndex];
       fieldCols = Math.ceil(width / quality.cellSize);
       fieldRows = Math.ceil(height / quality.cellSize);
       field = new Array(fieldCols * fieldRows);
+      restoreRakeGrid(previousGrid);
+      finishRake();
       for (const pool of pools) pool.updateGeometry();
       if (activePress) lastPreviewRect = null;
       markFullFieldDirty();
+    }
+
+    function captureRakeGrid() {
+      return {
+        cols: fieldCols,
+        rows: fieldRows,
+        cellSize: quality.cellSize,
+        dx: rakeDx,
+        dy: rakeDy,
+        cut: rakeCut,
+        paintId: rakePaintId,
+        paintStrength: rakePaintStrength,
+        stamp: rakeStamp
+      };
+    }
+
+    function restoreRakeGrid(previous) {
+      const len = Math.max(0, fieldCols * fieldRows);
+      rakeDx = new Array(len).fill(0);
+      rakeDy = new Array(len).fill(0);
+      rakeCut = new Array(len).fill(0);
+      rakePaintId = new Array(len).fill(0);
+      rakePaintStrength = new Array(len).fill(0);
+      rakeStamp = new Array(len).fill(0);
+      if (!previous || !previous.cols || !previous.rows || !previous.dx) return;
+
+      for (let gy = 0; gy < fieldRows; gy++) {
+        const py = gy * quality.cellSize + quality.cellSize * 0.5;
+        const oldGy = constrain(floor(py / previous.cellSize), 0, previous.rows - 1);
+        for (let gx = 0; gx < fieldCols; gx++) {
+          const px = gx * quality.cellSize + quality.cellSize * 0.5;
+          const oldGx = constrain(floor(px / previous.cellSize), 0, previous.cols - 1);
+          const oldIdx = oldGx + oldGy * previous.cols;
+          const idx = gx + gy * fieldCols;
+          rakeDx[idx] = previous.dx[oldIdx] || 0;
+          rakeDy[idx] = previous.dy[oldIdx] || 0;
+          rakeCut[idx] = previous.cut ? previous.cut[oldIdx] || 0 : 0;
+          rakePaintId[idx] = previous.paintId ? previous.paintId[oldIdx] || 0 : 0;
+          rakePaintStrength[idx] = previous.paintStrength ? previous.paintStrength[oldIdx] || 0 : 0;
+          rakeStamp[idx] = previous.stamp ? previous.stamp[oldIdx] || 0 : 0;
+        }
+      }
+    }
+
+    function resetRakeGrid() {
+      const len = Math.max(0, fieldCols * fieldRows);
+      rakeDx = new Array(len).fill(0);
+      rakeDy = new Array(len).fill(0);
+      rakeCut = new Array(len).fill(0);
+      rakePaintId = new Array(len).fill(0);
+      rakePaintStrength = new Array(len).fill(0);
+      rakeStamp = new Array(len).fill(0);
+      raking = false;
+      lastRakePoint = null;
+      lastRakeRawPoint = null;
+      rakeDirection = null;
+      activeRakeSourceId = 0;
     }
 
     function markFullFieldDirty() {
@@ -427,7 +621,8 @@
     }
 
     function markActivePreviewDirty() {
-      if (!activePress) {
+      if (!activePress || !shouldRenderHoldPreview(activePress)) {
+        if (lastPreviewRect) markDirtyRect(lastPreviewRect);
         lastPreviewRect = null;
         return;
       }
@@ -491,7 +686,7 @@
     }
 
     function renderPressPreview() {
-      if (!activePress) return;
+      if (!activePress || !shouldRenderHoldPreview(activePress)) return;
       const held = millis() - activePress.startedAt;
       const t = holdToUnit(held);
       noFill();
@@ -503,12 +698,19 @@
       circle(activePress.x, activePress.y, max(8, r * 0.6));
     }
 
+    function shouldRenderHoldPreview(press) {
+      return press && millis() - press.startedAt >= TAP_TO_HOLD_MS;
+    }
+
     function startPress(x, y) {
       const corner = handleCornerActionStart(x, y);
       if (corner) return;
       activePress = {
         x: constrain(x, 0, width),
         y: constrain(y, 0, height),
+        startX: constrain(x, 0, width),
+        startY: constrain(y, 0, height),
+        moved: false,
         startedAt: millis(),
         color: choosePigment(),
         seed: random(1000000)
@@ -519,13 +721,38 @@
 
     function endPress() {
       if (!activePress) return;
-      const held = millis() - activePress.startedAt;
-      const pool = createPool(activePress.x, activePress.y, held, activePress.color, activePress.seed, false);
-      pools.push(pool);
+      const press = activePress;
+      const held = millis() - press.startedAt;
       if (lastPreviewRect) markDirtyRect(lastPreviewRect);
-      markDirtyRect(pool.fieldRect);
       lastPreviewRect = null;
       activePress = null;
+
+      if (held < TAP_TO_HOLD_MS && !press.moved) {
+        addSplatter(press.x, press.y, press.color, press.seed);
+        return;
+      }
+
+      const pool = createPool(press.x, press.y, held, press.color, press.seed, false);
+      pools.push(pool);
+      markDirtyRect(pool.fieldRect);
+    }
+
+    function addSplatter(x, y, pigment, seed) {
+      randomSeed(floor(seed));
+      const count = floor(random(SPLATTER_MIN_DROPS, SPLATTER_MAX_DROPS + 0.99));
+      const affected = [];
+      for (let i = 0; i < count; i++) {
+        const angle = random(TWO_PI);
+        const radius = sqrt(random()) * SPLATTER_RADIUS;
+        const sx = constrain(x + cos(angle) * radius, 0, width);
+        const sy = constrain(y + sin(angle) * radius, 0, height);
+        const mass = random(180, 620) * (i === 0 ? 1.15 : 1);
+        const lobes = floor(random(1, 3.99));
+        const pool = createPoolFromMass(sx, sy, mass, lobes, pigment, seed + 97 * (i + 1), false);
+        pools.push(pool);
+        affected.push(pool.fieldRect);
+      }
+      for (const rect of affected) markDirtyRect(rect);
     }
 
     function handleCornerActionStart(x, y) {
@@ -590,6 +817,201 @@
 
     function handlePointerMove(x, y) {
       updateCornerActionHold(x, y);
+      if (!activePress) return;
+      const dx = x - activePress.startX;
+      const dy = y - activePress.startY;
+      if (sqrt(dx * dx + dy * dy) > TAP_MOVE_TOLERANCE) activePress.moved = true;
+    }
+
+    function touchCentroid() {
+      if (!touches || touches.length === 0) return { x: mouseX, y: mouseY };
+      let x = 0;
+      let y = 0;
+      for (const t of touches) {
+        x += t.x;
+        y += t.y;
+      }
+      return { x: x / touches.length, y: y / touches.length };
+    }
+
+    function beginRake(x, y) {
+      cancelResetHold();
+      activePress = null;
+      if (dirty || fullFieldDirty || dirtyRects.length) renderScene();
+      raking = true;
+      const point = { x: constrain(x, 0, width), y: constrain(y, 0, height) };
+      activeRakeSourceId = samplePoolIdAt(point.x, point.y);
+      lastRakePoint = point;
+      lastRakeRawPoint = point;
+      rakeDirection = null;
+    }
+
+    function finishRake() {
+      if (!raking) return false;
+      raking = false;
+      lastRakePoint = null;
+      lastRakeRawPoint = null;
+      rakeDirection = null;
+      activeRakeSourceId = 0;
+      dirty = true;
+      return true;
+    }
+
+    function samplePoolIdAt(x, y) {
+      const gx = constrain(floor(x / quality.cellSize), 0, fieldCols - 1);
+      const gy = constrain(floor(y / quality.cellSize), 0, fieldRows - 1);
+      const cell = field[gx + gy * fieldCols];
+      if (!cell || cell.owner < 0) return 0;
+      const pool = pools[cell.owner];
+      return pool ? pool.id : 0;
+    }
+
+    function updateRake(x, y) {
+      if (!raking || !lastRakePoint) return;
+      const raw = { x: constrain(x, 0, width), y: constrain(y, 0, height) };
+      const smooth = smoothRakePoint(raw);
+      const dx = smooth.x - lastRakePoint.x;
+      const dy = smooth.y - lastRakePoint.y;
+      const len = sqrt(dx * dx + dy * dy);
+      if (len < RAKE_MIN_MOVE) return;
+
+      updateRakeDirection(dx, dy, len);
+      const steps = max(1, ceil(len / RAKE_STEP));
+      let from = lastRakePoint;
+      for (let i = 1; i <= steps; i++) {
+        const t = i / steps;
+        const to = {
+          x: lerp(lastRakePoint.x, smooth.x, t),
+          y: lerp(lastRakePoint.y, smooth.y, t)
+        };
+        applyRasterRake(from.x, from.y, to.x, to.y, rakeDirection);
+        from = to;
+      }
+      lastRakePoint = smooth;
+      lastRakeRawPoint = raw;
+    }
+
+    function smoothRakePoint(raw) {
+      if (!lastRakeRawPoint || !lastRakePoint) return raw;
+      return {
+        x: lerp(lastRakePoint.x, raw.x, RAKE_SMOOTHING),
+        y: lerp(lastRakePoint.y, raw.y, RAKE_SMOOTHING)
+      };
+    }
+
+    function updateRakeDirection(dx, dy, len) {
+      const ux = dx / len;
+      const uy = dy / len;
+      if (!rakeDirection) {
+        rakeDirection = { x: ux, y: uy };
+        return;
+      }
+      const blendedX = lerp(rakeDirection.x, ux, 0.28);
+      const blendedY = lerp(rakeDirection.y, uy, 0.28);
+      const blendedLen = sqrt(blendedX * blendedX + blendedY * blendedY) || 1;
+      rakeDirection = { x: blendedX / blendedLen, y: blendedY / blendedLen };
+    }
+
+    // Raster-space rake prototype: instead of moving metaball lobes, a drag writes
+    // persistent per-cell coordinate offsets. The next field solve samples the
+    // same pools through those offsets, so settled pigment visually pulls apart
+    // while the existing owner/rim renderer still controls the borders.
+    function applyRasterRake(x0, y0, x1, y1, direction) {
+      const dx = x1 - x0;
+      const dy = y1 - y0;
+      const len = sqrt(dx * dx + dy * dy);
+      if (len < 0.25 || fieldCols <= 0 || fieldRows <= 0) return;
+
+      const ux = direction ? direction.x : dx / len;
+      const uy = direction ? direction.y : dy / len;
+      const nx = -uy;
+      const ny = ux;
+      const start = -(RAKE_TOOTH_COUNT - 1) * 0.5;
+      for (let i = 0; i < RAKE_TOOTH_COUNT; i++) {
+        const offset = (start + i) * RAKE_TOOTH_SPACING;
+        applySingleRakeTooth(
+          x0 + nx * offset,
+          y0 + ny * offset,
+          x1 + nx * offset,
+          y1 + ny * offset,
+          max(len, RAKE_STEP),
+          ux,
+          uy
+        );
+      }
+    }
+
+    function applySingleRakeTooth(x0, y0, x1, y1, len, ux, uy) {
+      const cellSize = quality.cellSize;
+      const stamp = millis();
+      const editPad = RAKE_RADIUS + cellSize * 2;
+      const dirtyPad = RAKE_RADIUS + RAKE_MAX_OFFSET + cellSize * 2;
+      const rect = clampRect({
+        x0: floor((min(x0, x1) - editPad) / cellSize),
+        y0: floor((min(y0, y1) - editPad) / cellSize),
+        x1: ceil((max(x0, x1) + editPad) / cellSize),
+        y1: ceil((max(y0, y1) + editPad) / cellSize)
+      });
+      const dirtyRect = clampRect({
+        x0: floor((min(x0, x1) - dirtyPad) / cellSize),
+        y0: floor((min(y0, y1) - dirtyPad) / cellSize),
+        x1: ceil((max(x0, x1) + dirtyPad) / cellSize),
+        y1: ceil((max(y0, y1) + dirtyPad) / cellSize)
+      });
+      if (!rect) return;
+
+      for (let gy = rect.y0; gy < rect.y1; gy++) {
+        const cy = gy * cellSize + cellSize * 0.5;
+        for (let gx = rect.x0; gx < rect.x1; gx++) {
+          const cx = gx * cellSize + cellSize * 0.5;
+          const nearest = closestPointOnSegment(cx, cy, x0, y0, x1, y1);
+          const ddx = cx - nearest.x;
+          const ddy = cy - nearest.y;
+          const dist = sqrt(ddx * ddx + ddy * ddy);
+          if (dist > RAKE_RADIUS) continue;
+
+          const idx = gx + gy * fieldCols;
+          const cell = field[idx];
+          const falloff = smoothFalloff(1 - dist / RAKE_RADIUS);
+
+          if (activeRakeSourceId) {
+            rakePaintId[idx] = activeRakeSourceId;
+            rakePaintStrength[idx] = max(rakePaintStrength[idx] || 0, falloff);
+            rakeCut[idx] = 0;
+          } else {
+            if (!cell || cell.owner < 0) continue;
+            rakeCut[idx] = max(rakeCut[idx] || 0, falloff * RAKE_CUT_STRENGTH);
+          }
+          rakeStamp[idx] = stamp;
+
+          if (!cell || cell.owner < 0) continue;
+
+          const edgeT = constrain((cell.strength - FIELD_THRESHOLD) / FIELD_RIM_BAND, 0, 1);
+          const borderPin = hasDifferentNeighbor(gx, gy, cell.owner) ? 0.82 : (1 - edgeT) * 0.58;
+          const force = falloff * (1 - constrain(borderPin, 0, 0.9));
+          if (force <= 0.02) continue;
+
+          const pull = min(len, RAKE_MAX_OFFSET * 0.38) * RAKE_STRENGTH * force;
+          rakeDx[idx] = constrain((rakeDx[idx] || 0) + ux * pull, -RAKE_MAX_OFFSET, RAKE_MAX_OFFSET);
+          rakeDy[idx] = constrain((rakeDy[idx] || 0) + uy * pull, -RAKE_MAX_OFFSET, RAKE_MAX_OFFSET);
+        }
+      }
+
+      if (dirtyRect) markDirtyRect(dirtyRect);
+    }
+
+    function smoothFalloff(t) {
+      const clamped = constrain(t, 0, 1);
+      return clamped * clamped * (3 - 2 * clamped);
+    }
+
+    function closestPointOnSegment(px, py, x0, y0, x1, y1) {
+      const sx = x1 - x0;
+      const sy = y1 - y0;
+      const l2 = sx * sx + sy * sy;
+      if (l2 <= 0.0001) return { x: x0, y: y0 };
+      const t = constrain(((px - x0) * sx + (py - y0) * sy) / l2, 0, 1);
+      return { x: x0 + sx * t, y: y0 + sy * t };
     }
 
     // Hold mapping: duration is clamped, eased, converted to target area/mass,
@@ -620,6 +1042,10 @@
       const lowComplexity = pools.length < 8 && totalLobeCount(pools) < 46 && qualityIndex === 0;
       const maxLobes = lowComplexity ? 9 : 8;
       const lobeCount = floor(lerp(3, maxLobes + 0.99, t));
+      return createPoolFromMass(x, y, mass, lobeCount, pigment, seed, preview);
+    }
+
+    function createPoolFromMass(x, y, mass, lobeCount, pigment, seed, preview) {
       const id = preview ? -1 : poolId++;
       return new PigmentPool(id, x, y, mass, lobeCount, pigment, seed, preview);
     }
@@ -798,6 +1224,7 @@
       }
       pools = [];
       activePress = null;
+      resetRakeGrid();
       lastPreviewRect = null;
       pigmentLayer.clear();
       renderPaper();
@@ -807,7 +1234,49 @@
 
     function updateHint() {
       const el = document.getElementById('hint');
-      el.textContent = `hold to drop · P palette · R reset · ${PALETTES[paletteIndex].name}`;
+      const toolLabel = activeTool === 'rake' ? 'rake mode: drag to comb' : 'drop mode: hold to drop';
+      el.textContent = `${toolLabel} · Shift-drag/two-finger rake · P palette · R reset · ${PALETTES[paletteIndex].name}`;
+      updateToolbarState();
+    }
+
+    function bindToolbar() {
+      const toolbar = document.getElementById('topToolbar');
+      if (!toolbar || toolbar.dataset.bound === 'true') return;
+      toolbar.dataset.bound = 'true';
+      toolbar.addEventListener('pointerdown', event => event.stopPropagation());
+      toolbar.addEventListener('touchstart', event => event.stopPropagation(), { passive: false });
+      document.getElementById('dropTool').addEventListener('click', event => {
+        event.preventDefault();
+        setActiveTool('drop');
+      });
+      document.getElementById('rakeTool').addEventListener('click', event => {
+        event.preventDefault();
+        setActiveTool('rake');
+      });
+      document.getElementById('paletteTool').addEventListener('click', event => {
+        event.preventDefault();
+        nextPalette();
+      });
+      document.getElementById('resetTool').addEventListener('click', event => {
+        event.preventDefault();
+        resetAll();
+      });
+      updateToolbarState();
+    }
+
+    function setActiveTool(tool) {
+      activeTool = tool;
+      finishRake();
+      activePress = null;
+      updateHint();
+    }
+
+    function updateToolbarState() {
+      const drop = document.getElementById('dropTool');
+      const rake = document.getElementById('rakeTool');
+      if (!drop || !rake) return;
+      drop.classList.toggle('active', activeTool === 'drop');
+      rake.classList.toggle('active', activeTool === 'rake');
     }
 
     function keyPressed() {
@@ -817,12 +1286,17 @@
 
     function mousePressed() {
       if (touches && touches.length) return false;
+      if (activeTool === 'rake' || keyIsDown(SHIFT)) {
+        beginRake(mouseX, mouseY);
+        return false;
+      }
       startPress(mouseX, mouseY);
       return false;
     }
 
     function mouseReleased() {
       if (touches && touches.length) return false;
+      if (finishRake()) return false;
       if (finishCornerActionHold()) return false;
       endPress();
       return false;
@@ -830,23 +1304,45 @@
 
     function mouseDragged() {
       if (touches && touches.length) return false;
+      if (raking) {
+        updateRake(mouseX, mouseY);
+        return false;
+      }
       handlePointerMove(mouseX, mouseY);
       return false;
     }
 
     function touchStarted() {
+      if (touches && touches.length >= 2) {
+        const p = touchCentroid();
+        beginRake(p.x, p.y);
+        return false;
+      }
+      if (activeTool === 'rake') {
+        beginRake(mouseX, mouseY);
+        return false;
+      }
       const t = touches && touches.length ? touches[0] : { x: mouseX, y: mouseY };
       startPress(t.x, t.y);
       return false;
     }
 
     function touchMoved() {
+      if (raking) {
+        const p = touches && touches.length ? touchCentroid() : { x: mouseX, y: mouseY };
+        updateRake(p.x, p.y);
+        return false;
+      }
       const t = touches && touches.length ? touches[0] : { x: mouseX, y: mouseY };
       handlePointerMove(t.x, t.y);
       return false;
     }
 
     function touchEnded() {
+      if (raking) {
+        finishRake();
+        return false;
+      }
       if (finishCornerActionHold()) return false;
       endPress();
       return false;

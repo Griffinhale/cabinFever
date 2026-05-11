@@ -25,10 +25,16 @@ You can also open `index.html` directly in a browser, but the static server path
 
 ## Controls
 
-- Press/tap: start adding pigment at the pointer.
-- Hold: increase paint amount and target footprint.
-- Release: finalize the pigment pool; it keeps growing slowly until settled.
+- Quick tap/click: splatter several small same-color metaball droplets within a small buffer around the pointer.
+- Hold: grow one larger pigment pool at the pointer; release finalizes it and it keeps growing slowly until settled.
+- Top toolbar:
+  - `drop`: hold/tap to place pigment.
+  - `rake`: drag directly to comb/rake the existing pigment field.
+  - `palette`: cycle palette for future pools.
+  - `reset`: clear the sketch.
 - `P`: cycle palette for future pools.
+- Shift-drag with mouse: rake settled pigment without switching toolbar mode.
+- Two-finger drag on touch: rake without switching toolbar mode.
 - `R` or `Escape`: reset.
 - Touch/mobile fallback: tap top-left corner to cycle palette; hold top-right corner for about 750 ms to reset.
 
@@ -52,11 +58,13 @@ Child lobes grow from tiny radii toward target radii. Same-pool child lobes are 
 
 The sketch renders a low-resolution field into an offscreen pigment layer, then composites that over a stable cream paper-grain layer. Round two replaced the fixed 4 px field with adaptive tiers: high uses 4 px cells, medium uses 6 px cells, and low uses 8 px cells for mobile/crowded/slow frames.
 
+The raking spike adds persistent raster-space displacement arrays, `rakeDx[]` and `rakeDy[]`, a `rakeCut[]` trough mask, and `rakePaintId[]` / `rakePaintStrength[]` dragged-color buffers parallel to the field grid. The top toolbar's `rake` mode, Shift-drag, or two-finger drag writes into these buffers. If the rake starts on paper, the smoothed/resampled 4-tooth comb carves negative-space channels through pigment. If the rake starts inside a color, the comb carries that source pigment through the stroke instead, so dragging from blue into red lays blue channels rather than cutting to paper. The rake buffers are resampled when adaptive quality changes, so switching tools or tiering from high/medium/low does not reset combed material. The next field solve samples each metaball pool at the displaced coordinates, applies cut troughs for paper-start strokes, and applies paint overrides for color-start strokes, giving a first-pass "metaball turns into raster-deformable substrate" behavior without changing lobe geometry.
+
 ## Hold mapping
 
 Hold duration is clamped from a quick-tap minimum to a capped long hold. Duration is eased, mapped to target area/mass, then split across a smaller 3-8 child lobe budget, with an optional 9th lobe only for low-complexity high-quality scenes:
 
-- quick tap: minimum visible small pool
+- quick tap: small randomized splatter cluster
 - medium hold: broader pool with more lobes
 - long hold: larger footprint with richer asymmetric edges
 
