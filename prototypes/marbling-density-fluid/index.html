@@ -1159,7 +1159,13 @@
           const dist = sqrt(ddx * ddx + ddy * ddy);
           if (dist > profile.radius) continue;
           const idx = gx + gy * fieldCols;
-          if (fluidOwners[idx] < 0 || fluidMask[idx] <= 0) continue;
+          const ownerId = fluidOwners[idx];
+          if (ownerId < 0 || fluidMask[idx] <= 0) continue;
+          // Lock each rake stroke to the first pigment it touches. Without this,
+          // every tooth injects velocity into every crossed owner, so a comb pass
+          // visually drains all colors at once instead of dragging one spread color.
+          if (activeRakeSourceId <= 0) activeRakeSourceId = ownerId;
+          if (ownerId !== activeRakeSourceId) continue;
           const falloff = smoothFalloff(1 - dist / profile.radius);
           const pin = constrain(fluidBorderPin[idx], 0, 1);
           const force = profile.strength * falloff * lerp(1, BORDER_VELOCITY_SCALE, pin);
